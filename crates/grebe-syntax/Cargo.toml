@@ -8,6 +8,7 @@ repository.workspace = true
 description = "DuckDB SQL parser built from DuckDB's own PEG grammar: tokenizer, packrat matcher, lossless CST."
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
 build = "build.rs"
 
 [dependencies]

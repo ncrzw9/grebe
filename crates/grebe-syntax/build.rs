@@ -820,11 +820,13 @@ fn main() {
 
     let mut rule_ids = HashMap::new();
     let mut rule_constants = String::new();
+    // One constant per grammar rule, over a thousand of them: hidden from the
+    // docs so they don't bury the real API, which looks rules up by name.
     for (idx, name) in sorted_rule_names.iter().enumerate() {
         rule_ids.insert(name.clone(), idx as u32);
         let c_name = format!("RULE_{}", camel_to_screaming_snake(name));
         rule_constants.push_str(&format!(
-            "pub const {}: RuleId = RuleId({});\n",
+            "#[doc(hidden)]\npub const {}: RuleId = RuleId({});\n",
             c_name, idx
         ));
     }
