@@ -594,6 +594,7 @@ pub fn analyze(tree: &Tree, src: &str) -> Vec<Finding> {
     out.extend(crate::tier2a::analyze_tier2a(tree, src));
     out.extend(crate::tier2b::analyze_tier2b(tree, src));
     out.extend(crate::tier3::analyze_tier3(tree, src));
+    out.extend(crate::tier4::analyze_tier4(tree, src));
     // MOD003/MOD004/MOD005.
     out.extend(group_by_all(tree, src));
     out.extend(subquery_order_by(tree, src));

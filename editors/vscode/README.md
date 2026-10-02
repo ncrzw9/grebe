@@ -39,14 +39,15 @@ DuckDB SQL. It spawns the `grebe` binary and hands everything to
   on `PATH`.
 - `grebe.select` — the MOD rules to lint for, same meaning as the CLI's
   `grebe check --select` flag: only the listed rules run, and any of them
-  that are off by default get turned on. Defaults to every MOD rule
-  (`MOD001`..`MOD025`), so the editor is loud out of the box even though
-  bare `grebe check` on the command line stays quiet. Parse errors (`PRS`)
-  and other-dialect notices (`SRC`) are always shown unless `grebe.toml`
-  sets them to `off` under `[severity]`. Remove a code from the
-  list to stop seeing it; the change takes effect immediately, no reload
-  needed. A code that doesn't name a real rule is dropped and reported with
-  a warning notification rather than silently ignored.
+  that are off by default get turned on. Defaults to `["ALL"]`, every MOD
+  rule there is, so the editor is loud out of the box even though bare
+  `grebe check` on the command line stays quiet -- and stays loud as new
+  rules ship, with no setting to update. Parse errors (`PRS`) and
+  other-dialect notices (`SRC`) are always shown unless `grebe.toml` sets
+  them to `off` under `[severity]`. List codes explicitly to pick a subset
+  instead; the change takes effect immediately, no reload needed. A code
+  that doesn't name a real rule is dropped and reported with a warning
+  notification rather than silently ignored.
 
 ## Syntax highlighting
 

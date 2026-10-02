@@ -601,13 +601,13 @@ fn apply_top(
         "exclude" => config.exclude = expect_array(value, "exclude", line, path)?,
         "select" => {
             let arr = expect_array(value, "select", line, path)?;
-            let mut codes = Vec::with_capacity(arr.len());
-            for code in arr {
-                let upper = code.to_ascii_uppercase();
-                if crate::lookup(&upper).is_none() {
-                    return Err(err(path, line, format!("unknown rule code `{upper}`")));
+            let upper: Vec<String> = arr.iter().map(|c| c.to_ascii_uppercase()).collect();
+            let mut codes = Vec::with_capacity(upper.len());
+            for code in crate::expand_select(upper) {
+                if crate::lookup(&code).is_none() {
+                    return Err(err(path, line, format!("unknown rule code `{code}`")));
                 }
-                codes.push(upper);
+                codes.push(code);
             }
             config.select = Some(codes);
         }
@@ -1083,6 +1083,16 @@ mod tests {
         let e = parse(text, &p("c.toml"), false).unwrap_err();
         assert_eq!(e.line, 1);
         assert!(e.message.contains("MOD999"), "{}", e.message);
+    }
+
+    #[test]
+    fn select_all_expands_to_every_mod_code() {
+        let text = "select = [\"all\"]\n";
+        let config = parse(text, &p("c.toml"), false).unwrap();
+        let select = config.select.expect("select set");
+        assert!(select.len() > 1, "{select:?}");
+        assert!(select.iter().all(|c| crate::lookup(c).is_some()));
+        assert!(select.contains(&"MOD010".to_string()), "{select:?}");
     }
 
     #[test]
