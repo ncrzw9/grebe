@@ -1,0 +1,16 @@
+grebe bundles third-party material.
+
+## DuckDB PEG grammar
+
+crates/grebe-syntax/vendor/grammar/ is a verbatim copy of the PEG grammar
+from the DuckDB source tree. It is never edited; vendor/SNAPSHOT records the
+exact upstream commit.
+
+    Source:  https://github.com/duckdb/duckdb
+    Path:    src/parser/peg/grammar
+    License: MIT, full text in crates/grebe-syntax/vendor/LICENSE-DuckDB
+
+crates/grebe-rules/vendor/aggregates.list is derived data: the names of
+DuckDB's built-in aggregate functions, extracted from a DuckDB build.
+
+grebe itself is MIT licensed; see LICENSE.

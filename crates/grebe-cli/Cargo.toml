@@ -1,0 +1,25 @@
+[package]
+name = "grebe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "A fast DuckDB SQL formatter and linter in one static binary."
+keywords.workspace = true
+categories.workspace = true
+
+
+[[bin]]
+name = "grebe"
+path = "src/main.rs"
+
+[dependencies]
+grebe-syntax.workspace = true
+grebe-rules.workspace = true
+grebe-format.workspace = true
+grebe-lsp.workspace = true
+
+[lints]
+workspace = true

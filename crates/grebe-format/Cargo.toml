@@ -1,0 +1,17 @@
+[package]
+name = "grebe-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Formatter for DuckDB SQL, built on grebe-syntax's lossless CST."
+keywords.workspace = true
+categories.workspace = true
+
+
+[dependencies]
+grebe-syntax.workspace = true
+
+[lints]
+workspace = true

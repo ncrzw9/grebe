@@ -1,0 +1,13 @@
+# Built-in aggregate function names, for MOD003 (group-by-all) and MOD014
+# (case-to-filter). Both need to know whether a select-list item is an
+# aggregate, and grebe embeds no engine to ask, so the list is checked in.
+#
+# DERIVED DATA, regenerable -- not hand-maintained:
+#   SELECT DISTINCT lower(function_name) FROM duckdb_functions()
+#   WHERE function_type = 'aggregate' ORDER BY 1
+#
+# Regenerate by running the query above against the engine version below.
+source  = duckdb_functions(), function_type='aggregate'
+engine  = v1.5.5
+count   = 88
+vendored = 2026-08-29

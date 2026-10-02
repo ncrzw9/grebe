@@ -1,0 +1,18 @@
+[package]
+name = "grebe-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language server for DuckDB SQL: diagnostics, quick fixes, formatting and semantic tokens."
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+grebe-syntax.workspace = true
+grebe-rules.workspace = true
+grebe-format.workspace = true
+
+[lints]
+workspace = true

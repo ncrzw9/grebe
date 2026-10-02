@@ -1,0 +1,6 @@
+# Vendored DuckDB PEG grammar — verbatim, never hand-edited
+source     = https://github.com/duckdb/duckdb
+path       = src/parser/peg/grammar
+commit     = ce512b864cc354d05c1b0ff672ecd38e586db523
+vendored   = 2026-08-29
+refresh    = just vendor-grammar <sha>   # must be followed by a green differential
