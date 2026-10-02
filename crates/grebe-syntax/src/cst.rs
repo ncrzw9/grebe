@@ -59,9 +59,30 @@ pub struct Tree {
     pub nodes: Vec<Node>,
     pub tokens: Vec<Token>,
     pub root: NodeId,
+    /// Every node in depth-first, left-to-right order, computed once:
+    /// `walk` and `find` are called by every detector over the whole file.
+    preorder: Vec<NodeId>,
 }
 
 impl Tree {
+    /// Builds a tree from a linked arena.
+    #[must_use]
+    pub fn new(nodes: Vec<Node>, tokens: Vec<Token>, root: NodeId) -> Self {
+        let mut preorder = Vec::with_capacity(nodes.len());
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            preorder.push(id);
+            // reversed so children come out left-to-right
+            stack.extend(nodes[id.0 as usize].children.iter().rev());
+        }
+        Tree {
+            nodes,
+            tokens,
+            root,
+            preorder,
+        }
+    }
+
     /// The root node — always the `Program` rule.
     #[must_use]
     pub fn root(&self) -> NodeId {
@@ -102,16 +123,7 @@ impl Tree {
     /// Every node, in pre-order from the root.
     #[must_use]
     pub fn walk(&self) -> Vec<NodeId> {
-        let mut out = Vec::with_capacity(self.nodes.len());
-        let mut stack = vec![self.root];
-        while let Some(id) = stack.pop() {
-            out.push(id);
-            // reversed so children come out left-to-right
-            for &c in self.children(id).iter().rev() {
-                stack.push(c);
-            }
-        }
-        out
+        self.preorder.clone()
     }
 
     /// Pre-order descendants of `id`, excluding `id` itself.
@@ -133,9 +145,15 @@ impl Tree {
     /// The workhorse for detectors: `tree.find("GroupByClause")`.
     #[must_use]
     pub fn find(&self, rule: &str) -> Vec<NodeId> {
-        self.walk()
-            .into_iter()
-            .filter(|&id| self.rule_name(id) == rule)
+        // Resolve the name once and compare rule ids per node: detectors call
+        // this for every rule they check, over every node of the file.
+        let Some(id) = crate::grammar::RULES.iter().position(|r| r.name == rule) else {
+            return Vec::new();
+        };
+        self.preorder
+            .iter()
+            .copied()
+            .filter(|&n| self.nodes[n.0 as usize].rule.0 as usize == id)
             .collect()
     }
 
