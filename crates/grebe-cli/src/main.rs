@@ -37,9 +37,9 @@
 //! changing. `check --json` prints one JSON document (`grebe_lsp::json`) and
 //! nothing else on stdout.
 //!
-//! `parse`, `tree` and `batch` are undocumented on purpose: internal verbs
-//! that drive the matcher directly when testing it against a corpus, not
-//! part of the user-facing surface.
+//! `parse`, `tree`, `batch` and `split` are undocumented on purpose:
+//! internal verbs that drive the matcher directly when testing it against a
+//! corpus, not part of the user-facing surface.
 //!
 //! Formatting is never a diagnostic: `check` reports no layout findings, and
 //! `format --check` is the only layout gate.
@@ -49,6 +49,38 @@
 //! usage or config error.
 
 mod setup;
+
+/// `print!` / `println!` for stdout, ending the run when the reader has
+/// gone. Rust ignores SIGPIPE, so a plain `println!` panics when output is
+/// piped into something that stops reading (`grebe rules | head`). This
+/// exits instead, with 141, the status a Unix tool killed by SIGPIPE reports,
+/// so `set -o pipefail` scripts see the usual signal rather than a false 0.
+macro_rules! out {
+    ($($arg:tt)*) => { emit(format_args!($($arg)*), false) };
+}
+macro_rules! outln {
+    () => { emit(format_args!(""), true) };
+    ($($arg:tt)*) => { emit(format_args!($($arg)*), true) };
+}
+
+fn emit(args: std::fmt::Arguments<'_>, newline: bool) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let written = stdout.write_fmt(args).and_then(|()| {
+        if newline {
+            stdout.write_all(b"\n")
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(e) = written {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(141);
+        }
+        eprintln!("grebe: cannot write output: {e}");
+        std::process::exit(2);
+    }
+}
 
 /// The parser is recursive, and a Rust stack overflow ABORTS -- it is not a
 /// catchable error. `MAX_DEPTH` bounds recursion, but the frames themselves
@@ -70,7 +102,7 @@ fn main() {
 
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
-    // The internal verbs (`parse`, `tree`, `batch`) are left out of the help
+    // The internal verbs (`parse`, `tree`, `batch`, `split`) are left out of the help
     // on purpose; see the module doc comment.
     if args.len() >= 2 && args[1] == "--help" {
         print_top_help();
@@ -80,19 +112,38 @@ fn run() -> i32 {
     // this, someone installing a build on a second machine has no way to tell
     // whether the copy that is running is the copy they just installed.
     if args.len() >= 2 && args[1] == "--version" {
-        println!("grebe {}", env!("CARGO_PKG_VERSION"));
+        outln!("grebe {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
     if args.len() >= 3 && args[1] == "parse" {
         let sql = &args[2];
         let (ok, far) = grebe_syntax::matcher::parse_check(sql);
         if ok {
-            println!("OK");
+            outln!("OK");
             return 0;
         } else {
-            println!("FAIL {}", far);
+            outln!("FAIL {}", far);
             return 1;
         }
+    }
+
+    // Split mode for corpus testing: SQL on stdin, each statement written
+    // out NUL-terminated, trimmed, empty ones dropped. Harnesses use it so
+    // they cut a corpus into statements exactly as grebe does.
+    if args.len() >= 2 && args[1] == "split" {
+        use std::io::Read;
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            eprintln!("grebe: stdin is not valid UTF-8");
+            return 2;
+        }
+        for sp in grebe_syntax::token::split_statements(&buf) {
+            let stmt = buf[sp.start as usize..sp.end as usize].trim();
+            if !stmt.is_empty() {
+                out!("{stmt}\0");
+            }
+        }
+        return 0;
     }
 
     // Batch mode for corpus testing: NUL-separated statements on stdin, one
@@ -135,7 +186,7 @@ fn run() -> i32 {
                 while let Some((id, d)) = stack.pop() {
                     let txt = t.text(id, sql);
                     let short: String = txt.chars().take(48).collect();
-                    println!(
+                    outln!(
                         "{:indent$}{} [{}..{}] {:?}",
                         "",
                         t.rule_name(id),
@@ -245,7 +296,7 @@ fn run() -> i32 {
             if want_check {
                 return i32::from(out != buf);
             }
-            print!("{out}");
+            out!("{out}");
             return 0;
         }
 
@@ -282,13 +333,13 @@ fn run() -> i32 {
                 continue;
             }
             if want_check {
-                println!("would reformat {}", f.display());
+                outln!("would reformat {}", f.display());
             } else {
                 if let Err(e) = std::fs::write(f, &out) {
                     eprintln!("grebe format: could not write {}: {e}", f.display());
                     return 2;
                 }
-                println!("reformatted {}", f.display());
+                outln!("reformatted {}", f.display());
             }
             changed += 1;
         }
@@ -523,7 +574,7 @@ fn run() -> i32 {
                         ),
                     ]));
                 } else {
-                    println!("{}:{}:{}: {} {}", f.display(), line, col, fnd.code, name);
+                    outln!("{}:{}:{}: {} {}", f.display(), line, col, fnd.code, name);
                 }
                 total += 1;
                 if sev == grebe_rules::Severity::Error {
@@ -554,7 +605,7 @@ fn run() -> i32 {
                     grebe_lsp::json::Json::num(fixed_edits as f64),
                 ),
             ]);
-            println!("{}", grebe_lsp::json::to_string(&doc));
+            outln!("{}", grebe_lsp::json::to_string(&doc));
         }
         if fix.is_some() {
             eprintln!(
@@ -604,125 +655,125 @@ fn run() -> i32 {
 }
 
 /// Top-level `grebe --help`. Lists the user-facing verbs (`check`, `format`,
-/// `rules`, `lsp`); `parse`, `tree` and `batch` are internal testing verbs
+/// `rules`, `lsp`); `parse`, `tree`, `batch` and `split` are internal testing verbs
 /// and are omitted on purpose (see the module doc comment's "Verbs" section).
 fn print_top_help() {
-    println!("grebe — a DuckDB SQL formatter and linter");
-    println!();
-    println!("Usage: grebe <command> [ARGS]");
-    println!();
-    println!("Commands:");
-    println!("  format   rewrite SQL files to canonical layout");
-    println!("  check    lint SQL files or directories");
-    println!("  rules    print the rule registry as a table");
-    println!("  lsp      run the language server on stdin/stdout");
-    println!();
-    println!("  --version   print the version and exit");
-    println!();
-    println!("Run 'grebe <command> --help' for that command's own flags.");
-    println!();
-    println!("Both format and check read grebe.toml (or [tool.grebe] in");
-    println!("pyproject.toml), discovered by walking up from the first path");
-    println!("given; --config PATH reads a specific file, --no-config reads none.");
-    println!();
-    println!("Exit codes:");
-    println!("  0   no findings, or every finding is below error severity");
-    println!("  1   at least one finding at error severity, or format --check");
-    println!("      found a file that would change");
-    println!("  2   usage or config error");
+    outln!("grebe — a DuckDB SQL formatter and linter");
+    outln!();
+    outln!("Usage: grebe <command> [ARGS]");
+    outln!();
+    outln!("Commands:");
+    outln!("  format   rewrite SQL files to canonical layout");
+    outln!("  check    lint SQL files or directories");
+    outln!("  rules    print the rule registry as a table");
+    outln!("  lsp      run the language server on stdin/stdout");
+    outln!();
+    outln!("  --version   print the version and exit");
+    outln!();
+    outln!("Run 'grebe <command> --help' for that command's own flags.");
+    outln!();
+    outln!("Both format and check read grebe.toml (or [tool.grebe] in");
+    outln!("pyproject.toml), discovered by walking up from the first path");
+    outln!("given; --config PATH reads a specific file, --no-config reads none.");
+    outln!();
+    outln!("Exit codes:");
+    outln!("  0   no findings, or every finding is below error severity");
+    outln!("  1   at least one finding at error severity, or format --check");
+    outln!("      found a file that would change");
+    outln!("  2   usage or config error");
 }
 
 /// `grebe format --help`.
 fn print_format_help() {
-    println!("grebe format — rewrite SQL files to canonical layout");
-    println!();
-    println!("Usage: grebe format PATHS... [--check] [--config PATH | --no-config]");
-    println!();
-    println!("Arguments:");
-    println!("  PATHS   one or more files or directories to format; directories are");
-    println!("          searched recursively for *.sql files. A single '-' reads");
-    println!("          stdin and writes the formatted text to stdout, nothing else.");
-    println!();
-    println!("Options:");
-    println!("  --check          write nothing; print 'would reformat <path>' for");
-    println!("                   each file that would change, and exit 1 if any");
-    println!("                   would (0 if none would).");
-    println!("  --config PATH    read this config file instead of discovering one.");
-    println!("  --no-config      read no config file, even if grebe.toml exists.");
-    println!();
-    println!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
-    println!("pyproject.toml) is discovered by walking up from the first path given");
-    println!("(the current directory, for stdin). Its [format] table sets");
-    println!("indent_size, inline_threshold and keyword_case.");
-    println!();
-    println!("Exit codes:");
-    println!("  0   nothing needed changing, or files were rewritten");
-    println!("  1   --check found a file that would change");
-    println!("  2   usage error (unrecognized flag, no .sql files found,");
-    println!("      unreadable/unwritable file, or a config error)");
+    outln!("grebe format — rewrite SQL files to canonical layout");
+    outln!();
+    outln!("Usage: grebe format PATHS... [--check] [--config PATH | --no-config]");
+    outln!();
+    outln!("Arguments:");
+    outln!("  PATHS   one or more files or directories to format; directories are");
+    outln!("          searched recursively for *.sql files. A single '-' reads");
+    outln!("          stdin and writes the formatted text to stdout, nothing else.");
+    outln!();
+    outln!("Options:");
+    outln!("  --check          write nothing; print 'would reformat <path>' for");
+    outln!("                   each file that would change, and exit 1 if any");
+    outln!("                   would (0 if none would).");
+    outln!("  --config PATH    read this config file instead of discovering one.");
+    outln!("  --no-config      read no config file, even if grebe.toml exists.");
+    outln!();
+    outln!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
+    outln!("pyproject.toml) is discovered by walking up from the first path given");
+    outln!("(the current directory, for stdin). Its [format] table sets");
+    outln!("indent_size, inline_threshold and keyword_case.");
+    outln!();
+    outln!("Exit codes:");
+    outln!("  0   nothing needed changing, or files were rewritten");
+    outln!("  1   --check found a file that would change");
+    outln!("  2   usage error (unrecognized flag, no .sql files found,");
+    outln!("      unreadable/unwritable file, or a config error)");
 }
 
 /// `grebe check --help`.
 fn print_check_help() {
-    println!("grebe check — lint SQL files");
-    println!();
-    println!("Usage: grebe check PATHS... [--select CODE[,CODE...]] [--fix [--unsafe]] [--json]");
-    println!("                    [--config PATH | --no-config]");
-    println!();
-    println!("Arguments:");
-    println!("  PATHS   one or more files or directories to lint; directories are");
-    println!("          searched recursively for *.sql files");
-    println!();
-    println!("Options:");
-    println!("  --select CODE[,CODE...]   run only these MOD rules, and enable any of");
-    println!("                            them that default to Off (see 'grebe rules').");
-    println!("                            Without --select, every MOD rule whose default");
-    println!("                            severity is not Off runs. PRS and SRC findings");
-    println!("                            are always reported unless set to off in");
-    println!("                            [severity]. Wins over a config file's select.");
-    println!("  --fix                     rewrite the files in place, applying the");
-    println!("                            fixes marked safe in 'grebe rules'. What is");
-    println!("                            printed afterwards is what is left.");
-    println!("  --unsafe                  with --fix, also apply the fixes marked");
-    println!("                            unsafe. These can change what a query");
-    println!("                            returns; read the diff. Needs --fix.");
-    println!("  --json                    print one JSON document to stdout instead");
-    println!("                            of text lines; summaries still go to");
-    println!("                            stderr.");
-    println!("  --config PATH             read this config file instead of");
-    println!("                            discovering one.");
-    println!("  --no-config               read no config file, even if grebe.toml");
-    println!("                            exists.");
-    println!();
-    println!("Put '-- grebe: ignore[CODE]' on a statement to silence it (a bare");
-    println!("'-- grebe: ignore' silences every code). A suppressed finding is");
-    println!("never fixed.");
-    println!();
-    println!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
-    println!("pyproject.toml) is discovered by walking up from the first path given.");
-    println!("Its select, [severity] and foreign-heads apply here; a config's own");
-    println!("select only takes effect when --select is absent on the command line.");
-    println!();
-    println!("Exit codes:");
-    println!("  0   no findings, or every finding is below error severity");
-    println!("  1   at least one finding at error severity (an effective severity,");
-    println!("      after any [severity] override)");
-    println!("  2   usage error (unrecognized flag, unknown rule code, no .sql");
-    println!("      files found, or a config error)");
+    outln!("grebe check — lint SQL files");
+    outln!();
+    outln!("Usage: grebe check PATHS... [--select CODE[,CODE...]] [--fix [--unsafe]] [--json]");
+    outln!("                    [--config PATH | --no-config]");
+    outln!();
+    outln!("Arguments:");
+    outln!("  PATHS   one or more files or directories to lint; directories are");
+    outln!("          searched recursively for *.sql files");
+    outln!();
+    outln!("Options:");
+    outln!("  --select CODE[,CODE...]   run only these MOD rules, and enable any of");
+    outln!("                            them that default to Off (see 'grebe rules').");
+    outln!("                            Without --select, every MOD rule whose default");
+    outln!("                            severity is not Off runs. PRS and SRC findings");
+    outln!("                            are always reported unless set to off in");
+    outln!("                            [severity]. Wins over a config file's select.");
+    outln!("  --fix                     rewrite the files in place, applying the");
+    outln!("                            fixes marked safe in 'grebe rules'. What is");
+    outln!("                            printed afterwards is what is left.");
+    outln!("  --unsafe                  with --fix, also apply the fixes marked");
+    outln!("                            unsafe. These can change what a query");
+    outln!("                            returns; read the diff. Needs --fix.");
+    outln!("  --json                    print one JSON document to stdout instead");
+    outln!("                            of text lines; summaries still go to");
+    outln!("                            stderr.");
+    outln!("  --config PATH             read this config file instead of");
+    outln!("                            discovering one.");
+    outln!("  --no-config               read no config file, even if grebe.toml");
+    outln!("                            exists.");
+    outln!();
+    outln!("Put '-- grebe: ignore[CODE]' on a statement to silence it (a bare");
+    outln!("'-- grebe: ignore' silences every code). A suppressed finding is");
+    outln!("never fixed.");
+    outln!();
+    outln!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
+    outln!("pyproject.toml) is discovered by walking up from the first path given.");
+    outln!("Its select, [severity] and foreign-heads apply here; a config's own");
+    outln!("select only takes effect when --select is absent on the command line.");
+    outln!();
+    outln!("Exit codes:");
+    outln!("  0   no findings, or every finding is below error severity");
+    outln!("  1   at least one finding at error severity (an effective severity,");
+    outln!("      after any [severity] override)");
+    outln!("  2   usage error (unrecognized flag, unknown rule code, no .sql");
+    outln!("      files found, or a config error)");
 }
 
 /// `grebe rules --help`.
 fn print_rules_help() {
-    println!("grebe rules — print the rule registry");
-    println!();
-    println!("Usage: grebe rules");
-    println!();
-    println!("No flags. Prints one row per rule: code, name, category, default");
-    println!("severity, and fix safety. Rows marked \"off (opt-in)\" are disabled by");
-    println!("default; turn one on with 'grebe check --select CODE,...'.");
-    println!();
-    println!("Exit codes:");
-    println!("  0   always");
+    outln!("grebe rules — print the rule registry");
+    outln!();
+    outln!("Usage: grebe rules");
+    outln!();
+    outln!("No flags. Prints one row per rule: code, name, category, default");
+    outln!("severity, and fix safety. Rows marked \"off (opt-in)\" are disabled by");
+    outln!("default; turn one on with 'grebe check --select CODE,...'.");
+    outln!();
+    outln!("Exit codes:");
+    outln!("  0   always");
 }
 
 /// `grebe rules`: the registry (`grebe_rules::RULES`) as a plain-text table,
@@ -800,12 +851,17 @@ fn print_rules_table() {
         .unwrap_or(0)
         .max(headers.4.len());
 
-    println!(
+    outln!(
         "{:w_code$}  {:w_name$}  {:w_cat$}  {:w_sev$}  {:w_st$}  {}",
-        headers.0, headers.1, headers.2, headers.3, headers.4, headers.5
+        headers.0,
+        headers.1,
+        headers.2,
+        headers.3,
+        headers.4,
+        headers.5
     );
     for r in &rows {
-        println!(
+        outln!(
             "{:w_code$}  {:w_name$}  {:w_cat$}  {:w_sev$}  {:w_st$}  {}",
             code(r),
             name(r),
@@ -815,12 +871,12 @@ fn print_rules_table() {
             fix(r)
         );
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "Rows marked \"off (opt-in)\" default to Off; enable one with 'grebe check --select CODE,...'."
     );
 
-    println!(
+    outln!(
         "DETECTOR \"not yet\" means the rule is registered but has no detector, so it cannot fire ({} of {} can).",
         grebe_rules::IMPLEMENTED.len(),
         grebe_rules::RULES.len()
@@ -855,18 +911,18 @@ fn severity_str(s: grebe_rules::Severity) -> &'static str {
 /// an editor spawns it. The one thing a human needs from it is confirmation
 /// that the binary they configured is the one being launched.
 fn print_lsp_help() {
-    println!("Usage: grebe lsp");
-    println!();
-    println!("Runs the language server over stdin/stdout, speaking LSP with");
-    println!("Content-Length framing. Editors spawn this; it is not useful");
-    println!("to run by hand.");
-    println!();
-    println!("Publishes diagnostics on open, change and save, and offers quick");
-    println!("fixes and semantic highlighting. Formatting (textDocument/formatting)");
-    println!("reads grebe.toml's [format] table the same way the CLI does;");
-    println!("completion and hover are not implemented.");
-    println!();
-    println!("The VS Code client lives in editors/vscode.");
+    outln!("Usage: grebe lsp");
+    outln!();
+    outln!("Runs the language server over stdin/stdout, speaking LSP with");
+    outln!("Content-Length framing. Editors spawn this; it is not useful");
+    outln!("to run by hand.");
+    outln!();
+    outln!("Publishes diagnostics on open, change and save, and offers quick");
+    outln!("fixes and semantic highlighting. Formatting (textDocument/formatting)");
+    outln!("reads grebe.toml's [format] table the same way the CLI does;");
+    outln!("completion and hover are not implemented.");
+    outln!();
+    outln!("The VS Code client lives in editors/vscode.");
 }
 
 /// Maps `work` over `items` on every available core and returns the results

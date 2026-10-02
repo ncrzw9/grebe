@@ -338,3 +338,22 @@ fn many_files_report_in_path_order_and_deep_nesting_still_parses() {
     sorted.sort_unstable();
     assert_eq!(lines, sorted, "format output must come out in path order");
 }
+
+#[test]
+fn a_closed_stdout_ends_the_run_quietly() {
+    let dir = TempDir::new("broken-pipe");
+    // Far more output than a pipe buffer holds, so writes hit the closed end.
+    dir.write("many.sql", &"SELECT count(*) FROM t;\n".repeat(20_000));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_grebe"))
+        .args(["check", "."])
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run grebe");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait for grebe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.code(), Some(141), "{stderr}");
+}

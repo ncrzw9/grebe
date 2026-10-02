@@ -149,14 +149,15 @@ pub fn analyze(src: &str, selection: &Selection<'_>) -> Vec<Finding> {
 /// Reported separately by `grebe check` because "did not parse" is a fact about
 /// the file, not a finding, and stays true even when `PRS001` is suppressed.
 pub fn unparsed_count(src: &str) -> usize {
-    if grebe_syntax::matcher::parse(src).is_some() {
+    // Accept/reject only: building a tree here would parse the file a second
+    // time at full cost just to throw the tree away.
+    let parses = |s: &str| grebe_syntax::matcher::parse_check(s).0;
+    if parses(src) {
         return 0;
     }
     grebe_syntax::token::split_statements(src)
         .into_iter()
-        .filter(|sp| {
-            grebe_syntax::matcher::parse(&src[sp.start as usize..sp.end as usize]).is_none()
-        })
+        .filter(|sp| !parses(&src[sp.start as usize..sp.end as usize]))
         .count()
 }
 

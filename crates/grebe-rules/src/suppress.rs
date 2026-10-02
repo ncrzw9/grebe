@@ -68,6 +68,16 @@ impl Suppressions {
 
         let line_of = LineIndex::new(src);
         let mut entries: Vec<(Span, Mark)> = Vec::new();
+        // Comments with their line, in source order. A comment can only
+        // belong to a statement if its line falls between the previous
+        // statement's last line and this statement's first, so each
+        // statement takes that range by binary search instead of rescanning
+        // every token: per-statement scans were quadratic on large files.
+        let comments: Vec<(usize, &grebe_syntax::token::Token)> = toks
+            .iter()
+            .filter(|t| matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment))
+            .map(|t| (line_of.line(t.span.start), t))
+            .collect();
 
         for (i, stmt) in stmts.iter().enumerate() {
             let first_line = line_of.line(stmt.start);
@@ -78,11 +88,12 @@ impl Suppressions {
             let prev_end_line = i.checked_sub(1).map(|p| line_of.line(stmts[p].end));
 
             let mut marks: Vec<Mark> = Vec::new();
-            for t in &toks {
-                if !matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment) {
-                    continue;
-                }
-                let cline = line_of.line(t.span.start);
+            let lowest = prev_end_line.map_or(0, |p| (p + 1).min(first_line));
+            let from = comments.partition_point(|&(line, _)| line < lowest);
+            for &(cline, t) in comments[from..]
+                .iter()
+                .take_while(|&&(line, _)| line <= first_line)
+            {
                 let applies = if cline == first_line {
                     // "on its first line" -- inside the statement or trailing
                     // it, as long as it shares the first code token's line.
@@ -115,15 +126,20 @@ impl Suppressions {
     /// per-statement spans back into file coordinates before reporting, so the
     /// same call works on the whole-file and per-statement paths alike.
     pub fn is_suppressed(&self, code: &str, offset: u32) -> bool {
-        self.entries.iter().any(|(span, mark)| {
-            if offset < span.start || offset >= span.end {
-                return false;
-            }
-            match mark {
+        // Entries are in statement order and statements never overlap, so
+        // only the entries of the last statement starting at or before
+        // `offset` can cover it.
+        let end = self
+            .entries
+            .partition_point(|(span, _)| span.start <= offset);
+        self.entries[..end]
+            .iter()
+            .rev()
+            .take_while(|(span, _)| offset < span.end)
+            .any(|(_, mark)| match mark {
                 Mark::All => true,
                 Mark::Codes(codes) => codes.iter().any(|c| c.eq_ignore_ascii_case(code)),
-            }
-        })
+            })
     }
 
     /// True when the buffer carries no suppressions at all — the common case,

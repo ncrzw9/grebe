@@ -466,28 +466,61 @@ pub fn parse(src: &str) -> Option<Tree> {
     nodes[root_idx].span = crate::Span::new(0, src.len() as u32);
 
     // Reattach every token, trivia included, to the innermost node whose
-    // span contains it. Siblings never overlap, so that node is found by
-    // walking down from the root, never by scanning the arena.
+    // span contains it, walking down from the root. A file of thousands of
+    // statements gives the root thousands of children, and lists (`VALUES`
+    // rows, `IN` lists) can be as wide, so a linear scan per token would be
+    // quadratic; wide nodes are searched through a sorted index instead.
+    let mut wide: Vec<Option<Vec<NodeId>>> = vec![None; nodes.len()];
     for t in &tokens {
         let mut at = root_idx;
-        'descend: loop {
-            for &c in &nodes[at].children {
-                let span = nodes[c.0 as usize].span;
-                if t.span.start >= span.start && t.span.end <= span.end {
-                    at = c.0 as usize;
-                    continue 'descend;
-                }
-            }
-            break;
+        while let Some(child) = containing_child(&nodes, &mut wide, at, t.span) {
+            at = child;
         }
         nodes[at].tokens.push(*t);
     }
 
-    Some(Tree {
-        nodes,
-        tokens,
-        root: NodeId(root_idx as u32),
-    })
+    Some(Tree::new(nodes, tokens, NodeId(root_idx as u32)))
+}
+
+/// The child of `parent` whose span contains `span`, if any.
+///
+/// Children are in match order, which is source order except for zero-width
+/// nodes that attached to an ancestor (see [`link`]); a zero-width node never
+/// contains a token, and the non-empty children never overlap, so at most
+/// one child qualifies. Narrow nodes are scanned; a wide node gets an index of
+/// its non-empty children, built once and binary-searched by start.
+fn containing_child(
+    nodes: &[Node],
+    wide: &mut [Option<Vec<NodeId>>],
+    parent: usize,
+    span: Span,
+) -> Option<usize> {
+    const SCAN_LIMIT: usize = 16;
+    let contains = |c: NodeId| {
+        let s = nodes[c.0 as usize].span;
+        span.start >= s.start && span.end <= s.end
+    };
+    let children = &nodes[parent].children;
+    if children.len() <= SCAN_LIMIT {
+        return children
+            .iter()
+            .copied()
+            .find(|&c| contains(c))
+            .map(|c| c.0 as usize);
+    }
+    let index = wide[parent].get_or_insert_with(|| {
+        children
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let s = nodes[c.0 as usize].span;
+                s.start < s.end
+            })
+            .collect()
+    });
+    let after = index.partition_point(|&c| nodes[c.0 as usize].span.start <= span.start);
+    let candidate = *index[..after].last()?;
+    contains(candidate).then_some(candidate.0 as usize)
 }
 
 /// Turns the matcher's post-order arena into linked [`Node`]s. Walking in
@@ -546,4 +579,50 @@ pub fn parse_check(src: &str) -> (bool, usize) {
         false
     };
     (ok, matcher.far)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The definition token attachment must meet: the smallest node whose
+    /// span contains the token, the earliest in the arena on a tie.
+    fn brute_force_owner(tree: &Tree, t: &Token) -> usize {
+        let mut best = (u32::MAX, usize::MAX);
+        for (i, n) in tree.nodes.iter().enumerate() {
+            if t.span.start >= n.span.start && t.span.end <= n.span.end && n.span.len() < best.0 {
+                best = (n.span.len(), i);
+            }
+        }
+        best.1
+    }
+
+    #[test]
+    fn tokens_attach_to_their_innermost_node_in_wide_trees() {
+        // A wide root (many statements), a wide VALUES list, and ON CONFLICT,
+        // whose zero-width modifiers attach out of source order.
+        let rows: Vec<String> = (0..60).map(|i| format!("({i}, 'x{i}')")).collect();
+        let mut src = format!("INSERT INTO t (a, b) VALUES {};\n", rows.join(", "));
+        for i in 0..120 {
+            src.push_str(&format!(
+                "INSERT INTO t (j, i) VALUES ({i}, 1) ON CONFLICT DO UPDATE SET j = EXCLUDED.j; -- n{i}\n"
+            ));
+        }
+        let tree = parse(&src).expect("parses");
+        let mut owner = vec![usize::MAX; tree.tokens.len()];
+        for (i, n) in tree.nodes.iter().enumerate() {
+            for t in &n.tokens {
+                let k = tree.tokens.iter().position(|x| x.span == t.span).unwrap();
+                owner[k] = i;
+            }
+        }
+        for (k, t) in tree.tokens.iter().enumerate() {
+            assert_eq!(
+                owner[k],
+                brute_force_owner(&tree, t),
+                "token {k} at {:?}",
+                t.span
+            );
+        }
+    }
 }
