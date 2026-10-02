@@ -1,0 +1,220 @@
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: "1.98.0"
+  BIN_NAME: grebe
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag ships only if it names the version every manifest declares and the
+  # tree passes the same checks as CI.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component rustfmt,clippy && rustup default ${{ env.RUST_VERSION }}
+      - name: Tag matches Cargo.toml and package.json
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "grebe") | .version')
+          vscode_version=$(jq -r .version editors/vscode/package.json)
+          echo "tag=$tag cargo=$cargo_version vscode=$vscode_version"
+          [ "$tag" = "$cargo_version" ] && [ "$tag" = "$vscode_version" ]
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo package --workspace
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify
+    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            aarch64_gnu: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }} (target ${{ matrix.target }})
+        shell: bash
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_VERSION }}
+          rustup target add ${{ matrix.target }}
+
+      - name: Install musl cross tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install aarch64-linux-gnu cross tools
+        if: matrix.aarch64_gnu
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu; then
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::warning::apt attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not install gcc-aarch64-linux-gnu after 3 attempts" >&2
+          exit 1
+
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="${{ env.BIN_NAME }}-${{ matrix.target }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$dir/"
+          cp LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "${{ env.BIN_NAME }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}.exe" "$dir/"
+          Copy-Item LICENSE "$dir/"
+          Copy-Item README.md "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: |
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.zip
+          if-no-files-found: ignore
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Package the VS Code extension
+        run: |
+          set -euo pipefail
+          node editors/vscode/build-grammar.js
+          if ! git diff --quiet editors/vscode/syntaxes/; then
+            echo "::error::editors/vscode/syntaxes/ is stale -- run 'node editors/vscode/build-grammar.js' and commit the result" >&2
+            exit 1
+          fi
+          cd editors/vscode
+          npm install --silent
+          npx --yes @vscode/vsce package
+          ls -la ./*.vsix
+
+      - name: Flatten artifacts and generate checksums
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} out/ \;
+          cp editors/vscode/*.vsix out/
+          ( cd out && sha256sum * > SHA256SUMS.txt )
+          ls -la out
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" out/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
+
+  # Publishing waits on the `release` environment, which requires a manual
+  # approval: every tag builds and tests on its own, nothing reaches a
+  # registry until a person approves it. crates.io and the VS Code
+  # Marketplace authenticate with short-lived OIDC tokens (trusted
+  # publishing), so no long-lived registry token is stored here.
+  publish:
+    name: publish to crates.io and the extension marketplaces
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Open VSX has no trusted publishing; its step is skipped until this
+      # secret exists.
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal && rustup default ${{ env.RUST_VERSION }}
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: crates-io
+
+      # Publishes every crate in dependency order.
+      - name: Publish crates
+        run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The extension published is the exact file attached to the release.
+      - name: Fetch the released extension
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "${{ github.ref_name }}" --pattern '*.vsix' --dir dist
+
+      - name: Publish to the VS Code Marketplace
+        run: npx --yes @vscode/vsce publish --oidc --packagePath dist/*.vsix
+
+      - name: Publish to Open VSX
+        if: ${{ env.OVSX_PAT != '' }}
+        run: npx --yes ovsx publish dist/*.vsix --pat "$OVSX_PAT"

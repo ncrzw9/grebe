@@ -1,0 +1,17 @@
+[package]
+name = "grebe-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DuckDB SQL parser built from DuckDB's own PEG grammar: tokenizer, packrat matcher, lossless CST."
+keywords.workspace = true
+categories.workspace = true
+build = "build.rs"
+
+[dependencies]
+
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+{
+  "generated": {
+    "note": "GENERATED FILE -- do not hand-edit.",
+    "by": "editors/vscode/build-grammar.js",
+    "from": "crates/grebe-syntax/vendor/grammar/keywords/reserved_keyword.list",
+    "regenerate": "node editors/vscode/build-grammar.js"
+  },
+  "scopeName": "source.duckdb.keywords",
+  "injectionSelector": "L:source.sql",
+  "patterns": [
+    {
+      "name": "keyword.other.duckdb",
+      "match": "(?i)\\b(PIVOT_LONGER|PIVOT_WIDER|ASYMMETRIC|CONSTRAINT|DEFERRABLE|REFERENCES|INITIALLY|INTERSECT|RETURNING|SUMMARIZE|SYMMETRIC|DESCRIBE|DISTINCT|TRAILING|VARIADIC|ANALYSE|ANALYZE|COLLATE|DEFAULT|FOREIGN|LATERAL|LEADING|PLACING|PRIMARY|QUALIFY|UNPIVOT|COLUMN|CREATE|EXCEPT|HAVING|LAMBDA|OFFSET|SELECT|UNIQUE|WINDOW|ARRAY|CHECK|FALSE|FETCH|GROUP|LIMIT|ORDER|PIVOT|TABLE|UNION|USING|WHERE|BOTH|CASE|CAST|DESC|ELSE|FROM|INTO|NULL|ONLY|SHOW|SOME|THEN|TRUE|WHEN|WITH|ALL|AND|ANY|ASC|END|FOR|NOT|AS|DO|IN|ON|OR|TO)\\b"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+[package]
+name = "grebe-rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lint rules, autofixes and configuration for the grebe DuckDB SQL linter."
+keywords.workspace = true
+categories.workspace = true
+
+
+[dependencies]
+grebe-syntax.workspace = true
+
+[lints]
+workspace = true
