@@ -47,6 +47,10 @@
 //!   accept it; it is not SQL, and bending the tokenizer to admit it would make
 //!   it wrong about real SQL.
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctest;
+
 pub mod cst;
 pub mod grammar;
 pub mod keyword;
