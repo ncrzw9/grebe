@@ -3,7 +3,7 @@
   "displayName": "grebe",
   "description": "DuckDB SQL diagnostics, quick fixes and formatting via the grebe LSP server",
   "publisher": "ncrzw9",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "license": "MIT",
   "engines": { "vscode": "^1.82.0" },
   "categories": ["Linters", "Formatters", "Programming Languages"],
