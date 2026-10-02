@@ -21,13 +21,8 @@
         "grebe.select": {
           "type": "array",
           "items": { "type": "string" },
-          "default": [
-            "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007", "MOD008",
-            "MOD009", "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016",
-            "MOD017", "MOD018", "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD024",
-            "MOD025"
-          ],
-          "description": "The MOD rules to lint for, same as the grebe CLI's --select flag. Only the MOD rules listed here run, and any of them that are off by default are turned on. The default lists every MOD rule so the editor shows all of them; remove a code to stop seeing it. Parse errors (PRS) and other-dialect notices (SRC) are always shown unless set to off in grebe.toml's [severity]."
+          "default": ["ALL"],
+          "description": "The MOD rules to lint for, same as the grebe CLI's --select flag. Only the MOD rules listed here run, and any of them that are off by default are turned on. The default, [\"ALL\"], is every MOD rule there is -- including ones added after this setting, so the editor stays loud rather than needing an update to see a new rule; list codes explicitly to pick a subset instead. Parse errors (PRS) and other-dialect notices (SRC) are always shown unless set to off in grebe.toml's [severity]."
         }
       }
     },

@@ -58,6 +58,7 @@ first path (`--config PATH` reads a specific file, `--no-config` reads none):
 include = ["**/*.sql"]
 exclude = ["generated/**"]
 # select = ["MOD001", "MOD010"]  # run only these MOD rules (opt-in ones included)
+# select = ["ALL"]               # every MOD rule, default-on and opt-in alike
 
 [severity]
 MOD001 = "warning"   # error | warning | info | off; a level turns an opt-in rule on

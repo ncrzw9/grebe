@@ -224,7 +224,7 @@ fn apply_select<W: Write>(raw: Option<Vec<String>>, state: &mut State, writer: &
     };
     let mut valid = Vec::new();
     let mut unknown = Vec::new();
-    for code in codes {
+    for code in grebe_rules::expand_select(codes) {
         if grebe_rules::lookup(&code).is_some() {
             valid.push(code);
         } else {
@@ -838,5 +838,19 @@ mod tests {
         apply_select(None, &mut state, &mut out);
         assert_eq!(state.select, None);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_select_expands_all_with_no_warning() {
+        let mut state = State::default();
+        let mut out: Vec<u8> = Vec::new();
+        apply_select(Some(vec!["ALL".to_string()]), &mut state, &mut out);
+        let select = state.select.expect("selection set");
+        assert!(select.len() > 1, "{select:?}");
+        assert!(select.contains(&"MOD010".to_string()), "{select:?}");
+        assert!(
+            out.is_empty(),
+            "ALL is a real expansion, not an unknown code"
+        );
     }
 }

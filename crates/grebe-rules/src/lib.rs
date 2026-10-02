@@ -6,7 +6,7 @@
 //!
 //! Both bands:
 //!
-//! - **default-on:** MOD001-009, MOD011-016, MOD021
+//! - **default-on:** MOD001-009, MOD011-016, MOD021, MOD026-029
 //! - **opt-in (`off` until `[severity]` enables them):** MOD010, MOD017-020,
 //!   MOD022-025
 //!
@@ -54,7 +54,7 @@
 
 pub mod registry;
 
-pub use registry::{Category, FixSafety, RULES, Rule, Severity, lookup};
+pub use registry::{Category, FixSafety, RULES, Rule, Severity, expand_select, lookup};
 pub mod analysis;
 pub mod config;
 pub mod detect;
@@ -64,6 +64,7 @@ pub mod suppress;
 pub mod tier2a;
 pub mod tier2b;
 pub mod tier3;
+pub mod tier4;
 
 /// The rule codes that have a detector.
 ///
@@ -81,8 +82,8 @@ pub mod tier3;
 pub const IMPLEMENTED: &[&str] = &[
     "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007", "MOD008", "MOD009",
     "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016", "MOD017", "MOD018",
-    "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD024", "MOD025", "PRS001", "SRC002",
-    "SRC003",
+    "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD024", "MOD025", "MOD026", "MOD027",
+    "MOD028", "MOD029", "PRS001", "SRC002", "SRC003",
 ];
 
 /// Does `code` have a detector?

@@ -357,3 +357,31 @@ fn a_closed_stdout_ends_the_run_quietly() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert_eq!(out.status.code(), Some(141), "{stderr}");
 }
+
+#[test]
+fn select_all_runs_every_opt_in_rule() {
+    let dir = TempDir::new("select-all");
+    // A comma join: MOD010 (implicit-cross-join), Off by default.
+    dir.write("a.sql", "SELECT * FROM a, b;\n");
+
+    let out = grebe(dir.path(), &["check", "."]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("MOD010"),
+        "MOD010 should stay quiet without --select"
+    );
+
+    let out = grebe(dir.path(), &["check", "--select", "ALL", "."]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MOD010"), "{stdout}");
+    assert_eq!(out.status.code(), Some(0), "MOD010 is Info severity");
+}
+
+#[test]
+fn select_all_combined_with_another_code_is_unknown() {
+    let dir = TempDir::new("select-all-mixed");
+    dir.write("a.sql", "SELECT 1;\n");
+    let out = grebe(dir.path(), &["check", "--select", "ALL,MOD001", "."]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ALL"), "{stderr}");
+}

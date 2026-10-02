@@ -383,6 +383,44 @@ pub static RULES: &[Rule] = &[
         fix_safety: FixSafety::None,
         message: "Bare * in the outermost select list. Opt-in.",
     },
+    // --- tier 4: rows coming back wrong or in whatever order the engine
+    // felt like, with nothing in the query's own text saying that was
+    // expected. Detect-only throughout -- see crate::tier4's module doc.
+    Rule {
+        code: "MOD026",
+        name: "limit-no-orderby",
+        category: Category::Mod,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "LIMIT/OFFSET with no ORDER BY: which rows come back is not guaranteed.",
+    },
+    Rule {
+        code: "MOD027",
+        name: "window-no-orderby",
+        category: Category::Mod,
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "row_number()/rank()/lag() etc. with no ORDER BY in OVER: the partition's \
+                   row order is not guaranteed.",
+    },
+    Rule {
+        code: "MOD028",
+        name: "not-in-subquery",
+        category: Category::Mod,
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "NOT IN (subquery): a single NULL in the subquery's result makes this \
+                   match zero rows, silently. Consider NOT EXISTS.",
+    },
+    Rule {
+        code: "MOD029",
+        name: "filter-defeats-outer-join",
+        category: Category::Mod,
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "WHERE filters on the LEFT JOIN's right side, which drops its unmatched \
+                   rows -- the join is acting as an INNER JOIN here.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -392,6 +430,32 @@ pub static RULES: &[Rule] = &[
 #[must_use]
 pub fn lookup(code: &str) -> Option<&'static Rule> {
     RULES.iter().find(|rule| rule.code == code)
+}
+
+/// The reserved selection value meaning "every `MOD` rule, default-on and
+/// opt-in alike" -- the strictness switch for someone who wants every
+/// opinion grebe has, not just the ones that ship on.
+pub const SELECT_ALL: &str = "ALL";
+
+/// Expands a `--select` / `select` / `grebe.select` list: a sole `ALL`
+/// entry (any case) becomes every `MOD` code, in registry order; anything
+/// else passes through untouched. `ALL` is never a real code, so this runs
+/// before a caller validates codes against [`lookup`].
+///
+/// `PRS` and `SRC` codes are deliberately left out of the expansion: a
+/// selection only ever restricts which `MOD` rules run (`Selection::enabled`
+/// in `analysis.rs`), and `ALL` keeps that meaning -- it does not also
+/// reach into `[severity]` to turn PRS/SRC back on.
+#[must_use]
+pub fn expand_select(codes: Vec<String>) -> Vec<String> {
+    if codes.len() == 1 && codes[0].eq_ignore_ascii_case(SELECT_ALL) {
+        return RULES
+            .iter()
+            .filter(|r| r.category == Category::Mod)
+            .map(|r| r.code.to_string())
+            .collect();
+    }
+    codes
 }
 
 #[cfg(test)]
@@ -506,7 +570,7 @@ mod tests {
         );
     }
 
-    /// Category counts: 1 PRS, 3 SRC, 25 MOD (MOD001-025, no gaps).
+    /// Category counts: 1 PRS, 3 SRC, 29 MOD (MOD001-029, no gaps).
     #[test]
     fn category_counts() {
         let prs = RULES.iter().filter(|r| r.category == Category::Prs).count();
@@ -514,8 +578,8 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 3);
-        assert_eq!(mods, 25);
-        assert_eq!(RULES.len(), 29);
+        assert_eq!(mods, 29);
+        assert_eq!(RULES.len(), 33);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025 —
@@ -542,7 +606,7 @@ mod tests {
     }
 
     /// Every `Mod` rule not in the opt-in band above is default-on
-    /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021.
+    /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021, 026-029.
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [
@@ -578,5 +642,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `ALL` expands to every `MOD` code, PRS/SRC excluded, in registry
+    /// order — the order `--select`'s own output and `grebe rules` share.
+    #[test]
+    fn select_all_expands_to_every_mod_code_in_registry_order() {
+        let expanded = expand_select(vec!["ALL".to_string()]);
+        let want: Vec<&str> = RULES
+            .iter()
+            .filter(|r| r.category == Category::Mod)
+            .map(|r| r.code)
+            .collect();
+        assert_eq!(expanded, want);
+        assert!(!expanded.is_empty());
+        for code in &expanded {
+            assert!(lookup(code).is_some(), "{code} not in the registry");
+        }
+    }
+
+    /// Case-insensitive, and only when `ALL` is the sole entry — mixed with
+    /// another code it is not a real rule, so expansion leaves it alone and
+    /// the caller's own validation reports it as unknown.
+    #[test]
+    fn select_all_is_case_insensitive_but_not_combinable() {
+        assert_eq!(
+            expand_select(vec!["all".to_string()]),
+            expand_select(vec!["ALL".to_string()])
+        );
+        let mixed = expand_select(vec!["ALL".to_string(), "MOD001".to_string()]);
+        assert_eq!(mixed, vec!["ALL".to_string(), "MOD001".to_string()]);
+    }
+
+    /// An ordinary selection is untouched.
+    #[test]
+    fn expand_select_passes_through_an_ordinary_list() {
+        let codes = vec!["MOD002".to_string(), "MOD010".to_string()];
+        assert_eq!(expand_select(codes.clone()), codes);
     }
 }

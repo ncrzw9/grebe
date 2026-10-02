@@ -380,11 +380,11 @@ fn run() -> i32 {
             if a == "--select" {
                 match it.next() {
                     Some(v) => {
-                        select = Some(
+                        select = Some(grebe_rules::expand_select(
                             v.split(',')
                                 .map(|c| c.trim().to_ascii_uppercase())
                                 .collect(),
-                        );
+                        ));
                     }
                     None => {
                         eprintln!("grebe check: --select needs a rule code");
@@ -392,11 +392,11 @@ fn run() -> i32 {
                     }
                 }
             } else if let Some(v) = a.strip_prefix("--select=") {
-                select = Some(
+                select = Some(grebe_rules::expand_select(
                     v.split(',')
                         .map(|c| c.trim().to_ascii_uppercase())
                         .collect(),
-                );
+                ));
             } else if a == "--fix" {
                 want_fix = true;
             } else if a == "--unsafe" {
@@ -731,6 +731,8 @@ fn print_check_help() {
     outln!("                            severity is not Off runs. PRS and SRC findings");
     outln!("                            are always reported unless set to off in");
     outln!("                            [severity]. Wins over a config file's select.");
+    outln!("  --select ALL              run every MOD rule, default-on and opt-in");
+    outln!("                            alike -- the strictest check available.");
     outln!("  --fix                     rewrite the files in place, applying the");
     outln!("                            fixes marked safe in 'grebe rules'. What is");
     outln!("                            printed afterwards is what is left.");
