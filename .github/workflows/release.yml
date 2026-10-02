@@ -172,9 +172,10 @@ jobs:
 
   # Publishing waits on the `release` environment, which requires a manual
   # approval: every tag builds and tests on its own, nothing reaches a
-  # registry until a person approves it. crates.io and the VS Code
-  # Marketplace authenticate with short-lived OIDC tokens (trusted
-  # publishing), so no long-lived registry token is stored here.
+  # registry until a person approves it. crates.io authenticates with a
+  # short-lived OIDC token (trusted publishing). The VS Code Marketplace has
+  # no equivalent for vsce, so it takes an Azure DevOps PAT (VSCE_PAT) scoped
+  # to Marketplace > Manage, stored as a secret of the `release` environment.
   publish:
     name: publish to crates.io and the extension marketplaces
     needs: release
@@ -185,6 +186,8 @@ jobs:
       contents: read
       id-token: write
     env:
+      # vsce reads VSCE_PAT from the environment.
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
       # Open VSX has no trusted publishing; its step is skipped until this
       # secret exists.
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
@@ -213,7 +216,7 @@ jobs:
         run: gh release download "${{ github.ref_name }}" --pattern '*.vsix' --dir dist
 
       - name: Publish to the VS Code Marketplace
-        run: npx --yes @vscode/vsce publish --oidc --packagePath dist/*.vsix
+        run: npx --yes @vscode/vsce publish --packagePath dist/*.vsix
 
       - name: Publish to Open VSX
         if: ${{ env.OVSX_PAT != '' }}
