@@ -19,7 +19,7 @@
 //! with, so no parse failure goes unclassified.
 //!
 //! The opt-in band defaults to [`Severity::Off`] (MOD010, MOD017-020,
-//! MOD022-025, MOD031).
+//! MOD022-025, MOD031, MOD033-034).
 
 /// Which layer of the tool produced the rule.
 ///
@@ -44,9 +44,10 @@ pub enum Category {
 ///
 /// `Off` is a real registry entry, not an omission: the rule exists but
 /// fires only once a `grebe.toml` `[severity]` entry or `--select` turns it
-/// on. The opt-in band (MOD010, MOD017-020, MOD022-025, MOD031) is either
-/// too noisy on idiomatic DuckDB SQL to default on, unproven on SQL written
-/// by others, or house style by nature; each row in [`RULES`] says which.
+/// on. The opt-in band (MOD010, MOD017-020, MOD022-025, MOD031,
+/// MOD033-034) is either too noisy on idiomatic DuckDB SQL to default on,
+/// unproven on SQL written by others, or house style by nature; each row in
+/// [`RULES`] says which.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Severity {
     Error,
@@ -445,6 +446,32 @@ pub static RULES: &[Rule] = &[
         fix_safety: FixSafety::Safe,
         message: "This CASE is coalesce(...) or nullif(...); the function says it directly.",
     },
+    Rule {
+        code: "MOD032",
+        name: "not-in-null",
+        category: Category::Mod,
+        // Default-on despite no corpus evidence: every finding is a certain
+        // bug (the test is never true), so there is no noise to measure.
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "NOT IN list contains NULL: the test is never true, so this keeps no rows.",
+    },
+    Rule {
+        code: "MOD033",
+        name: "having-without-aggregate",
+        category: Category::Mod,
+        default_severity: Severity::Off,
+        fix_safety: FixSafety::None,
+        message: "HAVING uses no aggregate: as a WHERE condition it filters before grouping.",
+    },
+    Rule {
+        code: "MOD034",
+        name: "redundant-count-default",
+        category: Category::Mod,
+        default_severity: Severity::Off,
+        fix_safety: FixSafety::Safe,
+        message: "count(...) is never NULL; the coalesce/ifnull default does nothing.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -602,17 +629,17 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 3);
-        assert_eq!(mods, 31);
-        assert_eq!(RULES.len(), 35);
+        assert_eq!(mods, 34);
+        assert_eq!(RULES.len(), 38);
     }
 
-    /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025, MOD031 —
-    /// 10 rows.
+    /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025,
+    /// MOD031, MOD033-034 — 12 rows.
     #[test]
     fn opt_in_band_defaults_off() {
         let off_codes = [
             "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD024",
-            "MOD025", "MOD031",
+            "MOD025", "MOD031", "MOD033", "MOD034",
         ];
         for code in off_codes {
             let rule = lookup(code).unwrap_or_else(|| panic!("{code} missing"));
@@ -630,12 +657,13 @@ mod tests {
     }
 
     /// Every `Mod` rule not in the opt-in band above is default-on
-    /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021, 026-030.
+    /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021,
+    /// 026-030, 032.
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [
             "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD024",
-            "MOD025", "MOD031",
+            "MOD025", "MOD031", "MOD033", "MOD034",
         ];
         for rule in RULES.iter().filter(|r| r.category == Category::Mod) {
             if off_codes.contains(&rule.code) {

@@ -11,3 +11,9 @@ CROSS JOIN (VALUES ('shipped'), ('lost'), (NULL)) AS ss (status);
 
 -- Same columns, no rows: aggregates over empty input behave differently.
 CREATE TABLE empty_t AS SELECT * FROM t WHERE false;
+
+-- A table to LEFT JOIN onto t: matches some x, not others, and has a
+-- matched row whose own columns are NULL.
+CREATE TABLE b AS
+SELECT *
+FROM (VALUES (1, 'one'), (2, NULL)) AS bs (x, label);

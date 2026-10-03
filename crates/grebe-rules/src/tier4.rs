@@ -1,6 +1,6 @@
 //! Tier 4 CST detectors: MOD026 (limit-no-orderby), MOD027
 //! (window-no-orderby), MOD028 (not-in-subquery), MOD029
-//! (filter-defeats-outer-join).
+//! (filter-defeats-outer-join), MOD032 (not-in-null).
 //!
 //! Where tiers 1-3 are mostly about idiom and readability, this tier is
 //! about rows coming back wrong or in whatever order the engine felt like
@@ -285,13 +285,12 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
 ///   standard way to keep an outer join's unmatched rows, and `OR` makes
 ///   which operand decides a row's fate too hard to read off the tree
 ///   alone.
-/// - a top-level `AND` operand with an explicit `NOT`, or that is itself
-///   an `IS [NOT] NULL` / `IS [NOT] DISTINCT FROM` test
-///   (`LogicalNotExpression`/`IsExpression` with any `IsTest`), is
-///   skipped outright: `b.id IS NULL` is the idiomatic way to find
-///   *unmatched* rows, and getting the negated forms wrong (`IS NOT
-///   NULL`, `NOTNULL`) right would need the same careful reading `OR`
-///   already doesn't get. Real, but rarer, misses.
+/// - a top-level `AND` operand with an explicit `NOT` is skipped, and so is
+///   every `IS` test except `IS NOT NULL`: `b.id IS NULL` is the idiomatic
+///   way to find *unmatched* rows, and `IS [NOT] DISTINCT FROM` is
+///   NULL-aware by design. `b.x IS NOT NULL` is in scope because it keeps
+///   exactly the rows an INNER JOIN would. The postfix `NOTNULL` spelling
+///   is not matched -- a rarer, real miss.
 /// - an operand containing a `ParensExpression` anywhere is skipped --
 ///   parenthesised sub-conditions can carry their own `OR` or their own
 ///   `IS NULL` guard, and this does not parse back into them.
@@ -461,6 +460,23 @@ fn defeated_join(tree: &Tree, operand: NodeId, targets: &[String], src: &str) ->
         return None;
     }
     let &is_expr = tree.children(operand).first()?;
+    // `b.x IS NOT NULL` keeps only rows where the joined side matched:
+    // executed, it returns exactly the INNER JOIN's rows. Every other IS
+    // test stays out of scope -- `IS NULL` in particular is the idiom for
+    // finding unmatched rows.
+    if let [subject, test] = tree.children(is_expr)[..] {
+        let is_not_null = tree.rule_name(test) == "IsTest"
+            && tree
+                .text(test, src)
+                .split_whitespace()
+                .map(str::to_ascii_uppercase)
+                .eq(["IS", "NOT", "NULL"]);
+        return if is_not_null {
+            joined_side_reference(tree, subject, targets, src)
+        } else {
+            None
+        };
+    }
     if tree.children(is_expr).len() > 1 {
         return None;
     }
@@ -490,14 +506,26 @@ fn defeated_join(tree: &Tree, operand: NodeId, targets: &[String], src: &str) ->
     if !has_predicate {
         return None;
     }
+    joined_side_reference(tree, comparison, targets, src)
+}
+
+/// The left-joined target that `scope` reads a column of, unless that read
+/// is wrapped in `coalesce(...)` or the scope has parentheses this does not
+/// look inside.
+fn joined_side_reference(
+    tree: &Tree,
+    scope: NodeId,
+    targets: &[String],
+    src: &str,
+) -> Option<String> {
     if tree
-        .descendants(comparison)
+        .descendants(scope)
         .iter()
         .any(|&d| tree.rule_name(d) == "ParensExpression")
     {
         return None;
     }
-    for qualifier in tree.descendants(comparison) {
+    for qualifier in tree.descendants(scope) {
         if tree.rule_name(qualifier) != "TableQualification" {
             continue;
         }
@@ -512,7 +540,7 @@ fn defeated_join(tree: &Tree, operand: NodeId, targets: &[String], src: &str) ->
         let Some(target) = targets.iter().find(|t| **t == name) else {
             continue;
         };
-        if !coalesce_guards(tree, qualifier, comparison, src) {
+        if !coalesce_guards(tree, qualifier, scope, src) {
             return Some(target.clone());
         }
     }
@@ -545,12 +573,60 @@ fn coalesce_guards(tree: &Tree, node: NodeId, boundary: NodeId, _src: &str) -> b
 }
 
 /// Every detector in this module.
+/// MOD032 — `x NOT IN (…, NULL, …)` is never true.
+///
+/// For a value in the list it is false; for any other value, comparing with
+/// the NULL is unknown, so the whole test is NULL. Executed: `WHERE x NOT IN
+/// (1, NULL)` keeps zero rows whatever `x` holds. Plain `IN (…, NULL)` is
+/// left alone -- it still matches the non-NULL items, the NULL is merely
+/// dead. Only a literal `NULL` item counts; `CAST(NULL AS …)` and the
+/// prefix `NOT x IN (…)` spelling are not matched.
+pub fn not_in_null_list(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for op in tree.find("BetweenInLikeOp") {
+        let negated = tree
+            .text(op, src)
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("NOT"));
+        if !negated {
+            continue;
+        }
+        let Some(list) = tree
+            .descendants(op)
+            .into_iter()
+            .find(|&d| tree.rule_name(d) == "InExpressionList")
+        else {
+            continue;
+        };
+        if tree.ancestor(list, "BetweenInLikeOp") != Some(op) {
+            continue;
+        }
+        let has_null = tree.children(list).iter().any(|&item| {
+            tree.rule_name(item) == "Expression"
+                && descend_single(tree, item, "NullLiteral").is_some()
+        });
+        if has_null {
+            let span = tree
+                .parent(op)
+                .map_or(tree.node(op).span, |p| tree.node(p).span);
+            out.push(Finding {
+                code: "MOD032",
+                span,
+                fix: None,
+            });
+        }
+    }
+    out
+}
+
 pub fn analyze_tier4(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     out.extend(limit_without_order_by(tree, src));
     out.extend(window_without_order_by(tree, src));
     out.extend(not_in_subquery(tree, src));
     out.extend(filter_defeats_outer_join(tree, src));
+    out.extend(not_in_null_list(tree, src));
     out.sort_by_key(|f| (f.span.start, f.code));
     out
 }
