@@ -497,6 +497,25 @@ pub static RULES: &[Rule] = &[
         message: "USING SAMPLE n ROWS samples before WHERE filters, so far fewer than n rows \
                    come back; filter in a subquery and sample its result.",
     },
+    Rule {
+        code: "MOD039",
+        name: "delete-then-insert",
+        category: Category::Mod,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "DELETE then INSERT into the same table is an upsert in two passes; MERGE \
+                   INTO does it in one atomic statement, about 2x faster. Outside a \
+                   transaction, a failed INSERT leaves the deleted rows gone.",
+    },
+    Rule {
+        code: "MOD040",
+        name: "csv-full-sniff",
+        category: Category::Mod,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "sample_size = -1 reads the whole CSV to guess its types, 15x slower on 5M \
+                   rows; declare them with columns = {...} or types = {...} instead.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -654,8 +673,8 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 2);
-        assert_eq!(mods, 37);
-        assert_eq!(RULES.len(), 40);
+        assert_eq!(mods, 39);
+        assert_eq!(RULES.len(), 42);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,
@@ -683,7 +702,7 @@ mod tests {
 
     /// Every `Mod` rule not in the opt-in band above is default-on
     /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021,
-    /// 026-030, 032, 035-038.
+    /// 026-030, 032, 035-040.
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [

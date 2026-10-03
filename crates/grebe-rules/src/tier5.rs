@@ -1,6 +1,7 @@
 //! Tier 5 CST detectors: MOD035 (wrapped-date-filter), MOD036
 //! (row-at-a-time-insert), MOD037 (order-by-random-sample), MOD038
-//! (sample-before-where).
+//! (sample-before-where), MOD039 (delete-then-insert), MOD040
+//! (csv-full-sniff).
 //!
 //! This tier is about SQL that returns the right rows the slow way: a
 //! spelling that stops DuckDB from using what it already knows about the
@@ -467,12 +468,145 @@ pub fn sample_before_where(tree: &Tree, src: &str) -> Vec<Finding> {
     out
 }
 
+/// Lowercased, whitespace-normalized text of the first table name under
+/// `node`.
+fn table_name(tree: &Tree, node: NodeId, src: &str) -> Option<String> {
+    let name = std::iter::once(node)
+        .chain(tree.descendants(node))
+        .find(|&d| tree.rule_name(d) == "BaseTableName")?;
+    Some(
+        tree.text(name, src)
+            .split_whitespace()
+            .collect::<String>()
+            .to_ascii_lowercase(),
+    )
+}
+
+/// MOD039 — `DELETE FROM t WHERE ...` immediately followed by `INSERT INTO
+/// t ... SELECT`, both reading the same source table: an upsert spelled as
+/// two statements.
+///
+/// Executed for 1M changed rows into 10M: DELETE + INSERT took 122 ms,
+/// `MERGE INTO` 56 ms (2.2x) as one atomic statement with no key required;
+/// and with the INSERT failing outside a transaction, the DELETE stayed
+/// committed and 500,000 rows were lost. `INSERT OR REPLACE` / `ON
+/// CONFLICT` are not the suggestion: they need a PRIMARY KEY, which made
+/// them 3x slower than the keyless DELETE + INSERT. Fires inside a
+/// transaction too, for the speed. A DELETE without WHERE is a full reload,
+/// not an upsert, and is left alone. Detect-only: the MERGE's ON condition
+/// and column mapping are the author's.
+pub fn delete_then_insert(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for program in tree.find("Program") {
+        let statements: Vec<NodeId> = tree
+            .children(program)
+            .iter()
+            .copied()
+            .filter(|&c| tree.rule_name(c) == "TopLevelStatement")
+            .collect();
+        for pair in statements.windows(2) {
+            let (Some(delete), Some(insert)) = (
+                descend_single(tree, pair[0], "DeleteStatement"),
+                descend_single(tree, pair[1], "InsertStatement"),
+            ) else {
+                continue;
+            };
+            if child(tree, delete, "WhereClause").is_none() {
+                continue;
+            }
+            let deleted =
+                child(tree, delete, "TargetOptAlias").and_then(|t| table_name(tree, t, src));
+            let inserted =
+                child(tree, insert, "InsertTarget").and_then(|t| table_name(tree, t, src));
+            if deleted.is_none() || deleted != inserted {
+                continue;
+            }
+            // An upsert reads its changes from somewhere: the DELETE's
+            // condition and the INSERT's SELECT must share a source table.
+            // Without that link this is an unrelated delete and insert (the
+            // DuckDB docs' transaction example deletes one person and adds
+            // another), and a single-row VALUES insert has no source at all.
+            let sources = |stmt: NodeId, own_target: Option<NodeId>| -> HashSet<String> {
+                tree.descendants(stmt)
+                    .into_iter()
+                    .filter(|&d| tree.rule_name(d) == "BaseTableName")
+                    .filter(|&d| {
+                        own_target.is_none_or(|t| d != t && !tree.descendants(t).contains(&d))
+                    })
+                    .map(|d| {
+                        tree.text(d, src)
+                            .split_whitespace()
+                            .collect::<String>()
+                            .to_ascii_lowercase()
+                    })
+                    .collect()
+            };
+            let delete_reads = sources(delete, child(tree, delete, "TargetOptAlias"));
+            let insert_reads = sources(insert, child(tree, insert, "InsertTarget"));
+            if !delete_reads.is_disjoint(&insert_reads) {
+                out.push(Finding {
+                    code: "MOD039",
+                    span: tree.node(delete).span,
+                    fix: None,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// MOD040 — `read_csv(..., sample_size = -1)`: the sniffer reads the whole
+/// file to guess column types before the query starts.
+///
+/// Executed on a 5M-row CSV: 3.5 s against 0.23 s with the default sample
+/// (15x). The usual reason for it is a type the default sample guessed
+/// wrong; declaring the types (`columns = {...}` or `types = {...}`) fixes
+/// that without reading the file twice. Detect-only: the types are the
+/// author's.
+pub fn csv_full_sniff(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for function in tree.find("TableFunction") {
+        let is_csv_reader = tree.descendants(function).into_iter().any(|d| {
+            tree.rule_name(d) == "TableFunctionName"
+                && matches!(
+                    tree.text(d, src).trim().to_ascii_lowercase().as_str(),
+                    "read_csv" | "read_csv_auto"
+                )
+        });
+        if !is_csv_reader {
+            continue;
+        }
+        let whole_file = tree.descendants(function).into_iter().any(|d| {
+            tree.rule_name(d) == "FunctionArgument"
+                && tree.ancestor(d, "TableFunction") == Some(function)
+                && matches!(
+                    tree.text(d, src)
+                        .split_whitespace()
+                        .collect::<String>()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "sample_size=-1" | "sample_size:=-1"
+                )
+        });
+        if whole_file {
+            out.push(Finding {
+                code: "MOD040",
+                span: tree.node(function).span,
+                fix: None,
+            });
+        }
+    }
+    out
+}
+
 /// Every tier-5 detector; findings are sorted by position, then code.
 pub fn analyze_tier5(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = wrapped_date_filter(tree, src);
     out.extend(row_at_a_time_insert(tree, src));
     out.extend(order_by_random_sample(tree, src));
     out.extend(sample_before_where(tree, src));
+    out.extend(delete_then_insert(tree, src));
+    out.extend(csv_full_sniff(tree, src));
     out.sort_by_key(|f| (f.span.start, f.code));
     out
 }

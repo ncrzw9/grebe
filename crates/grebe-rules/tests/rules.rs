@@ -80,6 +80,11 @@ fn every_rule_fixture_matches_its_expected_findings() {
             "{} names no registered rule",
             sql_path.display()
         );
+        assert!(
+            grebe_rules::is_implemented(code),
+            "{code} has a fixture but is missing from IMPLEMENTED, so `grebe rules` \
+             would report it as having no detector"
+        );
         let src = fs::read_to_string(sql_path).expect("readable fixture");
         let actual = render(sql_path, &src, code);
         let expected_path = sql_path.with_extension("expected");
