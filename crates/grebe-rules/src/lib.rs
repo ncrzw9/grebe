@@ -8,7 +8,7 @@
 //!
 //! - **default-on:** MOD001-009, MOD011-016, MOD021, MOD026-030
 //! - **opt-in (`off` until `[severity]` enables them):** MOD010, MOD017-020,
-//!   MOD022-025
+//!   MOD022-025, MOD031
 //!
 //! A rule is opt-in when its premise is real but it is noisy on idiomatic
 //! DuckDB code, its payoff is unproven, or it is house style by nature. A CST
@@ -83,7 +83,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007", "MOD008", "MOD009",
     "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016", "MOD017", "MOD018",
     "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD024", "MOD025", "MOD026", "MOD027",
-    "MOD028", "MOD029", "MOD030", "PRS001", "SRC002", "SRC003",
+    "MOD028", "MOD029", "MOD030", "MOD031", "PRS001", "SRC002", "SRC003",
 ];
 
 /// Does `code` have a detector?

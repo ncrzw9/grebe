@@ -464,6 +464,115 @@ fn as_equality(tree: &Tree, condition: NodeId, src: &str) -> Option<(NodeId, Nod
 /// identical to the first's (`structurally_equal`) — the correctness-
 /// critical check, since two different subjects sharing incidental
 /// structure must never collapse into one switch form.
+/// MOD031 — a single-branch searched CASE that is exactly `coalesce` or
+/// `nullif`:
+///
+/// - `CASE WHEN x IS NULL THEN y ELSE x END`     → `coalesce(x, y)`
+/// - `CASE WHEN x IS NOT NULL THEN x ELSE y END` → `coalesce(x, y)`
+/// - `CASE WHEN x = y THEN NULL ELSE x END`      → `nullif(x, y)`
+///
+/// Each was executed against DuckDB with NULL in every operand position and
+/// returns identical values; `coalesce` also skips its second argument when
+/// the first is non-NULL, as the CASE does. What differs is that the CASE
+/// writes `x` twice and so evaluates it twice, which matters only when `x`
+/// is volatile or costly. `x` must therefore be a plain column reference;
+/// `y` may be anything, since both spellings evaluate it under the same
+/// conditions. Operands are compared as whitespace-normalized text, so a
+/// near-miss in spelling is a missed finding, never a wrong one.
+pub fn case_to_function(tree: &Tree, src: &str) -> Vec<Finding> {
+    let norm = |n: NodeId| {
+        tree.text(n, src)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let is_column = |n: NodeId| reduce_to(tree, n, "ColumnReference").is_some();
+    let mut out = Vec::new();
+    for case in tree.find("CaseExpression") {
+        let children = tree.children(case);
+        if children.first().map(|&c| tree.rule_name(c)) == Some("Expression") {
+            continue; // switch form
+        }
+        let whens: Vec<NodeId> = children
+            .iter()
+            .copied()
+            .filter(|&c| tree.rule_name(c) == "CaseWhenThen")
+            .collect();
+        let [when_then] = whens[..] else {
+            continue;
+        };
+        let Some(else_expr) = children
+            .iter()
+            .find(|&&c| tree.rule_name(c) == "CaseElse")
+            .and_then(|&e| child(tree, e, "Expression"))
+        else {
+            continue;
+        };
+        let [condition, then_expr] = tree.children(when_then)[..] else {
+            continue;
+        };
+
+        let as_coalesce = || -> Option<String> {
+            let is_expr = reduce_to(tree, condition, "IsExpression")?;
+            let [operand, test] = tree.children(is_expr)[..] else {
+                return None;
+            };
+            if tree.rule_name(test) != "IsTest" || !is_column(operand) {
+                return None;
+            }
+            let fallback = match norm(test).to_ascii_uppercase().as_str() {
+                "IS NULL" if norm(else_expr) == norm(operand) => then_expr,
+                "IS NOT NULL" if norm(then_expr) == norm(operand) => else_expr,
+                _ => return None,
+            };
+            Some(format!(
+                "coalesce({}, {})",
+                norm(operand),
+                tree.text(fallback, src).trim()
+            ))
+        };
+        let as_nullif = || -> Option<String> {
+            let op_expr = reduce_to(tree, condition, "OtherOperatorExpression")?;
+            let [left, tail] = tree.children(op_expr)[..] else {
+                return None;
+            };
+            if tree.rule_name(tail) != "OtherOperatorTail" {
+                return None;
+            }
+            let [operator, right] = tree.children(tail)[..] else {
+                return None;
+            };
+            reduce_to(tree, then_expr, "NullLiteral")?;
+            if norm(operator) != "=" {
+                return None;
+            }
+            let (kept, compared) = if norm(else_expr) == norm(left) {
+                (left, right)
+            } else if norm(else_expr) == norm(right) {
+                (right, left)
+            } else {
+                return None;
+            };
+            is_column(kept).then(|| {
+                format!(
+                    "nullif({}, {})",
+                    norm(kept),
+                    tree.text(compared, src).trim()
+                )
+            })
+        };
+        if let Some(replacement) = as_coalesce().or_else(as_nullif) {
+            let span = tree.node(case).span;
+            out.push(Finding {
+                code: "MOD031",
+                span,
+                fix: Some(Fix { span, replacement }),
+            });
+        }
+    }
+    out
+}
+
 pub fn case_to_switch(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for case_expr in tree.find("CaseExpression") {
@@ -792,6 +901,7 @@ pub fn analyze_tier2b(tree: &Tree, src: &str) -> Vec<Finding> {
     out.extend(select_star_ctas(tree, src));
     out.extend(implicit_cross_join(tree, src));
     out.extend(case_to_filter(tree, src));
+    out.extend(case_to_function(tree, src));
     out.extend(case_to_switch(tree, src));
     out.extend(unused_cte(tree, src));
     out.sort_by_key(|f| (f.span.start, f.code));
