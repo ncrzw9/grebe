@@ -6,7 +6,7 @@
 //!
 //! Both bands:
 //!
-//! - **default-on:** MOD001-009, MOD011-016, MOD021, MOD026-030, MOD032
+//! - **default-on:** MOD001-009, MOD011-016, MOD021, MOD026-030, MOD032, MOD035
 //! - **opt-in (`off` until `[severity]` enables them):** MOD010, MOD017-020,
 //!   MOD022-023, MOD025, MOD031, MOD033-034
 //!
@@ -65,6 +65,7 @@ pub mod tier2a;
 pub mod tier2b;
 pub mod tier3;
 pub mod tier4;
+pub mod tier5;
 
 /// The rule codes that have a detector.
 ///
@@ -77,7 +78,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007", "MOD008", "MOD009",
     "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016", "MOD017", "MOD018",
     "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD025", "MOD026", "MOD027", "MOD028",
-    "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "PRS001", "SRC002", "SRC003",
+    "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "MOD035", "PRS001", "SRC002",
+    "SRC003",
 ];
 
 /// Does `code` have a detector?
