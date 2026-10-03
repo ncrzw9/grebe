@@ -453,6 +453,19 @@ pub static RULES: &[Rule] = &[
         fix_safety: FixSafety::Safe,
         message: "count(...) is never NULL; the coalesce/ifnull default does nothing.",
     },
+    Rule {
+        code: "MOD035",
+        name: "wrapped-date-filter",
+        category: Category::Mod,
+        // Default-on: the cost is measured (7-74x on a 20M-row table, every
+        // row group read) and the range spelling is never slower, so a
+        // finding is worth acting on even where the table is small today.
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "Filtering on year()/strftime()/a DATE cast of a column reads every row \
+                   group; compare the column to a range (ts >= '2023-01-01' AND ts < \
+                   '2024-01-01') so DuckDB can skip what it doesn't need.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -610,8 +623,8 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 2);
-        assert_eq!(mods, 33);
-        assert_eq!(RULES.len(), 36);
+        assert_eq!(mods, 34);
+        assert_eq!(RULES.len(), 37);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,
@@ -639,7 +652,7 @@ mod tests {
 
     /// Every `Mod` rule not in the opt-in band above is default-on
     /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021,
-    /// 026-030, 032.
+    /// 026-030, 032, 035.
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [
