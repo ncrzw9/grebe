@@ -12,7 +12,7 @@ DuckDB SQL. It spawns the `grebe` binary and hands everything to
    Command line:
 
    ```sh
-   code --install-extension grebe-0.4.2.vsix
+   code --install-extension grebe-0.5.0.vsix
    ```
 
    (substitute your editor's CLI — `antigravity-ide`, `cursor`, `codium`, ...)
@@ -144,4 +144,4 @@ npm install
 npx @vscode/vsce package
 ```
 
-This produces `grebe-0.4.2.vsix` in this directory.
+This produces `grebe-0.5.0.vsix` in this directory.
