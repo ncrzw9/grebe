@@ -134,7 +134,7 @@ editor wins over the file's `select`.
   sync), `didSave`, `didClose`, semantic tokens, code actions and
   formatting.
 - **No detector for `SRC004 unchecked-statement`.** It is registered but
-  cannot fire; the other 28 rules in the registry have detectors. Run
+  cannot fire; every other rule in the registry has a detector. Run
   `grebe rules` for the current table.
 
 ## Build from source

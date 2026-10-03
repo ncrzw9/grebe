@@ -724,6 +724,7 @@ pub fn case_to_filter(tree: &Tree, src: &str) -> Vec<Finding> {
         let [condition, then_expr] = wc[..] else {
             continue;
         };
+        let mut else_literal = None;
         if let Some(&else_node) = case_children
             .iter()
             .find(|&&c| tree.rule_name(c) == "CaseElse")
@@ -731,9 +732,31 @@ pub fn case_to_filter(tree: &Tree, src: &str) -> Vec<Finding> {
             let Some(else_expr) = child(tree, else_node, "Expression") else {
                 continue;
             };
-            if reduce_to(tree, else_expr, "LiteralExpression").is_none() {
+            let Some(literal) = reduce_to(tree, else_expr, "LiteralExpression") else {
                 continue;
-            }
+            };
+            else_literal = Some(literal);
+        }
+
+        // `sum(CASE WHEN c THEN 1 ELSE 0 END)` has an exact equivalent, so it
+        // gets its own rule with a safe fix rather than MOD014's unsafe one.
+        let is_literal = |n: NodeId, text: &str| {
+            reduce_to(tree, n, "LiteralExpression").is_some() && tree.text(n, src).trim() == text
+        };
+        if name == "sum"
+            && is_literal(then_expr, "1")
+            && else_literal.is_some_and(|e| tree.text(e, src).trim() == "0")
+        {
+            let func_span = tree.node(func).span;
+            out.push(Finding {
+                code: "MOD030",
+                span: func_span,
+                fix: Some(Fix {
+                    span: func_span,
+                    replacement: format!("count_if({})", tree.text(condition, src).trim()),
+                }),
+            });
+            continue;
         }
 
         // Unsafe (registry `fix_safety = Unsafe`): the rewrite drops the ELSE
@@ -983,6 +1006,41 @@ mod tests {
             "SELECT sum(CASE a WHEN 1 THEN x END) FROM t",
         ] {
             assert!(!fires("MOD014", sql), "should NOT fire: {sql}");
+        }
+    }
+
+    fn fix_text(code: &str, sql: &str) -> Option<String> {
+        let tree = parse(sql).unwrap_or_else(|| panic!("did not parse: {sql}"));
+        analyze_tier2b(&tree, sql)
+            .into_iter()
+            .find(|f| f.code == code)
+            .and_then(|f| f.fix)
+            .map(|fix| fix.replacement)
+    }
+
+    #[test]
+    fn mod030_sum_case_to_count_if() {
+        let sql = "SELECT sum(CASE WHEN status = 'shipped' THEN 1 ELSE 0 END) FROM t";
+        assert_eq!(codes(sql), ["MOD030"], "carved out of MOD014, never both");
+        assert_eq!(
+            fix_text("MOD030", sql).as_deref(),
+            Some("count_if(status = 'shipped')")
+        );
+        assert!(fires(
+            "MOD030",
+            "SELECT SUM(CASE WHEN a THEN 1 ELSE 0 END) FROM t"
+        ));
+
+        // Each of these changes the value or the type, so it stays MOD014.
+        for sql in [
+            "SELECT sum(CASE WHEN a THEN 1 END) FROM t", // NULL, not 0, when nothing matches
+            "SELECT sum(CASE WHEN a THEN 1.0 ELSE 0 END) FROM t", // DECIMAL sum
+            "SELECT sum(CASE WHEN a THEN 2 ELSE 0 END) FROM t",
+            "SELECT sum(CASE WHEN a THEN 1 ELSE 1 END) FROM t",
+            "SELECT count(CASE WHEN a THEN 1 ELSE 0 END) FROM t", // counts every row
+        ] {
+            assert!(!fires("MOD030", sql), "should NOT fire: {sql}");
+            assert!(fires("MOD014", sql), "should still be MOD014: {sql}");
         }
     }
 
