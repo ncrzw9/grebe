@@ -19,7 +19,7 @@
 //! with, so no parse failure goes unclassified.
 //!
 //! The opt-in band defaults to [`Severity::Off`] (MOD010, MOD017-020,
-//! MOD022-025).
+//! MOD022-025, MOD031).
 
 /// Which layer of the tool produced the rule.
 ///
@@ -44,9 +44,9 @@ pub enum Category {
 ///
 /// `Off` is a real registry entry, not an omission: the rule exists but
 /// fires only once a `grebe.toml` `[severity]` entry or `--select` turns it
-/// on. The opt-in band (MOD010, MOD017-020, MOD022-025) is either too noisy
-/// on idiomatic DuckDB SQL to default on, or house style by nature; each
-/// row in [`RULES`] says which.
+/// on. The opt-in band (MOD010, MOD017-020, MOD022-025, MOD031) is either
+/// too noisy on idiomatic DuckDB SQL to default on, unproven on SQL written
+/// by others, or house style by nature; each row in [`RULES`] says which.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Severity {
     Error,
@@ -434,6 +434,17 @@ pub static RULES: &[Rule] = &[
         fix_safety: FixSafety::Safe,
         message: "sum(CASE WHEN c THEN 1 ELSE 0 END) is count_if(c).",
     },
+    Rule {
+        code: "MOD031",
+        name: "case-to-function",
+        category: Category::Mod,
+        // Opt-in: the rewrite is proven equivalent, but no SQL written by
+        // others has shown how often the shape occurs, so there is no basis
+        // yet for turning it on everywhere.
+        default_severity: Severity::Off,
+        fix_safety: FixSafety::Safe,
+        message: "This CASE is coalesce(...) or nullif(...); the function says it directly.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -591,17 +602,17 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 3);
-        assert_eq!(mods, 30);
-        assert_eq!(RULES.len(), 34);
+        assert_eq!(mods, 31);
+        assert_eq!(RULES.len(), 35);
     }
 
-    /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025 —
-    /// 9 rows.
+    /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025, MOD031 —
+    /// 10 rows.
     #[test]
     fn opt_in_band_defaults_off() {
         let off_codes = [
             "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD024",
-            "MOD025",
+            "MOD025", "MOD031",
         ];
         for code in off_codes {
             let rule = lookup(code).unwrap_or_else(|| panic!("{code} missing"));
@@ -624,7 +635,7 @@ mod tests {
     fn default_on_band_is_not_off() {
         let off_codes = [
             "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD024",
-            "MOD025",
+            "MOD025", "MOD031",
         ];
         for rule in RULES.iter().filter(|r| r.category == Category::Mod) {
             if off_codes.contains(&rule.code) {

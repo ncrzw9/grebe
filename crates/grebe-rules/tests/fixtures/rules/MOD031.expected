@@ -1,0 +1,6 @@
+4:8 MOD031 => coalesce(x, y)
+6:8 MOD031 => coalesce(x, 0)
+8:8 MOD031 => coalesce(t.x, t.y + 1)
+10:8 MOD031 => nullif(x, y)
+13:8 MOD031 => nullif(x, y)
+15:8 MOD031 => nullif(status, 'lost')
