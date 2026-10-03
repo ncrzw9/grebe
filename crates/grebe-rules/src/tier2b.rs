@@ -573,6 +573,144 @@ pub fn case_to_function(tree: &Tree, src: &str) -> Vec<Finding> {
     out
 }
 
+/// Is this `FunctionExpression` a call to a known aggregate?
+fn is_aggregate_call(tree: &Tree, func: NodeId, src: &str) -> bool {
+    child(tree, func, "FunctionIdentifier")
+        .is_some_and(|id| AGGREGATE_FUNCTIONS.contains(ident(tree.text(id, src)).as_str()))
+}
+
+/// Last name segment of a column reference, lowercased: `t.x` → `x`.
+fn column_name(tree: &Tree, column: NodeId, src: &str) -> String {
+    ident(
+        tree.text(column, src)
+            .rsplit('.')
+            .next()
+            .unwrap_or_default(),
+    )
+}
+
+/// MOD033 — a `HAVING` condition that could be a `WHERE` condition.
+///
+/// `HAVING` filters groups after aggregation; a condition that uses no
+/// aggregate and reads only grouped columns gives the same rows when it
+/// filters input rows instead (executed: `GROUP BY g HAVING g > 1` and
+/// `WHERE g > 1 GROUP BY g` agree), and filtering first is clearer and
+/// aggregates less. Detect-only: moving the clause is the reader's edit.
+///
+/// Fires only when every column the condition names is also named in the
+/// `GROUP BY`. That one test excludes the cases where moving it is wrong:
+/// an aggregate's select-list alias (`HAVING n > 1`, which DuckDB accepts)
+/// is never a grouped column. `ROLLUP`, `CUBE` and `GROUPING SETS` are
+/// excluded outright -- executed, `HAVING g IS NULL` under `ROLLUP` keeps
+/// the subtotal row that `WHERE g IS NULL` cannot see. A condition with any
+/// subquery is skipped, as is `GROUP BY ALL` (it names no columns).
+pub fn having_without_aggregate(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for having in tree.find("HavingClause") {
+        let Some(group_by) = tree
+            .parent(having)
+            .and_then(|select| child(tree, select, "GroupByClause"))
+        else {
+            continue;
+        };
+        if tree.descendants(group_by).iter().any(|&d| {
+            matches!(
+                tree.rule_name(d),
+                "CubeOrRollupClause" | "GroupingSetsClause"
+            )
+        }) {
+            continue;
+        }
+        let inside = tree.descendants(having);
+        let disqualified = inside.iter().any(|&d| {
+            let rule = tree.rule_name(d);
+            rule.starts_with("Select")
+                || rule.contains("Subquery")
+                || (rule == "FunctionExpression" && is_aggregate_call(tree, d, src))
+        });
+        if disqualified {
+            continue;
+        }
+        let grouped: HashSet<String> = tree
+            .descendants(group_by)
+            .into_iter()
+            .filter(|&d| tree.rule_name(d) == "ColumnReference")
+            .map(|d| column_name(tree, d, src))
+            .collect();
+        let all_grouped = inside
+            .iter()
+            .filter(|&&d| tree.rule_name(d) == "ColumnReference")
+            .all(|&d| grouped.contains(&column_name(tree, d, src)));
+        if all_grouped && !grouped.is_empty() {
+            out.push(Finding {
+                code: "MOD033",
+                span: tree.node(having).span,
+                fix: None,
+            });
+        }
+    }
+    out
+}
+
+/// MOD034 — `coalesce(count(…), 0)` / `ifnull(count(…), 0)`: `count` never
+/// returns NULL, so the default is dead. Executed: identical values and
+/// type (BIGINT) per group and over empty input, where `count` gives 0.
+pub fn redundant_count_default(tree: &Tree, src: &str) -> Vec<Finding> {
+    let is_count = |e: NodeId| {
+        reduce_to(tree, e, "FunctionExpression").is_some_and(|f| {
+            child(tree, f, "FunctionIdentifier")
+                .is_some_and(|id| ident(tree.text(id, src)) == "count")
+        })
+    };
+    let is_zero = |e: NodeId| {
+        reduce_to(tree, e, "LiteralExpression").is_some() && tree.text(e, src).trim() == "0"
+    };
+    let mut out = Vec::new();
+    let mut check = |whole: NodeId, args: &[NodeId]| {
+        let [first, second] = args[..] else {
+            return;
+        };
+        if is_count(first) && is_zero(second) {
+            let span = tree.node(whole).span;
+            out.push(Finding {
+                code: "MOD034",
+                span,
+                fix: Some(Fix {
+                    span,
+                    replacement: tree.text(first, src).trim().to_string(),
+                }),
+            });
+        }
+    };
+    for coalesce in tree.find("CoalesceExpression") {
+        let args: Vec<NodeId> = tree
+            .children(coalesce)
+            .iter()
+            .copied()
+            .filter(|&c| tree.rule_name(c) == "Expression")
+            .collect();
+        check(coalesce, &args);
+    }
+    for func in tree.find("FunctionExpression") {
+        let named_ifnull = child(tree, func, "FunctionIdentifier")
+            .is_some_and(|id| ident(tree.text(id, src)) == "ifnull");
+        if !named_ifnull || tree.children(func).len() != 2 {
+            continue; // any FILTER/OVER/... modifier: not a plain call
+        }
+        let args: Vec<NodeId> = tree
+            .descendants(func)
+            .into_iter()
+            .filter(|&d| {
+                tree.rule_name(d) == "PositionalFunctionArgument"
+                    && tree.ancestor(d, "FunctionExpression") == Some(func)
+            })
+            .filter_map(|d| child(tree, d, "Expression"))
+            .collect();
+        check(func, &args);
+    }
+    out
+}
+
 pub fn case_to_switch(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for case_expr in tree.find("CaseExpression") {
@@ -902,6 +1040,8 @@ pub fn analyze_tier2b(tree: &Tree, src: &str) -> Vec<Finding> {
     out.extend(implicit_cross_join(tree, src));
     out.extend(case_to_filter(tree, src));
     out.extend(case_to_function(tree, src));
+    out.extend(having_without_aggregate(tree, src));
+    out.extend(redundant_count_default(tree, src));
     out.extend(case_to_switch(tree, src));
     out.extend(unused_cte(tree, src));
     out.sort_by_key(|f| (f.span.start, f.code));
