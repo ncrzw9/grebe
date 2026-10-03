@@ -19,7 +19,7 @@
 //! with, so no parse failure goes unclassified.
 //!
 //! The opt-in band defaults to [`Severity::Off`] (MOD010, MOD017-020,
-//! MOD022-025, MOD031, MOD033-034).
+//! MOD022-023, MOD025, MOD031, MOD033-034).
 
 /// Which layer of the tool produced the rule.
 ///
@@ -44,7 +44,7 @@ pub enum Category {
 ///
 /// `Off` is a real registry entry, not an omission: the rule exists but
 /// fires only once a `grebe.toml` `[severity]` entry or `--select` turns it
-/// on. The opt-in band (MOD010, MOD017-020, MOD022-025, MOD031,
+/// on. The opt-in band (MOD010, MOD017-020, MOD022-023, MOD025, MOD031,
 /// MOD033-034) is either too noisy on idiomatic DuckDB SQL to default on,
 /// unproven on SQL written by others, or house style by nature; each row in
 /// [`RULES`] says which.
@@ -119,14 +119,6 @@ pub static RULES: &[Rule] = &[
         default_severity: Severity::Info,
         fix_safety: FixSafety::None,
         message: "File contains statements from another SQL dialect; skipped.",
-    },
-    Rule {
-        code: "SRC004",
-        name: "unchecked-statement",
-        category: Category::Src,
-        default_severity: Severity::Info,
-        fix_safety: FixSafety::None,
-        message: "Statement type is parsed but not yet linted by any MOD rule.",
     },
     // --- MOD, default-on (MOD010 aside) ---
     Rule {
@@ -310,7 +302,7 @@ pub static RULES: &[Rule] = &[
     // MOD017: `CREATE TABLE x AS SELECT * FROM 'f.csv'` is the idiomatic
     //   DuckDB load pattern. MOD018: the perf premise is real, but key
     //   constraints in DDL are pervasive in valid SQL. MOD019: the payoff is
-    //   unmeasured, so the advice stays speculative. MOD020, MOD022-024: pure
+    //   unmeasured, so the advice stays speculative. MOD020, MOD022-023: pure
     //   style. MOD025: `*` is idiomatic for exploration; opt in where queries
     //   should name their columns.
     // The report-only rows (MOD017-019, MOD025) have no mechanical fix:
@@ -364,17 +356,6 @@ pub static RULES: &[Rule] = &[
         default_severity: Severity::Off,
         fix_safety: FixSafety::Safe,
         message: "expr AS x can be the prefix form x: expr. Opt-in house style.",
-    },
-    Rule {
-        code: "MOD024",
-        name: "trailing-comma",
-        category: Category::Mod,
-        default_severity: Severity::Off,
-        fix_safety: FixSafety::Safe,
-        // The formatter owns trailing commas long-term; this toggle exists for
-        // projects that lint without formatting.
-        message: "Multiline select list without a trailing comma. Opt-in; the \
-                   formatter owns this long-term.",
     },
     Rule {
         code: "MOD025",
@@ -628,18 +609,18 @@ mod tests {
         let src = RULES.iter().filter(|r| r.category == Category::Src).count();
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
-        assert_eq!(src, 3);
-        assert_eq!(mods, 34);
-        assert_eq!(RULES.len(), 38);
+        assert_eq!(src, 2);
+        assert_eq!(mods, 33);
+        assert_eq!(RULES.len(), 36);
     }
 
-    /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025,
-    /// MOD031, MOD033-034 — 12 rows.
+    /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,
+    /// MOD031, MOD033-034 — 11 rows.
     #[test]
     fn opt_in_band_defaults_off() {
         let off_codes = [
-            "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD024",
-            "MOD025", "MOD031", "MOD033", "MOD034",
+            "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD025",
+            "MOD031", "MOD033", "MOD034",
         ];
         for code in off_codes {
             let rule = lookup(code).unwrap_or_else(|| panic!("{code} missing"));
@@ -662,8 +643,8 @@ mod tests {
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [
-            "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD024",
-            "MOD025", "MOD031", "MOD033", "MOD034",
+            "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD025",
+            "MOD031", "MOD033", "MOD034",
         ];
         for rule in RULES.iter().filter(|r| r.category == Category::Mod) {
             if off_codes.contains(&rule.code) {
