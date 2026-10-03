@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 # One version for the workspace and the VS Code client alike; the release tag
 # (`v0.2.0`) is the same number. `grebe --version` reports it.
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -20,10 +20,10 @@ keywords = ["duckdb", "sql", "formatter", "linter"]
 categories = ["development-tools", "command-line-utilities", "parser-implementations"]
 
 [workspace.dependencies]
-grebe-syntax = { path = "crates/grebe-syntax", version = "0.4.1" }
-grebe-rules = { path = "crates/grebe-rules", version = "0.4.1" }
-grebe-format = { path = "crates/grebe-format", version = "0.4.1" }
-grebe-lsp = { path = "crates/grebe-lsp", version = "0.4.1" }
+grebe-syntax = { path = "crates/grebe-syntax", version = "0.4.2" }
+grebe-rules = { path = "crates/grebe-rules", version = "0.4.2" }
+grebe-format = { path = "crates/grebe-format", version = "0.4.2" }
+grebe-lsp = { path = "crates/grebe-lsp", version = "0.4.2" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"          # safe Rust only
