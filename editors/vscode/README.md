@@ -133,9 +133,8 @@ editor wins over the file's `select`.
 - **No completion, no hover.** The exchange is `didOpen`, `didChange` (full
   sync), `didSave`, `didClose`, semantic tokens, code actions and
   formatting.
-- **No detector for `SRC004 unchecked-statement`.** It is registered but
-  cannot fire; every other rule in the registry has a detector. Run
-  `grebe rules` for the current table.
+
+Run `grebe rules` for the current rule table.
 
 ## Build from source
 

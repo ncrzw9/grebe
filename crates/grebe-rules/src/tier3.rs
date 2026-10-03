@@ -1,15 +1,13 @@
-//! Tier 3 CST detectors: MOD021 (qualify-rewrite), MOD024
-//! (trailing-comma), MOD025 (select-star).
+//! Tier 3 CST detectors: MOD021 (qualify-rewrite), MOD025 (select-star).
 //!
 //! Production names are those of the vendored DuckDB grammar; `grebe tree`
 //! prints them for any statement.
 
 use std::collections::HashSet;
 
-use grebe_syntax::Span;
 use grebe_syntax::cst::{NodeId, Tree};
 
-use crate::detect::{Finding, Fix};
+use crate::detect::Finding;
 
 /// The single child of `id` produced by `rule`, if there is exactly one.
 ///
@@ -94,89 +92,6 @@ fn reduces_to_star(tree: &Tree, mut n: NodeId) -> Option<NodeId> {
         }
         n = children[0];
     }
-}
-
-// ---------------------------------------------------------------------
-// MOD024 -- trailing-comma
-// ---------------------------------------------------------------------
-
-/// Every non-trivia token in `id`'s subtree, `id`'s own directly-owned
-/// tokens included. Used only for MOD024's "fewer than 2 code tokens"
-/// degenerate guard -- the list's items are arbitrary expressions, not a
-/// flat token run, so this recurses rather than reading one node's own
-/// `code_tokens`.
-fn subtree_code_token_count(tree: &Tree, id: NodeId) -> usize {
-    let mut n = tree.code_tokens(id).len();
-    for &c in tree.children(id) {
-        n += subtree_code_token_count(tree, c);
-    }
-    n
-}
-
-/// MOD024 trailing-comma: a multiline select list whose last item has no
-/// trailing comma. DuckDB's grammar permits one (`List(D) <- D (',' D)*
-/// ','?`, `grebe-syntax/vendor/grammar/statements/common.gram`); adding one is a
-/// diff-minimizing style preference (a new last item doesn't touch the
-/// previous line), not a correctness issue -- hence opt-in.
-///
-/// The trailing comma is an explicit optional grammar element, not free
-/// text riding along in some other node's span: `TargetList`'s own span
-/// absorbs it when present, as `grebe tree` shows (with a
-/// trailing comma, the node's `span.end` lands one byte past the comma;
-/// without one, it lands at the last item's own last byte, and any
-/// trivia after either point belongs to whatever follows, not to
-/// `TargetList`). So "does this list have a trailing comma" is a direct
-/// CST-boundary check -- does the last token `TargetList` owns *directly*
-/// (which, since nothing in `List(D)` besides the commas is unwrapped,
-/// can only be a comma) end exactly where the node's own span ends --
-/// never a token-text compare.
-pub fn trailing_comma(tree: &Tree, src: &str) -> Vec<Finding> {
-    let mut out = Vec::new();
-    for select_clause in tree.find("SelectClause") {
-        // Top-level only, no subquery recursion.
-        if !is_top_level(tree, select_clause) {
-            continue;
-        }
-        let Some(target_list) = child(tree, select_clause, "TargetList") else {
-            continue;
-        };
-        // Degenerate: fewer than 2 code tokens anywhere in the list (e.g.
-        // a bare `SELECT *`) -- nothing to diff-minimize with.
-        if subtree_code_token_count(tree, target_list) < 2 {
-            continue;
-        }
-        // Multiline gate: no `\n` anywhere from `SELECT` through the end
-        // of the list -> skip entirely, even a very long single-line
-        // list. `SelectClause`'s own span already runs exactly from the
-        // `SELECT` keyword through `TargetList`'s end, so its raw text is
-        // exactly that segment.
-        if !tree.text(select_clause, src).contains('\n') {
-            continue;
-        }
-        let list_span = tree.node(target_list).span;
-        let already_trailing = tree
-            .code_tokens(target_list)
-            .last()
-            .is_some_and(|t| t.span.end == list_span.end);
-        if already_trailing {
-            continue;
-        }
-        // Insert immediately after the last item's last token, which
-        // (absent a trailing comma) is exactly where the list's own span
-        // already ends.
-        let at = list_span.end;
-        out.push(Finding {
-            code: "MOD024",
-            span: Span::new(at, at),
-            // Safe: a pure single-byte insertion, no reordering -- the
-            // simplest fix in the whole rule set.
-            fix: Some(Fix {
-                span: Span::new(at, at),
-                replacement: ",".to_string(),
-            }),
-        });
-    }
-    out
 }
 
 // ---------------------------------------------------------------------
@@ -439,11 +354,10 @@ pub fn qualify_rewrite(tree: &Tree, src: &str) -> Vec<Finding> {
     out
 }
 
-/// Every tier-3 detector, in registry order (MOD021, MOD024, MOD025).
+/// Every tier-3 detector, in registry order (MOD021, MOD025).
 pub fn analyze_tier3(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     out.extend(qualify_rewrite(tree, src));
-    out.extend(trailing_comma(tree, src));
     out.extend(select_star_outer(tree, src));
     out.sort_by_key(|f| (f.span.start, f.code));
     out
@@ -468,65 +382,6 @@ mod tests {
 
     fn count(code: &str, sql: &str) -> usize {
         codes(sql).into_iter().filter(|&c| c == code).count()
-    }
-
-    // -------------------------------------------------------------
-    // MOD024 -- trailing-comma
-    // -------------------------------------------------------------
-
-    #[test]
-    fn mod024_trailing_comma() {
-        for sql in [
-            "SELECT\n  a,\n  b\nFROM t",
-            "SELECT\n  a,\n  b\nFROM t WHERE x = 1",
-            "SELECT\n  count(*)\nFROM t",
-        ] {
-            assert!(fires("MOD024", sql), "should fire: {sql}");
-        }
-    }
-
-    #[test]
-    fn mod024_must_not_fire() {
-        for sql in [
-            // single-line: no `\n` in the SELECT-clause byte range
-            "SELECT a, b, c FROM t",
-            // degenerate: fewer than 2 code tokens, even multiline
-            "SELECT\n  *\nFROM t",
-            "SELECT\n  a\nFROM t",
-            // already has a trailing comma
-            "SELECT\n  a,\n  b,\nFROM t",
-        ] {
-            assert!(!fires("MOD024", sql), "should NOT fire: {sql}");
-        }
-    }
-
-    #[test]
-    fn mod024_top_level_only_no_subquery_recursion() {
-        // Outer select list is single-line (no fire via the multiline
-        // gate); the subquery's own list is multiline with no trailing
-        // comma, but MOD024 only ever looks at the top-level SELECT
-        // clause, so this must not fire at all.
-        let sql = "SELECT a FROM (SELECT\n  x,\n  y\nFROM t) sub";
-        assert!(!fires("MOD024", sql));
-    }
-
-    #[test]
-    fn mod024_fix_is_minimal_and_correct() {
-        let sql = "SELECT\n  a,\n  b\nFROM t";
-        let tree = parse(sql).unwrap();
-        let f = analyze_tier3(&tree, sql)
-            .into_iter()
-            .find(|f| f.code == "MOD024")
-            .unwrap();
-        let fix = f.fix.clone().expect("MOD024 has a safe fix");
-        let mut fixed = sql.to_string();
-        fixed.replace_range(
-            fix.span.start as usize..fix.span.end as usize,
-            &fix.replacement,
-        );
-        assert_eq!(fixed, "SELECT\n  a,\n  b,\nFROM t");
-        assert!(parse(&fixed).is_some(), "fixed SQL must still parse");
-        assert!(!codes(&fixed).contains(&"MOD024"), "fix is not idempotent");
     }
 
     // -------------------------------------------------------------

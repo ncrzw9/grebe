@@ -6,21 +6,14 @@
 //! statement was not analyzed. They therefore run on source text and the
 //! parse verdict, not on a tree that does not exist.
 //!
-//! # The three classifications this module produces — and the one it does not
+//! # The three classifications
 //!
-//! `registry.rs` lists four codes in the `Prs`/`Src` categories: `PRS001`,
-//! `SRC002`, `SRC003`, `SRC004`. Only the first three are decided here.
-//!
-//! `SRC004 unchecked-statement`'s registry message reads *"Statement type is
-//! parsed but not yet linted by any MOD rule"* — a statement that has a
-//! `Tree` and simply has no detector for its shape (e.g. a DDL form no MOD
-//! rule inspects yet). That is a post-parse classification: it belongs
-//! wherever the pipeline dispatches a successfully-parsed statement to its
-//! `MOD` detectors and finds none apply, not here. [`classify_unparsed`]
-//! only ever sees statements the matcher rejected, so it never emits
-//! `SRC004`. `MERGE` has its own grammar production
-//! (`grebe-syntax/vendor/grammar/statements/merge_into.gram`) and parses like anything
-//! else.
+//! Every code in the `Prs`/`Src` categories is decided here: `PRS001`,
+//! `SRC002` and `SRC003`, all from statements the matcher rejected
+//! ([`classify_unparsed`] never sees a statement that parsed). `MERGE` has
+//! its own grammar production
+//! (`grebe-syntax/vendor/grammar/statements/merge_into.gram`) and parses like
+//! anything else.
 //!
 //! # Dialect scope
 //!
