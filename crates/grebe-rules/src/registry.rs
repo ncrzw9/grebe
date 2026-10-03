@@ -466,6 +466,37 @@ pub static RULES: &[Rule] = &[
                    group; compare the column to a range (ts >= '2023-01-01' AND ts < \
                    '2024-01-01') so DuckDB can skip what it doesn't need.",
     },
+    Rule {
+        code: "MOD036",
+        name: "row-at-a-time-insert",
+        category: Category::Mod,
+        // Default-on: measured at 50x (one multi-row INSERT) to 1,800x
+        // (INSERT ... SELECT), and the threshold keeps it silent on anything
+        // shorter than a load script.
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "10+ single-row INSERTs into one table in a row: load them as one multi-row \
+                   INSERT, or INSERT ... SELECT FROM read_csv(...), instead.",
+    },
+    Rule {
+        code: "MOD037",
+        name: "order-by-random-sample",
+        category: Category::Mod,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "ORDER BY random() LIMIT n orders every row to keep n; USING SAMPLE n ROWS \
+                   draws the same uniform sample about 4x faster.",
+    },
+    Rule {
+        code: "MOD038",
+        name: "sample-before-where",
+        category: Category::Mod,
+        // Warning: the query returns far fewer rows than it asks for.
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "USING SAMPLE n ROWS samples before WHERE filters, so far fewer than n rows \
+                   come back; filter in a subquery and sample its result.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -623,8 +654,8 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 2);
-        assert_eq!(mods, 34);
-        assert_eq!(RULES.len(), 37);
+        assert_eq!(mods, 37);
+        assert_eq!(RULES.len(), 40);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,
@@ -652,7 +683,7 @@ mod tests {
 
     /// Every `Mod` rule not in the opt-in band above is default-on
     /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021,
-    /// 026-030, 032, 035.
+    /// 026-030, 032, 035-038.
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [

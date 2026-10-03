@@ -1,4 +1,6 @@
-//! Tier 5 CST detectors: MOD035 (wrapped-date-filter).
+//! Tier 5 CST detectors: MOD035 (wrapped-date-filter), MOD036
+//! (row-at-a-time-insert), MOD037 (order-by-random-sample), MOD038
+//! (sample-before-where).
 //!
 //! This tier is about SQL that returns the right rows the slow way: a
 //! spelling that stops DuckDB from using what it already knows about the
@@ -8,6 +10,9 @@
 //!
 //! Production names are those of the vendored DuckDB grammar; `grebe tree`
 //! prints them for any statement.
+
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use grebe_syntax::cst::{NodeId, Tree};
 
@@ -251,9 +256,223 @@ pub fn wrapped_date_filter(tree: &Tree, src: &str) -> Vec<Finding> {
     out
 }
 
+/// Aggregate function names, from the same vendored list the other tiers
+/// read.
+static AGGREGATE_FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    include_str!("../vendor/aggregates.list")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
+});
+
+/// How many consecutive single-row INSERTs into one table make a run worth
+/// a finding. Each statement costs about half a millisecond of overhead, so
+/// short runs are harmless; the corpus never has more than 3, while a load
+/// script has dozens to thousands.
+const INSERT_RUN_THRESHOLD: usize = 10;
+
+/// The target of a top-level `INSERT ... VALUES` with exactly one row.
+fn single_row_insert_target(tree: &Tree, statement: NodeId, src: &str) -> Option<String> {
+    let insert = descend_single(tree, statement, "InsertStatement")?;
+    let values = tree.descendants(insert).into_iter().find(|&d| {
+        tree.rule_name(d) == "ValuesClause" && tree.ancestor(d, "InsertStatement") == Some(insert)
+    })?;
+    let rows = tree
+        .children(values)
+        .iter()
+        .filter(|&&c| tree.rule_name(c) == "ValuesExpressions")
+        .count();
+    if rows != 1 {
+        return None;
+    }
+    let target = child(tree, insert, "InsertTarget")?;
+    Some(
+        tree.text(target, src)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+    )
+}
+
+/// MOD036 — a run of consecutive single-row `INSERT ... VALUES` statements
+/// into one table.
+///
+/// Executed: loading 10,000 rows took 5.1 s as 10,000 single-row INSERTs,
+/// 0.10 s as one multi-row INSERT (50x) and 2.8 ms as `INSERT ... SELECT`
+/// from a generated source (1,800x). The finding sits on the run's first
+/// statement. Detect-only: separate statements succeed or fail one at a
+/// time, one merged statement all at once, so merging is the author's call.
+pub fn row_at_a_time_insert(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for program in tree.find("Program") {
+        let mut run: Option<(String, NodeId, usize)> = None;
+        let mut close = |run: &mut Option<(String, NodeId, usize)>| {
+            if let Some((_, first, len)) = run.take() {
+                if len >= INSERT_RUN_THRESHOLD {
+                    out.push(Finding {
+                        code: "MOD036",
+                        span: tree.node(first).span,
+                        fix: None,
+                    });
+                }
+            }
+        };
+        for &statement in tree.children(program) {
+            if tree.rule_name(statement) != "TopLevelStatement" {
+                continue;
+            }
+            match single_row_insert_target(tree, statement, src) {
+                Some(target) if run.as_ref().is_some_and(|(t, _, _)| *t == target) => {
+                    if let Some((_, _, len)) = run.as_mut() {
+                        *len += 1;
+                    }
+                }
+                Some(target) => {
+                    close(&mut run);
+                    run = Some((target, statement, 1));
+                }
+                None => close(&mut run),
+            }
+        }
+        close(&mut run);
+    }
+    out
+}
+
+/// MOD037 — `ORDER BY random() LIMIT n` to draw a random sample.
+///
+/// Executed on 20M rows: 148 ms, against 36-38 ms for `USING SAMPLE n ROWS`,
+/// which returns the same kind of sample (uniform, exactly n rows). The
+/// rewrite is equivalent only where nothing runs between the FROM and the
+/// sample: `USING SAMPLE` samples before `WHERE` filters (executed: 9 rows
+/// back, not 1,000), and before grouping, `DISTINCT`, aggregates and window
+/// functions. Any of those, an `OFFSET`, a set operation, or another
+/// ordering key, and this does not fire. Detect-only: the sample is random,
+/// so there is no result to compare a rewrite against.
+pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for modifiers in tree.find("ResultModifiers") {
+        let (Some(order), Some(limit)) = (
+            child(tree, modifiers, "OrderByClause"),
+            child(tree, modifiers, "LimitOffset"),
+        ) else {
+            continue;
+        };
+        let keys: Vec<NodeId> = tree
+            .descendants(order)
+            .into_iter()
+            .filter(|&d| tree.rule_name(d) == "OrderByExpression")
+            .collect();
+        let [key] = keys[..] else {
+            continue;
+        };
+        let key_text = tree
+            .text(key, src)
+            .split_whitespace()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !matches!(
+            key_text.as_str(),
+            "random()" | "random()asc" | "random()desc"
+        ) {
+            continue;
+        }
+        if tree
+            .text(limit, src)
+            .split_whitespace()
+            .any(|w| w.eq_ignore_ascii_case("OFFSET"))
+        {
+            continue;
+        }
+        // The query the modifiers apply to is their sibling; a set operation
+        // forks on the way down and is skipped.
+        let Some(select) = tree.parent(modifiers).and_then(|p| {
+            tree.children(p)
+                .iter()
+                .copied()
+                .filter(|&c| c != modifiers)
+                .find_map(|c| descend_single(tree, c, "SimpleSelect"))
+        }) else {
+            continue;
+        };
+        let filters_or_groups = tree.children(select).iter().any(|&c| {
+            matches!(
+                tree.rule_name(c),
+                "WhereClause"
+                    | "GroupByClause"
+                    | "HavingClause"
+                    | "QualifyClause"
+                    | "WindowClause"
+                    | "SampleClause"
+            )
+        });
+        let reshapes_rows = tree
+            .descendants(select)
+            .iter()
+            .any(|&d| match tree.rule_name(d) {
+                "DistinctClause" | "OverClause" => true,
+                "FunctionExpression" => child(tree, d, "FunctionIdentifier").is_some_and(|id| {
+                    AGGREGATE_FUNCTIONS
+                        .contains(tree.text(id, src).trim().to_ascii_lowercase().as_str())
+                }),
+                _ => false,
+            });
+        let has_from = tree
+            .descendants(select)
+            .iter()
+            .any(|&d| tree.rule_name(d) == "FromClause");
+        if !filters_or_groups && !reshapes_rows && has_from {
+            out.push(Finding {
+                code: "MOD037",
+                span: tree.node(modifiers).span,
+                fix: None,
+            });
+        }
+    }
+    out
+}
+
+/// MOD038 — `WHERE ... USING SAMPLE n ROWS`: the sample is taken before the
+/// WHERE filters, so far fewer than n rows come back.
+///
+/// Executed on 1M rows where 1% match: `WHERE v = 1 USING SAMPLE 1000 ROWS`
+/// returned 9 rows. Only a fixed row count is flagged; a percentage keeps
+/// the same fraction whether taken before or after filtering, and is the
+/// usual way to approximate an aggregate. `TABLESAMPLE` on a table is not
+/// flagged: written on the table, it reads as what it does.
+pub fn sample_before_where(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for sample in tree.find("SampleClause") {
+        let has_where = tree
+            .parent(sample)
+            .is_some_and(|select| child(tree, select, "WhereClause").is_some());
+        let counts_rows = tree.descendants(sample).iter().any(|&d| {
+            tree.rule_name(d) == "SampleUnit"
+                && tree
+                    .text(d, src)
+                    .trim()
+                    .to_ascii_uppercase()
+                    .starts_with("ROW")
+        });
+        if has_where && counts_rows {
+            out.push(Finding {
+                code: "MOD038",
+                span: tree.node(sample).span,
+                fix: None,
+            });
+        }
+    }
+    out
+}
+
 /// Every tier-5 detector; findings are sorted by position, then code.
 pub fn analyze_tier5(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = wrapped_date_filter(tree, src);
+    out.extend(row_at_a_time_insert(tree, src));
+    out.extend(order_by_random_sample(tree, src));
+    out.extend(sample_before_where(tree, src));
     out.sort_by_key(|f| (f.span.start, f.code));
     out
 }
