@@ -421,6 +421,19 @@ pub static RULES: &[Rule] = &[
         message: "WHERE filters on the LEFT JOIN's right side, which drops its unmatched \
                    rows -- the join is acting as an INNER JOIN here.",
     },
+    Rule {
+        code: "MOD030",
+        name: "sum-case-to-count-if",
+        category: Category::Mod,
+        default_severity: Severity::Info,
+        // Safe, unlike MOD014 whose shape this is carved out of: executed
+        // against DuckDB, `count_if(c)` matches `sum(CASE WHEN c THEN 1 ELSE
+        // 0 END)` with c NULL, with no input rows (both NULL), with rows but
+        // no match (both 0), and in type (both HUGEINT). The literals must be
+        // exactly 1 and 0: `1.0` would make the sum a DECIMAL.
+        fix_safety: FixSafety::Safe,
+        message: "sum(CASE WHEN c THEN 1 ELSE 0 END) is count_if(c).",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -578,8 +591,8 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 3);
-        assert_eq!(mods, 29);
-        assert_eq!(RULES.len(), 33);
+        assert_eq!(mods, 30);
+        assert_eq!(RULES.len(), 34);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-025 —
@@ -606,7 +619,7 @@ mod tests {
     }
 
     /// Every `Mod` rule not in the opt-in band above is default-on
-    /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021, 026-029.
+    /// (`Error`/`Warning`/`Info`, never `Off`) — MOD001-009, 011-016, 021, 026-030.
     #[test]
     fn default_on_band_is_not_off() {
         let off_codes = [
