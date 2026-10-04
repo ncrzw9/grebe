@@ -6,10 +6,11 @@
 
 const path = require("path");
 const vscode = require("vscode");
-const { Session, checkCli, parseVersion } = require("./duckdb-session");
+const { Session, checkCli, parseVersion, queryBody } = require("./duckdb-session");
 const { columnar } = require("./lenient-json");
 const results = require("./results");
 const log = require("./log");
+const trust = require("./trust");
 
 let session = null;
 let status = null;
@@ -87,7 +88,7 @@ function settings() {
   return {
     cli: cfg.get("path", "") || "duckdb",
     database: cfg.get("database", "") || ":memory:",
-    maxRows: Math.max(1, cfg.get("maxRows", 100000)),
+    maxRows: Math.max(1, cfg.get("maxRows", 10000)),
     timeoutMs: Math.max(0, cfg.get("queryTimeout", 0)) * 1000,
   };
 }
@@ -245,6 +246,7 @@ function explicitPath() {
 async function applySettings() {
   restart();
   if (!(await refreshStatus({ recheck: true }))) return;
+  if (!trust.trusted()) return;
   const folder = (vscode.workspace.workspaceFolders || [])[0];
   const active = vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri;
   const uri = active && active.scheme === "file" ? active : folder ? folder.uri : null;
@@ -312,8 +314,8 @@ async function run(client, { doc, range }) {
   exportable.clear();
   const s = settings();
   results.begin({
-    title: `${path.basename(doc.fileName)} — ${statements.length} statement${statements.length === 1 ? "" : "s"}`,
-    detail: `running on ${s.database} with ${s.cli}…`,
+    title: path.basename(doc.fileName),
+    detail: `${statements.length} statement${statements.length === 1 ? "" : "s"} · ${s.database}`,
   });
 
   let sess;
@@ -355,7 +357,7 @@ async function run(client, { doc, range }) {
     let r;
     const t0 = Date.now();
     try {
-      r = await sess.run(st.text, { timeoutMs: s.timeoutMs });
+      r = await (st.kind === "select" ? runCapped(sess, st.text, s) : sess.run(st.text, { timeoutMs: s.timeoutMs }));
     } catch (e) {
       r = e && e.cancelled
         ? cancelledResult(e, Date.now() - t0)
@@ -365,8 +367,10 @@ async function run(client, { doc, range }) {
     }
     ran++;
     if (r.kind === "rows") {
+      const more = r.rows.length > s.maxRows;
       // What the grid receives: column-major display text (columnar()).
       r = { kind: "rows", ms: r.ms, ...columnar(r, s.maxRows) };
+      if (more) r.more = true;
       if (st.kind === "select") {
         entry.exportable = true;
         exportable.set(entry.id, { sql: st.text, uri: doc.uri });
@@ -418,11 +422,48 @@ async function run(client, { doc, range }) {
   for (const l of runListeners) l();
 }
 
+// A query runs as `FROM (<query>) LIMIT maxRows + 1`, so DuckDB formats only
+// the rows the grid keeps (and one more, to know there are more). Measured
+// on 1.5.5: a 1M-row result took 3.5 s to print and parse in full, 0.2 s
+// capped; a 10M-row one 0.2 s capped. The prefix is subtracted from an
+// error's position so the caret still points into the statement as written.
+const CAP_PREFIX = "FROM (\n";
+
+async function runCapped(sess, sql, s) {
+  const capped = `${CAP_PREFIX}${queryBody(sql)}\n) LIMIT ${s.maxRows + 1};`;
+  const r = await sess.run(capped, { timeoutMs: s.timeoutMs });
+  // Some queries cannot be a subquery; run those as written.
+  if (r.kind === "error" && r.type === "Parser") return sess.run(sql, { timeoutMs: s.timeoutMs });
+  if (r.kind === "error" && typeof r.position === "number") {
+    const at = r.position - Buffer.byteLength(CAP_PREFIX);
+    r.position = at >= 0 && at <= Buffer.byteLength(sql) ? at : null;
+  }
+  return r;
+}
+
+/** How many rows a query returns in full: the Count button. */
+async function countResult(id) {
+  const item = exportable.get(id);
+  if (!item) return;
+  const sess = await sessionFor(item.uri);
+  const r = await sess.run(`SELECT count(*) AS n FROM (\n${queryBody(item.sql)}\n);`);
+  if (r.kind === "rows") {
+    results.counted(id, Number(r.rows[0][0]));
+    log.info("duckdb", `counted ${Number(r.rows[0][0]).toLocaleString()} rows`);
+  } else if (r.kind === "error") {
+    log.error("duckdb", `count failed: ${r.type} Error: ${r.message}`);
+  }
+}
+
 /** What a statement did, in a few words, for the log. */
 function outcome(r) {
   const ms = r.ms === undefined ? "" : ` (${r.ms < 10 ? r.ms.toFixed(1) : Math.round(r.ms)} ms)`;
   if (r.kind === "cancelled") return `${r.reason === "timeout" ? "timed out" : "cancelled"}${ms}${r.ended ? `; ${r.message}` : ""}`;
-  if (r.kind === "rows") return `${r.total} row${r.total === 1 ? "" : "s"} × ${r.columns.length}${ms}`;
+  if (r.kind === "rows") {
+    const shown = r.data.length ? r.data[0].length : 0;
+    const rows = r.more ? `${shown}+ rows` : `${r.total} row${r.total === 1 ? "" : "s"}`;
+    return `${rows} × ${r.columns.length}${ms}`;
+  }
   if (r.kind === "ok") return `ok${ms}`;
   if (r.kind === "text") return `text output${ms}`;
   return `${r.type} Error: ${r.message}`;
@@ -503,6 +544,7 @@ function onDidRun(listener) {
  *  else one started for the workspace (or the active file's folder). */
 async function currentSession() {
   if (session && session.alive) return session;
+  if (!trust.trusted()) throw new Error("this folder is open in Restricted Mode; trust it to start DuckDB");
   const folder = (vscode.workspace.workspaceFolders || [])[0];
   const active = vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri;
   const uri = active && active.scheme === "file" ? active : folder ? folder.uri : null;
@@ -575,6 +617,7 @@ function activate(context, clientReady) {
   status.command = "grebe.duckdb.chooseDatabase";
 
   results.setExportHandler(exportResult);
+  results.setCountHandler(countResult);
   results.setRevealHandler(async (uri, line) => {
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(uri));
     const ed = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
@@ -591,6 +634,7 @@ function activate(context, clientReady) {
     return c;
   };
   const withClient = (mode) => async () => {
+    if (!trust.ok("Running SQL")) return;
     const c = await client();
     const target = c && fromEditor(c, mode);
     if (target) await run(c, target);
@@ -598,6 +642,7 @@ function activate(context, clientReady) {
   // The ▶ Run lens above each statement: that statement's own range, so it
   // runs exactly one statement whichever editor has focus.
   const runRange = async (uri, range) => {
+    if (!trust.ok("Running SQL")) return;
     const c = await client();
     if (!c) return;
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(uri));

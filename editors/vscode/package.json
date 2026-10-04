@@ -30,6 +30,21 @@
   "activationEvents": [
     "onLanguage:sql"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In Restricted Mode grebe lints and formats SQL. Running SQL, the Catalog and data files need a trusted folder, and the folder's own grebe.path, grebe.duckdb.path and grebe.duckdb.database settings are not used until then.",
+      "restrictedConfigurations": [
+        "grebe.path",
+        "grebe.duckdb.path",
+        "grebe.duckdb.database"
+      ]
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "grebe runs local programs (its language server and the duckdb CLI) on local files."
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -218,9 +233,9 @@
         },
         "grebe.duckdb.maxRows": {
           "type": "integer",
-          "default": 100000,
+          "default": 10000,
           "minimum": 1,
-          "description": "Most rows kept per result in the results grid, and read from a data file opened in the grid. The grid draws only what is in view, so this can be large. A query's row count is always reported in full, and Export always writes every row."
+          "description": "Most rows a query shows in the grid, and read from a data file opened in the grid (default 10,000). DuckDB stops after these, so a result of millions of rows comes back as fast as one of ten thousand; Count gives the full total, and Export always writes every row."
         },
         "grebe.duckdb.queryTimeout": {
           "type": "integer",

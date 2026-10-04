@@ -17,6 +17,7 @@ const { columnar } = require("./lenient-json");
 const { reader, inspector, cwdOf, cancel } = require("./inspect");
 const { Channel } = require("./results");
 const log = require("./log");
+const trust = require("./trust");
 
 // Parquet opens in the grid by default; delimited files only when chosen.
 // Two view types because a custom editor's priority covers all of its
@@ -26,7 +27,7 @@ const DELIMITED_VIEW_TYPE = "grebe.delimitedFile";
 const viewTypeFor = (uri) => (/\.parquet$/i.test(uri.fsPath) ? VIEW_TYPE : DELIMITED_VIEW_TYPE);
 
 function maxRows() {
-  return Math.max(1, vscode.workspace.getConfiguration("grebe.duckdb").get("maxRows", 100000));
+  return Math.max(1, vscode.workspace.getConfiguration("grebe.duckdb").get("maxRows", 10000));
 }
 
 /** Read `uri` into `channel`: its rows (up to grebe.duckdb.maxRows) with
@@ -34,8 +35,18 @@ function maxRows() {
 async function load(channel, uri) {
   const file = uri.fsPath;
   const limit = maxRows();
+  // One row past the limit, only to learn whether there are more.
   const sql = `FROM ${reader(file)} LIMIT ${limit + 1}`;
-  channel.begin({ title: path.basename(file), detail: "" });
+  // What the page shows: the query you would write yourself, relative to
+  // the workspace, rather than the one run here.
+  const rel = vscode.workspace.asRelativePath(uri, false);
+  const shown = `FROM '${rel.replace(/'/g, "''")}'`;
+  // fill: the one grid in a file's tab takes the whole tab.
+  channel.begin({ title: path.basename(file), detail: "", fill: true });
+  if (!trust.trusted()) {
+    channel.end("This folder is open in Restricted Mode. Trust it (Manage Workspace Trust) to read the file with DuckDB.");
+    return;
+  }
   channel.running(`Reading ${path.basename(file)}`);
   let r;
   let types = null;
@@ -62,11 +73,12 @@ async function load(channel, uri) {
     }
     // Not a count: the file has more rows than were read.
     if (more) r.more = true;
-    channel.add({ id: 0, uri: uri.toString(), line: null, preview: sql, result: r, exportable: false });
-    channel.end(more ? `first ${limit.toLocaleString()} rows (grebe.duckdb.maxRows) · ${file}` : file);
+    channel.add({ id: 0, uri: uri.toString(), line: null, preview: shown, result: r, exportable: false });
+    // The status line already says how many rows; the header says where.
+    channel.end(file);
   } else {
     if (r.kind === "error") log.error("grid", `${file}: ${r.type} Error: ${r.message}`);
-    channel.add({ id: 0, uri: uri.toString(), line: null, preview: sql, result: r, exportable: false });
+    channel.add({ id: 0, uri: uri.toString(), line: null, preview: shown, result: r, exportable: false });
     channel.end(r.kind === "error" ? "Could not read the file." : r.kind === "cancelled" ? "Cancelled. Reopen the file to read it again." : file);
   }
 }

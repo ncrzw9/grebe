@@ -19,6 +19,7 @@ const { Session } = require("./duckdb-session");
 const { columnar } = require("./lenient-json");
 const results = require("./results");
 const log = require("./log");
+const trust = require("./trust");
 
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
@@ -149,8 +150,14 @@ class Explorer {
   }
 
   async sourceChildren(root) {
+    if (!trust.trusted()) {
+      return [message("Restricted Mode: trust this folder to use DuckDB", "workbench.trust.manage", "shield")];
+    }
     if (root.source === "session" && !this.deps.liveSession()) {
-      return [message("Not started — run a statement, or click to start", "grebe.catalog.start", "play")];
+      const start = message("Start DuckDB session", "grebe.catalog.start", "play");
+      start.item.description = "or run a statement";
+      start.item.tooltip = "Start the session your runs use, to see what is in it.";
+      return [start];
     }
     if (root.source === "file" && this.files.get(root.alias).error) {
       return [message(this.files.get(root.alias).error)];
@@ -268,6 +275,7 @@ class Explorer {
 
   /** ATTACH a database file to the session, so its tables can be queried. */
   async attach(uri) {
+    if (!trust.ok("Attaching a database")) return;
     if (!uri) {
       const picked = await vscode.window.showOpenDialog({
         canSelectMany: false,
@@ -364,6 +372,7 @@ class Explorer {
   }
 
   async browseFile(uri) {
+    if (!trust.ok("Browsing a database file")) return;
     if (!uri) {
       const picked = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { DuckDB: ["duckdb", "db", "ddb"] } });
       uri = picked && picked[0];
@@ -449,6 +458,7 @@ function activate(context, deps) {
     view,
     on("refresh", () => explorer.refresh()),
     on("start", async () => {
+      if (!trust.ok("Starting DuckDB")) return;
       await deps.currentSession();
       explorer.refresh();
     }),

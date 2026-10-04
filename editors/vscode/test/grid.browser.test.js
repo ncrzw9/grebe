@@ -20,24 +20,28 @@ const browserTest = chromium ? test : test.skip;
 
 const PAGE = fs.readFileSync(path.join(__dirname, "..", "media", "results-page.js"), "utf8");
 
-// The shell results.js serves, minus the CSP nonce, with the VS Code API
-// replaced by a recorder.
+// The page results.js serves, made by its own html(), with the content
+// security policy and script tag swapped for a recorder of what the page
+// sends and the page script inline.
 function html() {
-  return `<!DOCTYPE html><html><head><style>
-    body { font-family: sans-serif; font-size: 12px; margin: 0; padding: 0 10px; background: #1e1e1e; color: #ccc;
-      --vscode-editor-font-family: monospace; --vscode-editor-font-size: 12px; }
-    .grid { outline: none; border: 1px solid #444; }
-    .viewport { overflow: auto; position: relative; }
-    .viewport canvas { position: sticky; top: 0; left: 0; display: block; }
-    .sizer { pointer-events: none; }
-  </style></head><body>
-  <header><div id="title">No results yet.</div><div id="summary"></div></header>
-  <main id="runs"></main>
-  <script>
-    window.sent = [];
-    window.acquireVsCodeApi = () => ({ postMessage: (m) => window.sent.push(m) });
-  </script>
-  <script>${PAGE}</script></body></html>`;
+  const Module = require("module");
+  const orig = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? {} : orig.call(this, request, ...rest);
+  };
+  let shell;
+  try {
+    delete require.cache[require.resolve("../results")];
+    shell = require("../results").html("page.js", "self");
+  } finally {
+    Module._load = orig;
+  }
+  return shell
+    .replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/, "")
+    .replace(/<style nonce="[^"]*">/, `<style>
+      body { --vscode-editor-font-family: monospace; --vscode-editor-font-size: 12px; background: #1e1e1e; color: #ccc; }`)
+    .replace(/<script nonce="[^"]*" src="page.js"><\/script>/, () =>
+      `<script>window.sent = []; window.acquireVsCodeApi = () => ({ postMessage: (m) => window.sent.push(m) });</script><script>${PAGE}</script>`);
 }
 
 function rowsResult(n) {
@@ -77,7 +81,15 @@ browserTest("the grid draws, selects, copies and sorts", async (t) => {
 
   assert.equal(await page.textContent("#title"), "q.sql — 1 statement");
   assert.equal(await page.textContent("#summary"), "1 statement succeeded.");
-  assert.match(await page.textContent(".bar"), /100,000 rows × 2/);
+  assert.match(await page.textContent("#status .count"), /^100,000 rows × 2$/);
+  assert.match(await page.textContent("#status"), /3\.2 ms/);
+  // One result set: no tab strip.
+  assert.equal(await page.isHidden("#tabs"), true);
+  // The grid fills the page below the header, down to the status line.
+  const gridBox = await page.locator(".grid").boundingBox();
+  const statusBox = await page.locator("#status").boundingBox();
+  assert.ok(Math.abs(gridBox.y + gridBox.height - statusBox.y) <= 2, `grid ends at ${gridBox.y + gridBox.height}, status at ${statusBox.y}`);
+  assert.ok(gridBox.height > 500, `grid is ${gridBox.height}px of a 700px page`);
 
   // Something was drawn: the canvas is not one flat colour.
   const colours = await page.evaluate(() => {
@@ -163,7 +175,7 @@ browserTest("the grid draws, selects, copies and sorts", async (t) => {
   assert.deepEqual(copies.at(-1).text.split("\n"), ["0", "1"]);
 
   // Export buttons post which format was asked for.
-  await page.click(".export button >> text=parquet");
+  await page.click("#status button >> text=Parquet");
   const exp = await page.evaluate(() => window.sent.filter((m) => m.type === "export"));
   assert.deepEqual(exp, [{ type: "export", id: 1, format: "parquet" }]);
 });
@@ -181,16 +193,22 @@ browserTest("errors, text, OK and a capped data file render as such", async (t) 
     window.postMessage({ type: "result", entry: { id: 4, line: null, uri: "u", preview: "FROM read_parquet('x')", result: capped } }, "*");
   }, { ...rowsResult(100), more: true });
   await page.waitForSelector("canvas");
-  assert.match(await page.textContent("main"), /OK · 1\.5 ms/);
-  assert.equal(await page.textContent("pre.text"), "PROJECTION");
-  assert.equal(await page.textContent(".error"), 'Binder Error: Referenced column "nope" not found');
+  // Statements that return no rows: one line each in the log.
+  const lines = await page.locator("#log .line").allTextContents();
+  assert.deepEqual(lines, ["✓L1CREATE TABLE t (a INT)1.5 ms", "✗L3SELECT nope"]);
+  assert.equal(await page.textContent("#log .detail.error"), 'Binder Error: Referenced column "nope" not found');
   assert.equal(await page.textContent("pre.context"), "3 | SELECT nope\n  |        ^");
-  assert.match(await page.textContent(".bar"), /^first 100 rows × 2/);
-  // A line link goes back to the statement; a data file has none.
-  await page.click(".stmt a >> text=L3");
+  // Result sets: a tab each, the newest shown; a data file's has no line.
+  assert.deepEqual(await page.locator("#tabs .tab").allTextContents(), ["L2 · text", "100+ rows"]);
+  assert.equal(await page.isVisible("#tabs"), true);
+  assert.match(await page.textContent("#status .count"), /^first 100 rows × 2$/);
+  await page.click("#tabs .tab >> text=L2 · text");
+  assert.equal(await page.textContent("pre.text"), "PROJECTION");
+  assert.equal(await page.textContent("#status .count"), "text");
+  // A line link goes back to the statement.
+  await page.click("#log .ln >> text=L3");
   const reveal = await page.evaluate(() => window.sent.filter((m) => m.type === "reveal"));
   assert.deepEqual(reveal, [{ type: "reveal", uri: "u", line: 2 }]);
-  assert.equal(await page.locator("section").nth(3).locator(".stmt a").count(), 0);
 });
 
 browserTest("a running statement shows its clock and a Cancel button", async (t) => {
@@ -222,7 +240,7 @@ browserTest("a running statement shows its clock and a Cancel button", async (t)
   await page.waitForSelector(".cancelled");
   await page.waitForTimeout(50);
   assert.equal(await page.locator(".running").count(), 0);
-  const notes = await page.locator(".cancelled").allTextContents();
+  const notes = await page.locator("#log .detail.cancelled").allTextContents();
   assert.deepEqual(notes, [
     "Cancelled after 1 min 5 s.",
     "Timed out (grebe.duckdb.queryTimeout) after 30.0 s.",

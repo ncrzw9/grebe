@@ -17,6 +17,7 @@ const { Session } = require("./duckdb-session");
 const { columnar } = require("./lenient-json");
 const results = require("./results");
 const log = require("./log");
+const trust = require("./trust");
 
 const DATA = /\.(parquet|csv|tsv|txt|json|jsonl|ndjson)(\.(gz|zst))?$/i;
 
@@ -100,6 +101,7 @@ async function target(arg) {
 }
 
 async function show(view, arg) {
+  if (!trust.ok("Reading a data file")) return;
   const uri = await target(arg);
   if (!uri) return;
   const file = uri.fsPath;
@@ -173,6 +175,7 @@ async function describe(file, cwd) {
 
 const hoverProvider = {
   async provideHover(doc, pos) {
+    if (!trust.trusted()) return null;
     const hit = literalAt(doc, pos);
     if (!hit) return null;
     const cwd = cwdOf(doc.uri);

@@ -61,13 +61,21 @@ exports.activate = function activate(context) {
   runner.activate(context, () => ready);
   inspect.activate(context);
   dataEditor.activate(context);
-  catalog.activate(context, {
+  const catalogView = catalog.activate(context, {
     currentSession: runner.currentSession,
     liveSession: runner.liveSession,
     onDidRun: runner.onDidRun,
     settings: runner.settings,
     cli: () => runner.settings().cli,
   });
+  // Trust granted: the folder's own grebe.path now applies, and DuckDB may
+  // run.
+  context.subscriptions.push(
+    workspace.onDidGrantWorkspaceTrust(() => {
+      restart(context);
+      catalogView.refresh();
+    }),
+  );
   return start(context);
 };
 

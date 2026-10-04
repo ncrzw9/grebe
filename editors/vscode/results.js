@@ -25,7 +25,7 @@ const log = require("./log");
 const VIEW_ID = "grebe.results";
 
 let extensionUri = null;
-const handlers = { reveal: () => {}, export: () => {}, cancel: () => {} };
+const handlers = { reveal: () => {}, export: () => {}, cancel: () => {}, count: () => {} };
 
 /** Where media/ lives; set once from activate(). */
 function init(uri) {
@@ -35,6 +35,11 @@ function init(uri) {
 /** Called with (uri, line) when a statement's line link is clicked. */
 function setRevealHandler(handler) {
   handlers.reveal = handler;
+}
+
+/** Called with (id) when a result's Count button is clicked. */
+function setCountHandler(handler) {
+  handlers.count = handler;
 }
 
 /** Called when the shared results' Cancel button is clicked. */
@@ -90,6 +95,7 @@ class Channel {
     }
     // Returned so a caller (the tests) can wait for the file to be written.
     if (m.type === "export") return handlers.export(m.id, m.format);
+    if (m.type === "count") return handlers.count(m.id);
     return undefined;
   }
 
@@ -124,6 +130,11 @@ class Channel {
    *  not. Not replayed: it is about one click, not the result. */
   exported(id, message) {
     for (const w of this.webviews) w.postMessage({ type: "exported", id, message });
+  }
+
+  /** A result's full row count, once counted. */
+  counted(id, total) {
+    for (const w of this.webviews) w.postMessage({ type: "counted", id, total });
   }
 }
 
@@ -191,6 +202,7 @@ const add = (entry) => shared.add(entry);
 const running = (label) => shared.running(label);
 const end = (summary) => shared.end(summary);
 const exported = (id, message) => shared.exported(id, message);
+const counted = (id, total) => shared.counted(id, total);
 
 function register(context) {
   context.subscriptions.push(
@@ -211,35 +223,58 @@ function html(scriptUri, cspSource) {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}' ${cspSource};">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style nonce="${nonce}">
-  body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 0 10px 16px; margin: 0; }
-  header { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 6px 0 4px; border-bottom: 1px solid var(--vscode-panel-border); z-index: 3; display: flex; gap: 10px; align-items: baseline; }
-  #title { font-weight: 600; }
-  .meta, .note { color: var(--vscode-descriptionForeground); }
-  section { margin-top: 10px; }
-  .stmt { font-family: var(--vscode-editor-font-family); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--vscode-descriptionForeground); }
-  .stmt a { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; margin-right: 2px; }
-  .error { color: var(--vscode-errorForeground); white-space: pre-wrap; font-family: var(--vscode-editor-font-family); font-size: 12px; margin-top: 2px; }
-  pre.context { font-family: var(--vscode-editor-font-family); font-size: 12px; margin: 2px 0 0; color: var(--vscode-descriptionForeground); overflow-x: auto; }
-  pre.text { font-family: var(--vscode-editor-font-family); font-size: 12px; overflow-x: auto; margin: 4px 0; }
-  .bar { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; margin: 2px 0 3px; font-size: 11px; }
-  .export { display: inline-flex; gap: 2px; align-items: baseline; margin-left: auto; }
-  .export button { font: inherit; padding: 0 4px; cursor: pointer; color: var(--vscode-textLink-foreground); background: none; border: none; }
-  .export button:hover { text-decoration: underline; }
-  .running { margin-left: auto; display: inline-flex; gap: 8px; align-items: baseline; }
-  .running button { font: inherit; cursor: pointer; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: none; padding: 1px 8px; border-radius: 2px; }
-  .running button:hover { background: var(--vscode-button-hoverBackground); }
-  .running button:disabled { opacity: 0.6; cursor: default; }
-  .cancelled { color: var(--vscode-editorWarning-foreground); margin-top: 2px; }
-  .grid { outline: none; border: 1px solid var(--vscode-panel-border); }
-  .grid:focus { border-color: var(--vscode-focusBorder); }
-  .viewport { overflow: auto; position: relative; }
+  html, body { height: 100%; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 0; display: flex; flex-direction: column; overflow: hidden;
+    font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
+  button { font: inherit; color: var(--vscode-textLink-foreground); background: none; border: none; padding: 0 4px; cursor: pointer; }
+  button:hover { text-decoration: underline; }
+  button:disabled { opacity: 0.6; cursor: default; text-decoration: none; }
+  .meta, .note, .ms { color: var(--vscode-descriptionForeground); }
+  #bar { display: flex; gap: 10px; align-items: baseline; padding: 4px 10px; flex: none; min-width: 0; }
+  #title { font-weight: 600; white-space: nowrap; }
+  #summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .running { margin-left: auto; display: inline-flex; gap: 8px; align-items: baseline; white-space: nowrap; }
+  .running button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); padding: 0 8px; border-radius: 2px; }
+  .running button:hover { background: var(--vscode-button-hoverBackground); text-decoration: none; }
+  #log { flex: none; max-height: 30vh; overflow: auto; padding: 0 10px 4px; font-family: var(--vscode-editor-font-family); font-size: 11px; }
+  body:not(.has-results) #log { flex: 1; max-height: none; }
+  .line { display: flex; gap: 8px; align-items: baseline; white-space: nowrap; line-height: 17px; color: var(--vscode-descriptionForeground); }
+  .line .mark { width: 1ch; flex: none; }
+  .line.ok .mark { color: var(--vscode-testing-iconPassed, #73c991); }
+  .line.error, .line.error .mark { color: var(--vscode-errorForeground); }
+  .line.cancelled .mark { color: var(--vscode-editorWarning-foreground); }
+  .line .sql { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .line .outcome { flex: none; }
+  .ln { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; flex: none; }
+  .detail { margin: 2px 0 0 calc(1ch + 8px); white-space: pre-wrap; }
+  .detail.error { color: var(--vscode-errorForeground); }
+  .detail.cancelled { color: var(--vscode-editorWarning-foreground); }
+  pre.context { margin: 2px 0 2px calc(1ch + 8px); color: var(--vscode-descriptionForeground); font-family: inherit; }
+  #tabs { flex: none; display: flex; gap: 2px; padding: 0 10px; border-bottom: 1px solid var(--vscode-panel-border); overflow-x: auto; }
+  .tab { color: var(--vscode-descriptionForeground); padding: 3px 8px; border-bottom: 1px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+  .tab:hover { color: var(--vscode-foreground); text-decoration: none; }
+  .tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+  #main { flex: 1; min-height: 0; display: flex; }
+  #main > * { flex: 1; min-width: 0; }
+  pre.text { margin: 0; padding: 6px 10px; overflow: auto; font-family: var(--vscode-editor-font-family); font-size: 12px; }
+  .empty { padding: 6px 10px; color: var(--vscode-descriptionForeground); }
+  #status { flex: none; display: flex; gap: 12px; align-items: baseline; padding: 3px 10px; border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; min-width: 0; }
+  body:not(.has-results) #status { display: none; }
+  #status .sql { overflow: hidden; text-overflow: ellipsis; color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family); font-size: 11px; flex: 1; min-width: 0; }
+  #status .actions { display: inline-flex; gap: 2px; align-items: baseline; }
+  .grid { outline: none; display: flex; }
+  .viewport { overflow: auto; position: relative; flex: 1; }
   .viewport canvas { position: sticky; top: 0; left: 0; display: block; }
   .sizer { pointer-events: none; }
 </style>
 </head>
 <body>
-<header><div id="title">No results yet. Run a statement, or open a data file.</div><div id="summary" class="meta"></div></header>
-<main id="runs"></main>
+<header id="bar"><span id="title">No results yet.</span><span id="summary" class="meta">Run a statement, or open a data file.</span></header>
+<div id="log" hidden></div>
+<nav id="tabs" hidden></nav>
+<div id="main"></div>
+<footer id="status"></footer>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
@@ -255,10 +290,12 @@ module.exports = {
   running,
   end,
   exported,
+  counted,
   show,
   openInEditor,
   setRevealHandler,
   setExportHandler,
   setCancelHandler,
+  setCountHandler,
   html,
 };

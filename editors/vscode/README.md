@@ -116,7 +116,27 @@ them.
 ## The results grid
 
 Results appear in the **DuckDB Results** view, which starts in the bottom
-panel. Put it wherever suits you:
+panel. One run fills it:
+
+- a **header** line: the file, the statement count, and while it runs, a
+  clock and **Cancel**;
+- a **log**: one line per statement that returned no rows (`✓ L2 CREATE
+  TEMP TABLE recent  13 ms`), or the error, with the line and a caret under
+  the spot DuckDB reported;
+- a **tab** for each result set when there is more than one; the newest
+  is shown;
+- the **grid**, filling the rest;
+- a **status line** for it: `first 10,000 rows × 3 · 23 ms`, the
+  statement, and **Count**, **CSV**, **TSV**, **Parquet**, **JSON**.
+
+It is built to be fast. A query shows at most `grebe.duckdb.maxRows` rows
+(10,000 by default) and DuckDB stops producing rows there, so a query that
+returns 5 million rows comes back as fast as one that returns 10,000.
+**Count** asks DuckDB for the full total; **export** writes every row. The
+grid draws only the cells in view, so scrolling stays at the display's
+frame rate at any size.
+
+Put the view wherever suits you:
 
 - **Drag its tab** to the side bar, the secondary side bar, or back to the
   panel, like any view. It keeps showing the current results when moved.
@@ -125,8 +145,7 @@ panel. Put it wherever suits you:
   beside your SQL, or be moved into a window of its own (right-click the
   tab, **Move into New Window**). Both stay in step while open.
 
-The grid draws only what is in view, so 100,000 rows or 200 columns scroll
-at full speed.
+In the grid:
 
 - **Select**: click or drag cells; click a **header** for the column
   (Shift+click or drag across headers for several), a **row number** for
@@ -139,11 +158,6 @@ at full speed.
 - **Sort and size**: the **↕** at a header's right edge sorts ascending,
   descending, off (NULLs last). Drag a header's edge to resize it,
   double-click it to fit.
-- **Export** a query's result as **CSV, TSV, Parquet or JSON**. DuckDB
-  writes the file itself (`COPY`), so it has every row with exact types, not
-  only what is on screen. Export runs the query again, so values from
-  `now()` or `random()` may differ from what you saw, and it is offered
-  only for queries, never for statements that change data.
 - **Types** of each column show in its header.
 
 ## Catalog
@@ -209,6 +223,14 @@ columns and types, with links to the views above.
 Data files are read with your `duckdb` CLI in a separate in-memory session:
 looking at a file never touches the database your script is working on.
 
+## Restricted Mode
+
+In a folder VS Code has not been told to trust, grebe still lints and
+formats. Running SQL, the Catalog and data files wait until you trust the
+folder (**Manage Workspace Trust**): a folder's SQL can read and write
+files, and its own `grebe.path`, `grebe.duckdb.path` and
+`grebe.duckdb.database` settings are not used until then.
+
 ## When something goes wrong
 
 Everything the extension does is logged in one place: the **grebe** output
@@ -237,9 +259,9 @@ timing, and on a failure the whole statement and where DuckDB stopped),
   on `PATH`). grebe never bundles or links DuckDB.
 - `grebe.duckdb.database`: `:memory:` (the default) or a database file;
   relative paths resolve against the workspace folder.
-- `grebe.duckdb.maxRows`: most rows kept per result, and read from a data
-  file opened in the grid (default 100,000). The full row count of a query
-  is always reported, and Export always writes every row.
+- `grebe.duckdb.maxRows`: most rows a query shows, and read from a data file
+  opened in the grid (default 10,000). DuckDB stops producing rows there;
+  **Count** gives the full total and Export always writes every row.
 - `grebe.duckdb.queryTimeout`: cancel a statement that runs longer than
   this many seconds (default 0: never).
 - `grebe.duckdb.codeLens`: the **▶ Run** link above each statement (default

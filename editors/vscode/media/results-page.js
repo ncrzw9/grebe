@@ -59,7 +59,164 @@
   const grids = new Set();
   new MutationObserver(() => readTheme()).observe(document.body, { attributes: true, attributeFilter: ["class"] });
 
-  // --- messages -----------------------------------------------------------
+  // --- layout -------------------------------------------------------------
+  //
+  // One run on one page: a header line; a compact log, one line for each
+  // statement that returned no rows (and the error, if any); a tab for each
+  // result set, the active one's grid filling the rest of the page; and a
+  // status line for that result.
+  const el = (id) => document.getElementById(id);
+  let tabs = []; // { entry, button, view, dispose }
+  let active = -1;
+
+  const fmtMs = (ms) => {
+    if (ms === undefined || ms === null) return "";
+    if (ms < 10) return ms.toFixed(1) + " ms";
+    if (ms < 10000) return Math.round(ms).toLocaleString() + " ms";
+    if (ms < 60000) return (ms / 1000).toFixed(1) + " s";
+    const s = Math.round(ms / 1000);
+    return `${Math.floor(s / 60)} min ${s % 60} s`;
+  };
+
+  function reset(header) {
+    stopRunning();
+    for (const t of tabs) if (t.dispose) t.dispose();
+    tabs = [];
+    active = -1;
+    el("title").textContent = header.title;
+    el("summary").textContent = header.detail || "";
+    for (const id of ["log", "tabs", "main", "status"]) el(id).replaceChildren();
+    el("log").hidden = true;
+    el("tabs").hidden = true;
+    document.body.classList.remove("has-results");
+  }
+
+  /** A statement's line link, back to where it is in the file. */
+  function lineLink(entry) {
+    if (typeof entry.line !== "number") return null;
+    const a = $("a", "ln", "L" + (entry.line + 1));
+    a.title = "Go to the statement";
+    a.addEventListener("click", () => vscode.postMessage({ type: "reveal", uri: entry.uri, line: entry.line }));
+    return a;
+  }
+
+  /** One line in the log: a mark, the line link, the statement, the outcome. */
+  function logLine(entry, cls, mark, outcome) {
+    const line = $("div", "line " + cls);
+    line.append($("span", "mark", mark));
+    const link = lineLink(entry);
+    if (link) line.append(link);
+    line.append($("span", "sql", entry.preview), $("span", "outcome", outcome));
+    el("log").append(line);
+    el("log").hidden = false;
+    return line;
+  }
+
+  function addResult(entry) {
+    const r = entry.result;
+    if (r.kind === "ok") {
+      logLine(entry, "ok", "✓", fmtMs(r.ms));
+    } else if (r.kind === "error") {
+      logLine(entry, "error", "✗", "");
+      const msg = $("div", "detail error", r.type + " Error: " + r.message);
+      el("log").append(msg);
+      // Where in the statement DuckDB stopped: the line, and a caret.
+      if (r.context) {
+        const n = String(r.context.line + 1);
+        el("log").append($("pre", "context", `${n} | ${r.context.text}\n${" ".repeat(n.length)} | ${" ".repeat(r.context.column)}^`));
+      }
+      msg.scrollIntoView({ block: "nearest" });
+    } else if (r.kind === "cancelled") {
+      const why = r.reason === "timeout" ? "timed out (grebe.duckdb.queryTimeout)" : "cancelled";
+      logLine(entry, "cancelled", "■", fmtMs(r.ms));
+      el("log").append($("div", "detail cancelled", `${why[0].toUpperCase()}${why.slice(1)}${r.ms ? " after " + fmtMs(r.ms) : ""}.` + (r.ended ? " " + r.message : "")));
+    } else {
+      addTab(entry);
+    }
+  }
+
+  // --- result tabs ----------------------------------------------------------
+  function rowsLabel(r) {
+    const shown = r.data.length ? r.data[0].length : 0;
+    if (r.more) return `first ${shown.toLocaleString()} rows`;
+    if (shown < r.total) return `${shown.toLocaleString()} of ${r.total.toLocaleString()} rows`;
+    return `${r.total.toLocaleString()} row${r.total === 1 ? "" : "s"}`;
+  }
+
+  function addTab(entry) {
+    const r = entry.result;
+    const button = $("button", "tab");
+    const what = r.kind === "rows" ? (r.more ? `${(r.data.length ? r.data[0].length : 0).toLocaleString()}+ rows` : rowsLabel(r)) : "text";
+    button.textContent = (typeof entry.line === "number" ? `L${entry.line + 1} · ` : "") + what;
+    button.title = entry.preview;
+    const i = tabs.length;
+    button.addEventListener("click", () => show(i));
+    el("tabs").append(button);
+    tabs.push({ entry, button, view: null, dispose: null });
+    // Two or more result sets: the tabs say which is which.
+    el("tabs").hidden = tabs.length < 2;
+    document.body.classList.add("has-results");
+    show(i);
+  }
+
+  function show(i) {
+    if (active >= 0 && tabs[active]) tabs[active].button.classList.remove("active");
+    active = i;
+    const t = tabs[i];
+    t.button.classList.add("active");
+    if (!t.view) {
+      const r = t.entry.result;
+      if (r.kind === "rows" && r.columns.length) {
+        t.view = grid(r);
+        t.dispose = t.view.dispose;
+      } else if (r.kind === "rows") {
+        t.view = $("div", "empty", "No columns.");
+      } else {
+        t.view = $("pre", "text", r.text);
+      }
+    }
+    el("main").replaceChildren(t.view);
+    if (t.view.repaint) requestAnimationFrame(() => t.view.repaint(true));
+    status(t);
+  }
+
+  /** The status line for a result: its size and time, and what can be done
+   *  with it. */
+  function status(t) {
+    const r = t.entry.result;
+    const bar = el("status");
+    bar.replaceChildren();
+    const count = $("span", "count", r.kind === "rows" ? `${rowsLabel(r)} × ${r.columns.length}` : "text");
+    count.dataset.countFor = String(t.entry.id);
+    bar.append(count, $("span", "ms", fmtMs(r.ms)));
+    const sql = $("span", "sql", t.entry.preview);
+    sql.title = t.entry.preview;
+    bar.append(sql);
+    const actions = $("span", "actions");
+    if (t.entry.exportable && r.more) {
+      const b = $("button", "", "Count");
+      b.title = "Count every row of the result (runs the query again)";
+      b.addEventListener("click", () => {
+        b.disabled = true;
+        vscode.postMessage({ type: "count", id: t.entry.id });
+      });
+      actions.append(b);
+    }
+    if (t.entry.exportable) {
+      for (const [fmt, label] of [["csv", "CSV"], ["tsv", "TSV"], ["parquet", "Parquet"], ["json", "JSON"]]) {
+        const b = $("button", "", label);
+        b.title = `Save every row as ${label} with DuckDB's COPY (runs the query again)`;
+        b.addEventListener("click", () => vscode.postMessage({ type: "export", id: t.entry.id, format: fmt }));
+        actions.append(b);
+      }
+    }
+    const note = $("span", "note");
+    note.dataset.exportNote = String(t.entry.id);
+    if (t.note) note.textContent = t.note;
+    actions.append(note);
+    bar.append(actions);
+  }
+
   // --- what is running now, with a way to stop it --------------------------
   let ticking = null;
   function running(label, since) {
@@ -74,7 +231,7 @@
       vscode.postMessage({ type: "cancel" });
     });
     box.append(text, stop);
-    document.querySelector("header").append(box);
+    el("bar").append(box);
     const tick = () => {
       const s = Math.max(0, Math.floor((Date.now() - since) / 1000));
       text.textContent = `${label} · ${s < 60 ? s + " s" : Math.floor(s / 60) + " min " + (s % 60) + " s"}`;
@@ -89,104 +246,32 @@
     ticking = null;
   }
 
+  // --- messages -----------------------------------------------------------
   window.addEventListener("message", ({ data }) => {
-    const runs = document.getElementById("runs");
     if (!theme) readTheme();
     if (data.type === "begin") {
-      stopRunning();
-      for (const g of grids) g.dispose();
-      grids.clear();
-      runs.replaceChildren();
-      document.getElementById("title").textContent = data.header.title;
-      document.getElementById("summary").textContent = data.header.detail;
+      reset(data.header);
     } else if (data.type === "running") {
       running(data.label, data.since);
-    } else if (data.type === "end") {
-      stopRunning();
-      document.getElementById("summary").textContent = data.summary;
     } else if (data.type === "result") {
       stopRunning();
-      runs.append(section(data.entry));
-    } else if (data.type === "exported") {
+      addResult(data.entry);
+    } else if (data.type === "end") {
+      stopRunning();
+      el("summary").textContent = data.summary;
+    } else if (data.type === "exported" || data.type === "counted") {
+      const t = tabs.find((x) => x.entry.id === data.id);
+      if (data.type === "counted" && t && typeof data.total === "number") {
+        t.entry.result.more = false;
+        t.entry.result.total = data.total;
+        if (tabs[active] === t) status(t);
+        return;
+      }
+      if (t) t.note = data.message;
       const note = document.querySelector(`[data-export-note="${data.id}"]`);
       if (note) note.textContent = data.message;
     }
   });
-
-  function section(entry) {
-    const sec = $("section");
-    const stmt = $("div", "stmt");
-    // A statement from a .sql file links back to it; an inspection of a
-    // data file has no line to go to.
-    if (typeof entry.line === "number") {
-      const link = $("a", "", "L" + (entry.line + 1));
-      link.title = "Go to the statement";
-      link.addEventListener("click", () => vscode.postMessage({ type: "reveal", uri: entry.uri, line: entry.line }));
-      stmt.append(link, document.createTextNode(" "));
-    }
-    stmt.append(document.createTextNode(entry.preview));
-    sec.append(stmt);
-
-    const r = entry.result;
-    const ms = r.ms === undefined ? "" : fmtMs(r.ms);
-    if (r.kind === "error") {
-      sec.append($("div", "error", r.type + " Error: " + r.message));
-      // Where in the statement DuckDB stopped: the line, and a caret.
-      if (r.context) {
-        const n = String(r.context.line + 1);
-        sec.append($("pre", "context", `${n} | ${r.context.text}\n${" ".repeat(n.length)} | ${" ".repeat(r.context.column)}^`));
-      }
-    } else if (r.kind === "text") {
-      sec.append($("pre", "text", r.text));
-      sec.append($("div", "note", ms));
-    } else if (r.kind === "ok") {
-      sec.append($("div", "note", "OK · " + ms));
-    } else if (r.kind === "cancelled") {
-      const why = r.reason === "timeout" ? "Timed out (grebe.duckdb.queryTimeout)" : "Cancelled";
-      sec.append($("div", "cancelled", (ms ? `${why} after ${ms}.` : `${why}.`) + (r.ended ? " " + r.message : "")));
-    } else {
-      const shown = r.data.length ? r.data[0].length : 0;
-      const bar = $("div", "bar");
-      const count =
-        (r.more
-          ? `first ${shown.toLocaleString()}`
-          : shown < r.total
-            ? `${shown.toLocaleString()} of ${r.total.toLocaleString()}`
-            : r.total.toLocaleString()) +
-        (r.total === 1 && !r.more ? " row" : " rows") +
-        ` × ${r.columns.length} · ${ms}`;
-      bar.append($("span", "note", count));
-      if (entry.exportable) {
-        const exp = $("span", "export");
-        exp.append($("span", "note", "export"));
-        for (const [fmt, label] of [["csv", "csv"], ["tsv", "tsv"], ["parquet", "parquet"], ["json", "json"]]) {
-          const b = $("button", "", label);
-          b.title =
-            "Save the full result with DuckDB's COPY: every row, exact types. " +
-            "The query runs again, so now() or random() may differ from what is shown.";
-          b.addEventListener("click", () => vscode.postMessage({ type: "export", id: entry.id, format: fmt }));
-          exp.append(b);
-        }
-        const note = $("span", "note");
-        note.dataset.exportNote = String(entry.id);
-        exp.append(note);
-        bar.append(exp);
-      }
-      sec.append(bar);
-      if (r.columns.length) sec.append(grid(r));
-    }
-    return sec;
-  }
-
-  // Milliseconds while that is the useful unit; a long query in seconds,
-  // a very long one in minutes and seconds.
-  const fmtMs = (ms) => {
-    if (ms < 10) return ms.toFixed(1) + " ms";
-    if (ms < 10000) return Math.round(ms).toLocaleString() + " ms";
-    if (ms < 60000) return (ms / 1000).toFixed(1) + " s";
-    const s = Math.round(ms / 1000);
-    return `${Math.floor(s / 60)} min ${s % 60} s`;
-  };
 
   // --- the grid -----------------------------------------------------------
   function grid(r) {
@@ -241,7 +326,7 @@
       sizer.style.height = HEAD + n * ROW + "px";
     };
     layout();
-    viewport.style.height = Math.min(HEAD + n * ROW + 16, Math.max(180, Math.round(window.innerHeight * 0.6))) + "px";
+    // The grid fills whatever holds it; the page lays that out.
 
     // View order (sorting) and selection, both in view coordinates.
     let order = null; // null = natural order
@@ -330,8 +415,10 @@
         ctx.restore();
       }
 
-      // Grid lines: hairlines between rows and columns.
+      // Grid lines: hairlines between rows and columns, half strength, so
+      // the data is what the eye lands on.
       ctx.strokeStyle = t.line;
+      ctx.globalAlpha = 0.5;
       ctx.lineWidth = 1 / dpr;
       ctx.beginPath();
       for (let v = first; v <= last; v++) {
@@ -346,6 +433,7 @@
         ctx.lineTo(xx, Math.min(HEAD + n * ROW - sy, H));
       }
       ctx.stroke();
+      ctx.globalAlpha = 1;
 
       // Active cell.
       if (sel && sel.r >= first && sel.r < last && sel.c >= c0 && sel.c < c1 && document.activeElement === root) {
@@ -624,9 +712,14 @@
 
     const g = {
       repaint: (resize) => repaint(resize),
-      dispose: () => ro.disconnect(),
+      dispose: () => {
+        ro.disconnect();
+        grids.delete(g);
+      },
     };
     grids.add(g);
+    root.repaint = g.repaint;
+    root.dispose = g.dispose;
     requestAnimationFrame(() => repaint(true));
     return root;
   }

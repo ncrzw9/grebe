@@ -124,6 +124,7 @@ function makeVscode(config) {
     workspace: {
       getConfiguration: () => ({ get: (k, d) => (k in config ? config[k] : d), update: async () => {} }),
       getWorkspaceFolder: () => undefined,
+      asRelativePath: (u) => path.basename(typeof u === "string" ? u : u.fsPath),
       onDidChangeTextDocument: () => disposable,
       openTextDocument: async (uri) => shown.docs.get(uri.toString()),
       onDidChangeConfiguration: (h) => {
@@ -330,7 +331,9 @@ live("run file and run statement, end to end", async (t) => {
   const rows = results[1].result;
   assert.equal(rows.kind, "rows");
   assert.deepEqual(rows.columns, ["i", "label"]);
-  assert.equal(rows.total, 5);
+  // Capped inside DuckDB: maxRows (2) and one more, to know there are more.
+  assert.equal(rows.more, true);
+  assert.equal(rows.data[0].length, 2);
   assert.deepEqual(rows.data, [["0", "1"], ["row;0", "row;1"]], "capped at maxRows, column-major text");
   assert.deepEqual(rows.num, [true, false]);
   assert.equal(results[2].result.kind, "error");
@@ -349,7 +352,7 @@ live("run file and run statement, end to end", async (t) => {
   assert.deepEqual(results[2].result.context, { line: 3, text: "SELECT nope FROM t;", column: 7 });
   const logged = shown.log.join("");
   assert.match(logged, /\[duckdb\] load\.sql:2 ok/);
-  assert.match(logged, /\[duckdb\] load\.sql:3 5 rows × 2/);
+  assert.match(logged, /\[duckdb\] load\.sql:3 2\+ rows × 2/);
   assert.match(logged, /\[duckdb\] load\.sql:4 Binder Error: Referenced column "nope" not found/);
   assert.match(logged, /\[duckdb\] 4 \| SELECT nope FROM t;\n.*\[duckdb\]   \|        \^/);
 
@@ -359,7 +362,7 @@ live("run file and run statement, end to end", async (t) => {
   await shown.commands.get("grebe.duckdb.runStatement")();
   const one = shown.posted.filter((m) => m.type === "result");
   assert.equal(one.length, 1);
-  assert.equal(one[0].entry.result.total, 5);
+  assert.equal(one[0].entry.result.more, true);
   assert.equal(shown.errors.length, 0, shown.errors.join("\n"));
 
   // --- a ▶ Run lens above each statement, and clicking one runs just that.
@@ -376,7 +379,13 @@ live("run file and run statement, end to end", async (t) => {
   const clicked = shown.posted.filter((m) => m.type === "result");
   assert.equal(clicked.length, 1, "exactly the one statement");
   assert.equal(clicked[0].entry.line, 2);
-  assert.equal(clicked[0].entry.result.total, 5);
+  assert.equal(clicked[0].entry.result.more, true);
+
+  // Count asks DuckDB for the whole total.
+  shown.posted.length = 0;
+  await shown.fromPage({ type: "count", id: clicked[0].entry.id });
+  assert.deepEqual(shown.posted.filter((m) => m.type === "counted"), [{ type: "counted", id: clicked[0].entry.id, total: 5 }]);
+  shown.posted.length = 0;
 
   // --- types from DESCRIBE, and export straight from the panel.
   const entry = clicked[0].entry;
@@ -539,7 +548,7 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
 
   // Before a session exists: say so, don't start one behind your back.
   let [root] = await ex.getChildren();
-  assert.deepEqual(labels(await ex.getChildren(root)), ["Not started — run a statement, or click to start"]);
+  assert.deepEqual(labels(await ex.getChildren(root)), ["Start DuckDB session (or run a statement)"]);
 
   sess = new Session({ cli: CLI, database: ":memory:", cwd: dir });
   await sess.start();
@@ -832,7 +841,7 @@ live("data files open in the grid: rows with types, a row cap, a reload on chang
   assert.deepEqual(r.types, ["BIGINT", "VARCHAR", "DECIMAL(21,1)"]);
   assert.equal(r.data[0].length, 100);
   assert.equal(r.more, true);
-  assert.match(orders.end(), /^first 100 rows \(grebe\.duckdb\.maxRows\)/);
+  assert.equal(orders.end(), path.join(dir, "orders.parquet"), "the header says where; the status line, how many");
 
   // CSV: every row, no cap reached.
   const people = await open("people.csv");
@@ -1030,4 +1039,78 @@ test("results: Cancel goes to the channel's own handler, else to the shared one"
   } finally {
     Module._load = origLoad;
   }
+});
+
+live("Restricted Mode: nothing starts DuckDB, and each place says why", async (t) => {
+  const { vscode, shown } = makeVscode({ path: CLI, database: ":memory:", maxRows: 100 });
+  vscode.workspace.isTrusted = false;
+  class TreeItem {
+    constructor(label, state) {
+      this.label = label;
+      this.collapsibleState = state;
+    }
+  }
+  Object.assign(vscode, {
+    TreeItem,
+    ThemeIcon: class {
+      constructor(id) {
+        this.id = id;
+      }
+    },
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+    RelativePattern: class {},
+  });
+  vscode.workspace.createFileSystemWatcher = () => ({ onDidChange() {}, onDidCreate() {}, dispose() {} });
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  t.after(() => {
+    Module._load = origLoad;
+  });
+  for (const m of ["../run", "../results", "../log", "../trust", "../catalog", "../inspect", "../dataEditor", "../duckdb-session"]) {
+    delete require.cache[require.resolve(m)];
+  }
+  const { Session } = require("../duckdb-session");
+  const runner = require("../run");
+  const subs = [];
+  runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") } }, () => Promise.resolve(null));
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+  resolveResultsView(vscode, shown);
+
+  // Run: a warning that names Restricted Mode, and no session.
+  const doc = fakeDocument(path.join(os.tmpdir(), "r.sql"), "SELECT 1;");
+  vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+  await shown.commands.get("grebe.duckdb.runFile")();
+  assert.match(shown.warnings.at(-1), /Running SQL needs a trusted folder\. This folder is open in Restricted Mode; linting and formatting still work\./);
+  assert.equal(runner.liveSession(), null);
+
+  // Catalog: says so in the tree, and its start command does not start one.
+  const { Explorer } = require("../catalog");
+  const ex = new Explorer({ currentSession: runner.currentSession, liveSession: runner.liveSession, settings: runner.settings, cli: () => CLI });
+  t.after(() => ex.dispose());
+  const [root] = await ex.getChildren();
+  const [msg] = await ex.getChildren(root);
+  assert.equal(msg.item.label, "Restricted Mode: trust this folder to use DuckDB");
+  assert.equal(msg.item.command.command, "workbench.trust.manage");
+  await assert.rejects(runner.currentSession(), /Restricted Mode/);
+
+  // A data file opened in the grid: the reason, in the tab.
+  const dataEditor = require("../dataEditor");
+  const posted = [];
+  await dataEditor.provider.resolveCustomEditor(
+    dataEditor.provider.openCustomDocument(vscode.Uri.file(path.join(os.tmpdir(), "x.parquet"))),
+    { webview: fakeWebview(shown, posted), onDidDispose() {} },
+  );
+  assert.match(posted.find((m) => m.type === "end").summary, /Restricted Mode/);
+  assert.equal(posted.some((m) => m.type === "result"), false);
+
+  // Hover: nothing, quietly.
+  const inspect = require("../inspect");
+  const sql = fakeDocument(path.join(os.tmpdir(), "h.sql"), "FROM 'x.parquet'");
+  assert.equal(await inspect.hoverProvider.provideHover(sql, new Position(0, 8)), null);
+
+  // Not one duckdb process was started.
+  assert.equal(Session.cancelAll(), false);
+  assert.equal(shown.errors.length, 0, shown.errors.join("\n"));
 });

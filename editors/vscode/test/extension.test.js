@@ -78,6 +78,7 @@ const vscode = {
   workspace: {
     getConfiguration: () => ({ get: (k, d) => (k in settings ? settings[k] : d) }),
     onDidChangeConfiguration: (fn) => { configListeners.push(fn); return { dispose() {} }; },
+    onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
   },
   commands: { registerCommand: () => ({ dispose() {} }), executeCommand() {} },
 };
@@ -88,7 +89,7 @@ const quiet = {
   "./results": { init() {}, register() {}, setCancelHandler() {} },
   "./run": { activate() {}, clientChanged: () => clientChanges++, cancel() {}, isRunning: () => false, currentSession() {}, liveSession() {}, onDidRun() {}, settings: () => ({}) },
   "./inspect": { activate() {} },
-  "./catalog": { activate() {} },
+  "./catalog": { activate: () => ({ refresh() {} }) },
   "./dataEditor": { activate() {} },
 };
 const realLoad = Module._load;
