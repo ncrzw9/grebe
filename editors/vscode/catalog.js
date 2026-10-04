@@ -205,11 +205,14 @@ class Explorer {
   async show(n, title, sql) {
     const o = n.object;
     results.begin({ title: `${o.name} — ${title}`, detail: qname(o) });
+    results.running(`${title} of ${o.name}`);
     let r;
     try {
       r = await (await this.sessionFor(n.source)).run(sql);
     } catch (e) {
-      r = { kind: "error", type: "Session", message: String(e.message ?? e) };
+      r = e && e.cancelled
+        ? { kind: "cancelled", reason: "cancel", ended: true, message: e.message }
+        : { kind: "error", type: "Session", message: String(e.message ?? e) };
     }
     if (r.kind === "error") log.error("catalog", `${title} of ${qname(o)}: ${r.type} Error: ${r.message}`);
     if (r.kind === "rows") r = { kind: "rows", ms: r.ms, ...columnar(r, 100000) };

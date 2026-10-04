@@ -85,8 +85,8 @@ const vscode = {
 // here it only has to be activated, and told when the server changes.
 let clientChanges = 0;
 const quiet = {
-  "./results": { init() {}, register() {} },
-  "./run": { activate() {}, clientChanged: () => clientChanges++, currentSession() {}, liveSession() {}, onDidRun() {}, settings: () => ({}) },
+  "./results": { init() {}, register() {}, setCancelHandler() {} },
+  "./run": { activate() {}, clientChanged: () => clientChanges++, cancel() {}, isRunning: () => false, currentSession() {}, liveSession() {}, onDidRun() {}, settings: () => ({}) },
   "./inspect": { activate() {} },
   "./catalog": { activate() {} },
   "./dataEditor": { activate() {} },

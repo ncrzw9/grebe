@@ -25,7 +25,7 @@ const log = require("./log");
 const VIEW_ID = "grebe.results";
 
 let extensionUri = null;
-const handlers = { reveal: () => {}, export: () => {} };
+const handlers = { reveal: () => {}, export: () => {}, cancel: () => {} };
 
 /** Where media/ lives; set once from activate(). */
 function init(uri) {
@@ -37,6 +37,11 @@ function setRevealHandler(handler) {
   handlers.reveal = handler;
 }
 
+/** Called when the shared results' Cancel button is clicked. */
+function setCancelHandler(handler) {
+  handlers.cancel = handler;
+}
+
 /** Called with (id, format) when an export button is clicked. */
 function setExportHandler(handler) {
   handlers.export = handler;
@@ -46,6 +51,9 @@ class Channel {
   constructor() {
     this.webviews = new Set();
     this.log = [];
+    // What Cancel stops, for a channel with its own producer (a data
+    // file's tab); the shared results use the handler set for them.
+    this.onCancel = null;
   }
 
   /** Render into `webview` from now on; replays what is on screen now. */
@@ -73,6 +81,7 @@ class Channel {
       return undefined;
     }
     if (m.type === "reveal") return handlers.reveal(m.uri, m.line);
+    if (m.type === "cancel") return this.onCancel ? this.onCancel() : handlers.cancel();
     // The page cannot reach the system clipboard itself; the extension can.
     if (m.type === "copy" && typeof m.text === "string") {
       vscode.env.clipboard.writeText(m.text);
@@ -93,6 +102,12 @@ class Channel {
   /** Start a run: clears the page and shows what is about to execute. */
   begin(header) {
     this.post({ type: "begin", header });
+  }
+
+  /** Something has started and may take a while: `label` and a clock in
+   *  the header, with a Cancel button. Cleared by the next result or end. */
+  running(label) {
+    this.post({ type: "running", label, since: Date.now() });
   }
 
   /** One statement's outcome. The caller has capped the rows, turned them
@@ -173,6 +188,7 @@ function begin(header) {
 }
 
 const add = (entry) => shared.add(entry);
+const running = (label) => shared.running(label);
 const end = (summary) => shared.end(summary);
 const exported = (id, message) => shared.exported(id, message);
 
@@ -209,6 +225,11 @@ function html(scriptUri, cspSource) {
   .export { display: inline-flex; gap: 2px; align-items: baseline; margin-left: auto; }
   .export button { font: inherit; padding: 0 4px; cursor: pointer; color: var(--vscode-textLink-foreground); background: none; border: none; }
   .export button:hover { text-decoration: underline; }
+  .running { margin-left: auto; display: inline-flex; gap: 8px; align-items: baseline; }
+  .running button { font: inherit; cursor: pointer; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: none; padding: 1px 8px; border-radius: 2px; }
+  .running button:hover { background: var(--vscode-button-hoverBackground); }
+  .running button:disabled { opacity: 0.6; cursor: default; }
+  .cancelled { color: var(--vscode-editorWarning-foreground); margin-top: 2px; }
   .grid { outline: none; border: 1px solid var(--vscode-panel-border); }
   .grid:focus { border-color: var(--vscode-focusBorder); }
   .viewport { overflow: auto; position: relative; }
@@ -231,11 +252,13 @@ module.exports = {
   register,
   begin,
   add,
+  running,
   end,
   exported,
   show,
   openInEditor,
   setRevealHandler,
   setExportHandler,
+  setCancelHandler,
   html,
 };

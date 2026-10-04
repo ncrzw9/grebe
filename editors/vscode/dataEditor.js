@@ -14,7 +14,7 @@
 const path = require("path");
 const vscode = require("vscode");
 const { columnar } = require("./lenient-json");
-const { reader, inspector, cwdOf } = require("./inspect");
+const { reader, inspector, cwdOf, cancel } = require("./inspect");
 const { Channel } = require("./results");
 const log = require("./log");
 
@@ -35,7 +35,8 @@ async function load(channel, uri) {
   const file = uri.fsPath;
   const limit = maxRows();
   const sql = `FROM ${reader(file)} LIMIT ${limit + 1}`;
-  channel.begin({ title: path.basename(file), detail: "reading…" });
+  channel.begin({ title: path.basename(file), detail: "" });
+  channel.running(`Reading ${path.basename(file)}`);
   let r;
   let types = null;
   try {
@@ -43,7 +44,9 @@ async function load(channel, uri) {
     r = await sess.run(sql);
     if (r.kind === "rows") types = await sess.describe(`FROM ${reader(file)}`).catch(() => null);
   } catch (e) {
-    r = { kind: "error", type: "Session", message: String(e.message ?? e) };
+    r = e && e.cancelled
+      ? { kind: "cancelled", reason: "cancel", ended: true, message: e.message }
+      : { kind: "error", type: "Session", message: String(e.message ?? e) };
   }
   if (r.kind === "rows") {
     // One row past the limit was asked for, only to know whether there are
@@ -64,7 +67,7 @@ async function load(channel, uri) {
   } else {
     if (r.kind === "error") log.error("grid", `${file}: ${r.type} Error: ${r.message}`);
     channel.add({ id: 0, uri: uri.toString(), line: null, preview: sql, result: r, exportable: false });
-    channel.end(r.kind === "error" ? "Could not read the file." : file);
+    channel.end(r.kind === "error" ? "Could not read the file." : r.kind === "cancelled" ? "Cancelled. Reopen the file to read it again." : file);
   }
 }
 
@@ -75,6 +78,7 @@ const provider = {
 
   resolveCustomEditor(document, panel) {
     const channel = new Channel();
+    channel.onCancel = () => cancel();
     const attached = channel.attach(panel.webview);
     const reload = () => load(channel, document.uri);
     const watcher = vscode.workspace.createFileSystemWatcher(

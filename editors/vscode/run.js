@@ -20,6 +20,8 @@ let versionFor = { cli: null, text: null, error: null };
 let announced = null;
 let nextResultId = 0;
 let lenses = null;
+// The run (or export) in progress: { sess, label, started, cancelled, timer }.
+let active = null;
 // Result id -> { sql, uri } for the results on screen that can be exported.
 const exportable = new Map();
 
@@ -39,6 +41,10 @@ async function exportResult(id, format) {
     return;
   }
   const base = vscode.workspace.getWorkspaceFolder(item.uri)?.uri ?? vscode.Uri.file(path.dirname(item.uri.fsPath));
+  if (active) {
+    results.exported(id, "A run is in progress; export when it ends.");
+    return;
+  }
   const target = await vscode.window.showSaveDialog({
     defaultUri: vscode.Uri.joinPath(base, `result.${fmt.ext}`),
     filters: { [fmt.label]: [fmt.ext] },
@@ -49,9 +55,18 @@ async function exportResult(id, format) {
   let r;
   try {
     const sess = await sessionFor(item.uri);
+    startActivity(sess, `export to ${path.basename(target.fsPath)}`);
     r = await sess.exportTo(item.sql, target.fsPath, format);
   } catch (e) {
-    r = { kind: "error", type: "Session", message: String(e.message ?? e) };
+    r = e && e.cancelled ? cancelledResult(e) : { kind: "error", type: "Session", message: String(e.message ?? e) };
+    if (e && e.ended) session = null;
+  } finally {
+    endActivity();
+  }
+  if (r.kind === "cancelled") {
+    results.exported(id, r.ended ? `Export cancelled. ${r.message}` : "Export cancelled.");
+    log.info("duckdb", `export to ${target.fsPath} cancelled`);
+    return;
   }
   if (r.kind === "error") {
     results.exported(id, `Export failed: ${r.type} Error: ${r.message}`);
@@ -73,7 +88,52 @@ function settings() {
     cli: cfg.get("path", "") || "duckdb",
     database: cfg.get("database", "") || ":memory:",
     maxRows: Math.max(1, cfg.get("maxRows", 100000)),
+    timeoutMs: Math.max(0, cfg.get("queryTimeout", 0)) * 1000,
   };
+}
+
+// --- a run in progress -------------------------------------------------------
+
+/** Mark `sess` busy with `label`: a clock on the status bar that cancels
+ *  when clicked, and the editor's Run buttons turned into a Stop button. */
+function startActivity(sess, label) {
+  active = { sess, label, started: Date.now(), cancelled: false, timer: null };
+  vscode.commands.executeCommand("setContext", "grebe.duckdb.running", true);
+  const tick = () => {
+    if (!active) return;
+    const s = Math.floor((Date.now() - active.started) / 1000);
+    status.text = `$(loading~spin) DuckDB · ${s} s`;
+    status.tooltip = `Running ${active.label}\nClick to cancel.`;
+    status.command = "grebe.duckdb.cancel";
+  };
+  tick();
+  active.timer = setInterval(tick, 1000);
+}
+
+function endActivity() {
+  if (!active) return;
+  clearInterval(active.timer);
+  active = null;
+  vscode.commands.executeCommand("setContext", "grebe.duckdb.running", false);
+  status.command = "grebe.duckdb.chooseDatabase";
+  refreshStatus();
+}
+
+/** Stop what is running: the statement in flight, and any left in the run. */
+async function cancel() {
+  if (!active) {
+    vscode.window.setStatusBarMessage("grebe: nothing is running", 2500);
+    return false;
+  }
+  active.cancelled = true;
+  log.info("duckdb", `cancelling ${active.label} after ${((Date.now() - active.started) / 1000).toFixed(1)} s`);
+  return active.sess.cancel("cancel");
+}
+
+/** A statement that was stopped, as a result to show. A cancel that had to
+ *  end the session rejects run() instead; that becomes one of these too. */
+function cancelledResult(e, ms) {
+  return { kind: "cancelled", reason: "cancel", ended: true, ms, message: `${e.message.replace(/^cancelled; /, "DuckDB ").replace(/^DuckDB on Windows/, "On Windows, cancelling")}: TEMP tables and in-memory data are gone.` };
 }
 
 /** The directory relative paths in SQL resolve against: the file's
@@ -225,6 +285,15 @@ function fromEditor(client, mode) {
 /** Run the statements of `doc` that `range` (an LSP range) touches, or all
  *  of them when `range` is null. */
 async function run(client, { doc, range }) {
+  // One run at a time: a second would wait, invisibly, behind the first.
+  if (active) {
+    const pick = await vscode.window.showWarningMessage(
+      `grebe: ${active.label} is still running.`,
+      "Cancel It",
+    );
+    if (pick === "Cancel It") await cancel();
+    return;
+  }
   const params = { textDocument: { uri: doc.uri.toString() } };
   if (range) params.range = range;
   let statements;
@@ -258,8 +327,18 @@ async function run(client, { doc, range }) {
   }
 
   let ran = 0;
+  let succeeded = 0;
   let failed = false;
-  for (const st of statements) {
+  let stopped = null; // "cancel" | "timeout" when a statement was stopped
+  startActivity(sess, `${path.basename(doc.fileName)}`);
+  try {
+  for (const [i, st] of statements.entries()) {
+    // Cancelled between statements (the last one finished as the cancel
+    // came in): the rest do not run.
+    if (active.cancelled) {
+      stopped = "cancel";
+      break;
+    }
     const range = client.protocol2CodeConverter.asRange(st.range);
     const entry = {
       id: ++nextResultId,
@@ -270,11 +349,19 @@ async function run(client, { doc, range }) {
       // Types and export both run the query again, so only for queries.
       exportable: false,
     };
+    results.running(
+      statements.length === 1 ? "Running" : `Running statement ${i + 1} of ${statements.length}`,
+    );
     let r;
+    const t0 = Date.now();
     try {
-      r = await sess.run(st.text);
+      r = await sess.run(st.text, { timeoutMs: s.timeoutMs });
     } catch (e) {
-      r = { kind: "error", type: "Session", subtype: null, message: String(e.message ?? e), position: null };
+      r = e && e.cancelled
+        ? cancelledResult(e, Date.now() - t0)
+        : { kind: "error", type: "Session", subtype: null, message: String(e.message ?? e), position: null };
+      // The session is gone either way; the next run starts a new one.
+      if (e && e.ended && session === sess) session = null;
     }
     ran++;
     if (r.kind === "rows") {
@@ -301,6 +388,11 @@ async function run(client, { doc, range }) {
     entry.result = r;
     results.add(entry);
     log.info("duckdb", `${where} ${outcome(r)}`);
+    if (r.kind === "cancelled") {
+      stopped = r.reason;
+      break;
+    }
+    if (r.kind !== "error") succeeded++;
     if (r.kind === "error") {
       failed = true;
       // The whole statement, and where in it DuckDB stopped, so the log
@@ -311,11 +403,16 @@ async function run(client, { doc, range }) {
       break; // a failure stops the run where it happened
     }
   }
+  } finally {
+    endActivity();
+  }
   const skipped = statements.length - ran;
   results.end(
-    failed
-      ? `Stopped at the error: ${ran - 1} succeeded${skipped ? `, ${skipped} not run` : ""}.`
-      : `${ran} statement${ran === 1 ? "" : "s"} succeeded.`,
+    stopped
+      ? `${stopped === "timeout" ? "Timed out" : "Cancelled"}: ${succeeded} succeeded${skipped ? `, ${skipped} not run` : ""}.`
+      : failed
+        ? `Stopped at the error: ${ran - 1} succeeded${skipped ? `, ${skipped} not run` : ""}.`
+        : `${ran} statement${ran === 1 ? "" : "s"} succeeded.`,
   );
   // A run may have created, dropped or attached something.
   for (const l of runListeners) l();
@@ -324,6 +421,7 @@ async function run(client, { doc, range }) {
 /** What a statement did, in a few words, for the log. */
 function outcome(r) {
   const ms = r.ms === undefined ? "" : ` (${r.ms < 10 ? r.ms.toFixed(1) : Math.round(r.ms)} ms)`;
+  if (r.kind === "cancelled") return `${r.reason === "timeout" ? "timed out" : "cancelled"}${ms}${r.ended ? `; ${r.message}` : ""}`;
   if (r.kind === "rows") return `${r.total} row${r.total === 1 ? "" : "s"} × ${r.columns.length}${ms}`;
   if (r.kind === "ok") return `ok${ms}`;
   if (r.kind === "text") return `text output${ms}`;
@@ -517,6 +615,7 @@ function activate(context, clientReady) {
     vscode.languages.registerCodeLensProvider({ language: "sql" }, lenses),
     lenses,
     log.command("grebe.duckdb.restart", restart),
+    log.command("grebe.duckdb.cancel", cancel),
     log.command("grebe.duckdb.chooseDatabase", chooseDatabase),
     // A runtime error describes the text it ran; once that text changes, it
     // no longer points at anything.
@@ -539,4 +638,7 @@ function clientChanged() {
   if (lenses) lenses.refresh();
 }
 
-module.exports = { activate, clientChanged, errorContext, caretLines, currentSession, liveSession, onDidRun, settings, resolveDatabase, cwdFor };
+/** A run or export is in progress. */
+const isRunning = () => active !== null;
+
+module.exports = { activate, clientChanged, cancel, isRunning, errorContext, caretLines, currentSession, liveSession, onDidRun, settings, resolveDatabase, cwdFor };

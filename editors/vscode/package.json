@@ -55,6 +55,12 @@
         "icon": "$(run-all)"
       },
       {
+        "command": "grebe.duckdb.cancel",
+        "title": "Cancel Running Query",
+        "category": "grebe",
+        "icon": "$(debug-stop)"
+      },
+      {
         "command": "grebe.duckdb.chooseDatabase",
         "title": "Choose DuckDB Database",
         "category": "grebe"
@@ -204,6 +210,12 @@
           "minimum": 1,
           "description": "Most rows kept per result in the results grid, and read from a data file opened in the grid. The grid draws only what is in view, so this can be large. A query's row count is always reported in full, and Export always writes every row."
         },
+        "grebe.duckdb.queryTimeout": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "Cancel a statement that runs longer than this many seconds. 0, the default, never does. A cancelled statement stops within milliseconds and the session, TEMP tables included, carries on; the rest of the run does not run."
+        },
         "grebe.duckdb.codeLens": {
           "type": "boolean",
           "default": true,
@@ -238,13 +250,18 @@
       "editor/title/run": [
         {
           "command": "grebe.duckdb.runStatement",
-          "when": "editorLangId == sql",
+          "when": "editorLangId == sql && !grebe.duckdb.running",
           "group": "navigation@1"
         },
         {
           "command": "grebe.duckdb.runFile",
-          "when": "editorLangId == sql",
+          "when": "editorLangId == sql && !grebe.duckdb.running",
           "group": "navigation@2"
+        },
+        {
+          "command": "grebe.duckdb.cancel",
+          "when": "editorLangId == sql && grebe.duckdb.running",
+          "group": "navigation@1"
         }
       ],
       "commandPalette": [
@@ -291,6 +308,10 @@
         {
           "command": "grebe.openInGrid",
           "when": "true"
+        },
+        {
+          "command": "grebe.duckdb.cancel",
+          "when": "grebe.duckdb.running"
         }
       ],
       "explorer/context": [

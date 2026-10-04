@@ -855,3 +855,126 @@ test("errorContext: the line DuckDB points into, and the column, as the editor c
   assert.equal(caretLines(ctx), "12 |        nope\n   |        ^");
   assert.equal(errorContext(sql, null, 0), null);
 });
+
+live("cancel: a long statement stops, the rest of the run does not run, the session lives on", { skip: process.platform === "win32" }, async (t) => {
+  const config = { path: CLI, database: ":memory:", maxRows: 100, queryTimeout: 0 };
+  const { vscode, shown } = makeVscode(config);
+  const contexts = [];
+  vscode.commands.executeCommand = async (name, ...args) => {
+    if (name === "setContext") contexts.push(args);
+  };
+  let warningPick;
+  vscode.window.showWarningMessage = async (m, ...actions) => {
+    shown.warnings.push(m);
+    return actions.includes(warningPick) ? warningPick : undefined;
+  };
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  t.after(() => {
+    Module._load = origLoad;
+  });
+  for (const m of ["../run", "../results", "../log", "../duckdb-session"]) delete require.cache[require.resolve(m)];
+  const runner = require("../run");
+  const results = require("../results");
+  const client = lspClient(GREBE);
+  t.after(() => client.stop());
+  await client.request("initialize", { capabilities: {} });
+  const subs = [];
+  runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") } }, () => Promise.resolve(client));
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+  t.after(() => require("../duckdb-session").Session.disposeAll());
+  resolveResultsView(vscode, shown);
+  results.setCancelHandler(() => runner.cancel());
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-cancel-"));
+  const open = (name, sql) => {
+    const doc = fakeDocument(path.join(dir, name), sql);
+    shown.docs.set(doc.uri.toString(), doc);
+    client.notify("textDocument/didOpen", { textDocument: { uri: doc.uri.toString(), languageId: "sql", version: 1, text: sql } });
+    vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+    return doc;
+  };
+  const endless = "SELECT count(*) FROM range(3000000) a, range(3000000) b WHERE (a.range * b.range) % 1000003 = 7;";
+  open("long.sql", ["CREATE TEMP TABLE keep AS SELECT 42 AS v;", endless, "CREATE TABLE never AS SELECT 1;"].join("\n"));
+
+  // --- cancel from the command while statement 2 runs.
+  const running = shown.commands.get("grebe.duckdb.runFile")();
+  await until(() => shown.posted.some((m) => m.type === "running" && /2 of 3/.test(m.label)), "statement 2 to start");
+  assert.equal(runner.isRunning(), true);
+  assert.deepEqual(contexts.at(-1), ["grebe.duckdb.running", true], "the Stop button replaces Run");
+
+  // A second run meanwhile is not queued behind it; it offers to cancel.
+  await shown.commands.get("grebe.duckdb.runStatement")();
+  assert.match(shown.warnings.at(-1), /long\.sql is still running/);
+
+  await new Promise((r) => setTimeout(r, 300));
+  const t0 = Date.now();
+  await shown.commands.get("grebe.duckdb.cancel")();
+  await running;
+  assert.ok(Date.now() - t0 < 2000, `stopped in ${Date.now() - t0} ms`);
+  const outcomes = shown.posted.filter((m) => m.type === "result").map((m) => m.entry.result.kind);
+  assert.deepEqual(outcomes, ["ok", "cancelled"], "the third statement never ran");
+  assert.equal(shown.posted.findLast((m) => m.type === "end").summary, "Cancelled: 1 succeeded, 1 not run.");
+  assert.deepEqual(contexts.at(-1), ["grebe.duckdb.running", false]);
+  assert.equal(runner.isRunning(), false);
+  assert.match(shown.log.join(""), /\[duckdb\] cancelling long\.sql after/);
+  assert.match(shown.log.join(""), /\[duckdb\] long\.sql:2 cancelled/);
+
+  // Same session: the TEMP table is still there; the cancelled run's last
+  // statement never created its table.
+  shown.posted.length = 0;
+  open("after.sql", "SELECT v FROM keep;\nSELECT count(*) AS n FROM duckdb_tables() WHERE table_name = 'never';");
+  await shown.commands.get("grebe.duckdb.runFile")();
+  const after = shown.posted.filter((m) => m.type === "result").map((m) => m.entry.result);
+  assert.deepEqual(after[0].data, [["42"]]);
+  assert.deepEqual(after[1].data, [["0"]]);
+
+  // --- cancel from the grid's Cancel button.
+  shown.posted.length = 0;
+  open("again.sql", endless);
+  const again = shown.commands.get("grebe.duckdb.runFile")();
+  await until(() => shown.posted.some((m) => m.type === "running"), "the run to start");
+  await new Promise((r) => setTimeout(r, 300));
+  await shown.fromPage({ type: "cancel" });
+  await again;
+  assert.equal(shown.posted.findLast((m) => m.type === "result").entry.result.kind, "cancelled");
+
+  // --- a timeout does it unasked.
+  config.queryTimeout = 1;
+  shown.posted.length = 0;
+  open("slow.sql", endless);
+  await shown.commands.get("grebe.duckdb.runFile")();
+  const timed = shown.posted.findLast((m) => m.type === "result").entry.result;
+  assert.deepEqual([timed.kind, timed.reason], ["cancelled", "timeout"]);
+  assert.ok(timed.ms >= 1000 && timed.ms < 3000, `${timed.ms} ms`);
+  assert.equal(shown.posted.findLast((m) => m.type === "end").summary, "Timed out: 0 succeeded.");
+  assert.deepEqual(shown.errors, []);
+});
+
+test("results: Cancel goes to the channel's own handler, else to the shared one", () => {
+  const { vscode, shown } = makeVscode({});
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  try {
+    for (const m of ["../results", "../log"]) delete require.cache[require.resolve(m)];
+    const results = require("../results");
+    results.init({ fsPath: path.join(__dirname, "..") });
+    let shared = 0;
+    let own = 0;
+    results.setCancelHandler(() => shared++);
+    const view = new results.Channel();
+    view.attach(fakeWebview(shown, []));
+    shown.fromPage({ type: "cancel" });
+    const file = new results.Channel();
+    file.onCancel = () => own++;
+    file.attach(fakeWebview(shown, []));
+    shown.fromPage({ type: "cancel" });
+    assert.deepEqual([shared, own], [1, 1]);
+  } finally {
+    Module._load = origLoad;
+  }
+});

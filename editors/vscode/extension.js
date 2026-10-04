@@ -17,6 +17,7 @@ const runner = require("./run");
 const inspect = require("./inspect");
 const catalog = require("./catalog");
 const dataEditor = require("./dataEditor");
+const { Session } = require("./duckdb-session");
 
 // A server that has not answered `initialize` by then is not going to: a
 // healthy grebe answers in milliseconds.
@@ -51,6 +52,12 @@ exports.activate = function activate(context) {
   );
   results.init(context.extensionUri);
   results.register(context);
+  // The shared results' Cancel button stops whatever is filling them: a run,
+  // an export, a catalog preview or a file inspection.
+  results.setCancelHandler(() => {
+    if (runner.isRunning()) runner.cancel();
+    else Session.cancelAll();
+  });
   runner.activate(context, () => ready);
   inspect.activate(context);
   dataEditor.activate(context);
@@ -65,6 +72,8 @@ exports.activate = function activate(context) {
 };
 
 exports.deactivate = function deactivate() {
+  // Every duckdb process ends with the extension, busy or not.
+  Session.disposeAll();
   return stopClient();
 };
 

@@ -60,18 +60,52 @@
   new MutationObserver(() => readTheme()).observe(document.body, { attributes: true, attributeFilter: ["class"] });
 
   // --- messages -----------------------------------------------------------
+  // --- what is running now, with a way to stop it --------------------------
+  let ticking = null;
+  function running(label, since) {
+    stopRunning();
+    const box = $("span", "running");
+    const text = $("span", "note");
+    const stop = $("button", "cancel", "Cancel");
+    stop.title = "Stop this statement. The session and its TEMP tables stay.";
+    stop.addEventListener("click", () => {
+      stop.disabled = true;
+      stop.textContent = "Cancelling…";
+      vscode.postMessage({ type: "cancel" });
+    });
+    box.append(text, stop);
+    document.querySelector("header").append(box);
+    const tick = () => {
+      const s = Math.max(0, Math.floor((Date.now() - since) / 1000));
+      text.textContent = `${label} · ${s < 60 ? s + " s" : Math.floor(s / 60) + " min " + (s % 60) + " s"}`;
+    };
+    tick();
+    ticking = { box, timer: setInterval(tick, 1000) };
+  }
+  function stopRunning() {
+    if (!ticking) return;
+    clearInterval(ticking.timer);
+    ticking.box.remove();
+    ticking = null;
+  }
+
   window.addEventListener("message", ({ data }) => {
     const runs = document.getElementById("runs");
     if (!theme) readTheme();
     if (data.type === "begin") {
+      stopRunning();
       for (const g of grids) g.dispose();
       grids.clear();
       runs.replaceChildren();
       document.getElementById("title").textContent = data.header.title;
       document.getElementById("summary").textContent = data.header.detail;
+    } else if (data.type === "running") {
+      running(data.label, data.since);
     } else if (data.type === "end") {
+      stopRunning();
       document.getElementById("summary").textContent = data.summary;
     } else if (data.type === "result") {
+      stopRunning();
       runs.append(section(data.entry));
     } else if (data.type === "exported") {
       const note = document.querySelector(`[data-export-note="${data.id}"]`);
@@ -107,6 +141,9 @@
       sec.append($("div", "note", ms));
     } else if (r.kind === "ok") {
       sec.append($("div", "note", "OK · " + ms));
+    } else if (r.kind === "cancelled") {
+      const why = r.reason === "timeout" ? "Timed out (grebe.duckdb.queryTimeout)" : "Cancelled";
+      sec.append($("div", "cancelled", (ms ? `${why} after ${ms}.` : `${why}.`) + (r.ended ? " " + r.message : "")));
     } else {
       const shown = r.data.length ? r.data[0].length : 0;
       const bar = $("div", "bar");
@@ -141,7 +178,15 @@
     return sec;
   }
 
-  const fmtMs = (ms) => (ms < 10 ? ms.toFixed(1) : Math.round(ms).toLocaleString()) + " ms";
+  // Milliseconds while that is the useful unit; a long query in seconds,
+  // a very long one in minutes and seconds.
+  const fmtMs = (ms) => {
+    if (ms < 10) return ms.toFixed(1) + " ms";
+    if (ms < 10000) return Math.round(ms).toLocaleString() + " ms";
+    if (ms < 60000) return (ms / 1000).toFixed(1) + " s";
+    const s = Math.round(ms / 1000);
+    return `${Math.floor(s / 60)} min ${s % 60} s`;
+  };
 
   // --- the grid -----------------------------------------------------------
   function grid(r) {

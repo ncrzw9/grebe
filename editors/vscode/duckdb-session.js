@@ -19,7 +19,10 @@
 
 const { spawn, execFile } = require("child_process");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { parse, readTable } = require("./lenient-json");
+const watchdog = require("./watchdog");
 
 const SETUP = [
   ".echo off",
@@ -35,6 +38,32 @@ const SETUP = [
 // without a limit `start()` waited forever. Generous, because a ~/.duckdbrc
 // may INSTALL an extension over the network.
 const START_TIMEOUT_MS = 20000;
+
+// Cancelling a statement. Measured on the 1.5.5 CLI over a pipe:
+//
+//   - SIGINT to a CLI reading a pipe ends the process, and the session with
+//     it. Run with `-interactive`, SIGINT stops the query instead (3-9 ms on
+//     a 30M-row join, an 830 MB CSV scan, a COPY to Parquet), prints nothing
+//     for it, keeps the process and its TEMP tables, and the marker after it
+//     still arrives. SIGINT while idle does nothing.
+//   - `-interactive` also turns on the shell's history file, which would put
+//     every statement run here into ~/.duckdb_history; DUCKDB_HISTORY points
+//     it at /dev/null.
+//   - Errors stay plain JSON and no progress bar is drawn: neither is a
+//     terminal.
+//
+// Windows has no SIGINT to send another process (Node's kill() terminates
+// it there), so cancelling on Windows ends the session.
+const INTERRUPTIBLE = process.platform !== "win32";
+
+// How long a cancelled statement may take to stop before the process is
+// killed instead. A query normally stops within milliseconds; one that
+// does not (stuck in a call that does not check for interrupts) should not
+// hold the session forever.
+const CANCEL_GRACE_MS = 3000;
+
+// Every session not yet ended, so they can all be ended together.
+const live = new Set();
 
 /** Terminal colour codes removed: the CLI colours its "Loading resources
  *  from ~/.duckdbrc" line even when writing to a pipe. */
@@ -157,7 +186,7 @@ class Session {
    * @param {{ cli: string, database: string, cwd: string,
    *           onStderr?: (text: string) => void,
    *           onExit?: (reason: string) => void,
-   *           startTimeoutMs?: number }} opts
+   *           startTimeoutMs?: number, cancelGraceMs?: number }} opts
    * `onStderr` hears, as it arrives, what the CLI writes to stderr during
    * start-up or between statements (a statement's own stderr is its result).
    * `onExit` hears the process ending on its own (a crash, a kill, an rc
@@ -189,12 +218,16 @@ class Session {
 
   /** Start the process and wait until its setup has been applied. */
   async start() {
-    const proc = spawn(this.opts.cli, [this.opts.database], {
+    const args = INTERRUPTIBLE ? ["-interactive", this.opts.database] : [this.opts.database];
+    const proc = spawn(this.opts.cli, args, {
       cwd: this.opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: INTERRUPTIBLE ? { ...process.env, DUCKDB_HISTORY: "/dev/null" } : process.env,
     });
     this.proc = proc;
+    live.add(this);
+    watchdog.watch(proc.pid);
     proc.stderr.setEncoding("utf8");
     proc.stdout.on("data", (d) => {
       this.chunks.push(d);
@@ -211,6 +244,8 @@ class Session {
     });
     proc.on("error", (e) => this.close(spawnMessage(this.opts.cli, e)));
     proc.on("exit", (code, signal) => {
+      live.delete(this);
+      watchdog.unwatch(proc.pid);
       if (this.closedWith !== null) return; // dispose() or a start-up timeout
       const said = farewell(this.err + Buffer.concat(this.chunks).toString("utf8"));
       const reason = said || `duckdb exited (${signal || `code ${code}`})`;
@@ -235,19 +270,79 @@ class Session {
     }
   }
 
-  /** Run one statement. Resolves with `classify`'s shape plus `ms`. */
-  run(sql) {
+  /**
+   * Run one statement. Resolves with `classify`'s shape plus `ms`, or
+   * `{ kind: "cancelled", reason }` when cancel() stopped it ("cancel") or
+   * `timeoutMs` ran out ("timeout"). Rejects when the session ends under it;
+   * the error has `ended: true`, and `cancelled` when ending it was how a
+   * cancel had to be done.
+   */
+  run(sql, { timeoutMs = 0 } = {}) {
     const job = this.queue.then(async () => {
       const started = process.hrtime.bigint();
       const trimmed = sql.replace(/\s+$/, "");
       const terminated = trimmed.endsWith(";") ? trimmed : `${trimmed}\n;`;
-      const { out, err } = await this.send(terminated);
-      const result = classify(err.trim() ? `${err}\n${out}` : out);
+      const sent = this.send(terminated);
+      const timer = timeoutMs > 0 ? setTimeout(() => this.cancel("timeout"), timeoutMs) : null;
+      let reply;
+      try {
+        reply = await sent;
+      } finally {
+        clearTimeout(timer);
+      }
+      const { out, err, cancelled } = reply;
+      let result = classify(err.trim() ? `${err}\n${out}` : out);
+      // A cancelled query prints nothing. If it printed rows or an error
+      // anyway, it finished before the interrupt reached it: that result is
+      // real and is kept.
+      if (cancelled && (result.kind === "ok" || (result.kind === "error" && /interrupt/i.test(result.type)))) {
+        result = { kind: "cancelled", reason: cancelled };
+      }
       result.ms = Number(process.hrtime.bigint() - started) / 1e6;
       return result;
     });
     this.queue = job.catch(() => {});
     return job;
+  }
+
+  /** A statement is running (not start-up, not idle). */
+  get busy() {
+    return this.waiting !== null && !this.starting;
+  }
+
+  /** The text being run now, or null. */
+  get running() {
+    return this.busy ? this.waiting.text : null;
+  }
+
+  /**
+   * Stop the statement in flight. Resolves true if there was one. Where the
+   * CLI can be interrupted the session survives; if the statement has not
+   * stopped within the grace period, or on Windows, the process is ended
+   * instead and run() rejects with `cancelled` and `ended` set.
+   */
+  cancel(reason = "cancel") {
+    const w = this.waiting;
+    if (!w || this.starting || this.closedWith !== null) return false;
+    if (w.cancelled) return true;
+    w.cancelled = reason;
+    if (!INTERRUPTIBLE) {
+      this.end(`cancelled; on Windows that ends the DuckDB session`);
+      return true;
+    }
+    this.proc.kill("SIGINT");
+    const grace = this.opts.cancelGraceMs ?? CANCEL_GRACE_MS;
+    const timer = setTimeout(() => {
+      if (this.waiting === w) this.end(`cancelled; DuckDB did not stop within ${grace / 1000} s, so the session was ended`);
+    }, grace);
+    if (timer.unref) timer.unref();
+    return true;
+  }
+
+  /** End the process now, rejecting the statement in flight as cancelled. */
+  end(reason) {
+    this.close(reason, { cancelled: true });
+    if (this.proc && this.proc.exitCode === null) this.proc.kill("SIGKILL");
   }
 
   /**
@@ -276,8 +371,34 @@ class Session {
    * `format`: csv | tsv | parquet | json (newline-delimited). The query runs
    * again, so the caller only offers this for statements that change
    * nothing. Resolves `classify`'s shape.
+   *
+   * A cancelled export leaves nothing behind. Measured on 1.5.5: writing to
+   * a new path, COPY creates the file at once, so a cancel left a truncated
+   * file there; writing over an existing one, it writes `tmp_<name>` and
+   * renames at the end, so a cancel kept the old file and left an empty
+   * `tmp_<name>`. Whatever this export created is removed; a file that was
+   * already there is not touched.
    */
   async exportTo(sql, file, format) {
+    const scratch = path.join(path.dirname(file), `tmp_${path.basename(file)}`);
+    const existed = { file: fs.existsSync(file), scratch: fs.existsSync(scratch) };
+    const tidy = () => {
+      for (const [p, was] of [[file, existed.file], [scratch, existed.scratch]]) {
+        if (!was) fs.rmSync(p, { force: true });
+      }
+    };
+    let r;
+    try {
+      r = await this.copy(sql, file, format);
+    } catch (e) {
+      if (e && e.cancelled) tidy();
+      throw e;
+    }
+    if (r.kind === "cancelled") tidy();
+    return r;
+  }
+
+  async copy(sql, file, format) {
     const opts = {
       csv: "FORMAT csv, HEADER true",
       tsv: "FORMAT csv, HEADER true, DELIMITER '\\t'",
@@ -299,7 +420,7 @@ class Session {
     if (this.closedWith !== null) return Promise.reject(new Error(this.closedWith));
     const marker = `@@grebe-${crypto.randomBytes(8).toString("hex")}@@`;
     return new Promise((resolve, reject) => {
-      this.waiting = { marker, resolve, reject };
+      this.waiting = { marker, resolve, reject, text };
       this.proc.stdin.write(`${text}\n.print ${marker}\n`);
       this.pump();
     });
@@ -323,30 +444,55 @@ class Session {
     const rest = all.subarray(at + needle.length);
     this.chunks = rest.length ? [rest] : [];
     this.waiting = null;
+    const cancelled = w.cancelled || null;
     // stderr and stdout are separate pipes. Anything the CLI wrote to
     // stderr for this statement was written before the marker reached
     // stdout, so it is readable by the time the event loop turns once more.
     setImmediate(() => {
       const err = this.err;
       this.err = "";
-      w.resolve({ out, err });
+      w.resolve({ out, err, cancelled });
     });
   }
 
-  close(reason) {
+  close(reason, { cancelled = false } = {}) {
     if (this.closedWith !== null) return;
     this.closedWith = reason;
     if (this.waiting) {
-      this.waiting.reject(new Error(reason));
+      const e = new Error(reason);
+      e.ended = true;
+      e.cancelled = cancelled || Boolean(this.waiting.cancelled);
+      this.waiting.reject(e);
       this.waiting = null;
     }
   }
 
-  /** Kill the process. Any statement in flight rejects. */
+  /**
+   * End the process. Any statement in flight rejects. SIGTERM stops even a
+   * busy CLI within ~100 ms (measured); SIGKILL follows if it has not.
+   */
   dispose() {
     this.close("session closed");
-    if (this.proc && this.proc.exitCode === null) this.proc.kill();
+    const proc = this.proc;
+    if (!proc || proc.exitCode !== null) return;
+    proc.kill();
+    const timer = setTimeout(() => {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+    }, 2000);
+    if (timer.unref) timer.unref();
+  }
+
+  /** Cancel whatever any session is running. */
+  static cancelAll(reason = "cancel") {
+    let any = false;
+    for (const s of live) if (s.cancel(reason)) any = true;
+    return any;
+  }
+
+  /** End every session still running, as the extension shuts down. */
+  static disposeAll() {
+    for (const s of [...live]) s.dispose();
   }
 }
 
-module.exports = { Session, classify, checkCli, cliVersion, parseVersion, plain, queryBody };
+module.exports = { Session, INTERRUPTIBLE, classify, checkCli, cliVersion, parseVersion, plain, queryBody };

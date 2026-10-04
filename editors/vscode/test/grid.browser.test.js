@@ -192,3 +192,40 @@ browserTest("errors, text, OK and a capped data file render as such", async (t) 
   assert.deepEqual(reveal, [{ type: "reveal", uri: "u", line: 2 }]);
   assert.equal(await page.locator("section").nth(3).locator(".stmt a").count(), 0);
 });
+
+browserTest("a running statement shows its clock and a Cancel button", async (t) => {
+  const browser = await chromium.launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.setContent(html());
+  await page.evaluate(() => {
+    window.postMessage({ type: "begin", header: { title: "load.sql — 3 statements", detail: "" } }, "*");
+    window.postMessage({ type: "running", label: "Running statement 2 of 3", since: Date.now() - 65000 }, "*");
+  });
+  await page.waitForSelector(".running");
+  assert.match(await page.textContent(".running"), /^Running statement 2 of 3 · 1 min 5 s/);
+  await page.waitForTimeout(1100);
+  assert.match(await page.textContent(".running"), /1 min [67] s/, "the clock ticks");
+
+  await page.click(".running button");
+  assert.deepEqual(await page.evaluate(() => window.sent.filter((m) => m.type === "cancel")), [{ type: "cancel" }]);
+  assert.equal(await page.textContent(".running button"), "Cancelling…");
+  assert.equal(await page.isDisabled(".running button"), true, "one click, one cancel");
+
+  // The result arrives: the clock goes, the result says what happened.
+  await page.evaluate(() => {
+    window.postMessage({ type: "result", entry: { id: 1, line: 1, uri: "u", preview: "SELECT ...", result: { kind: "cancelled", reason: "cancel", ms: 65400 } } }, "*");
+    window.postMessage({ type: "result", entry: { id: 2, line: 2, uri: "u", preview: "SELECT ...", result: { kind: "cancelled", reason: "timeout", ms: 30000 } } }, "*");
+    window.postMessage({ type: "result", entry: { id: 3, line: 3, uri: "u", preview: "SELECT ...", result: { kind: "cancelled", reason: "cancel", ended: true, ms: 3100, message: "DuckDB did not stop within 3 s, so the session was ended: TEMP tables and in-memory data are gone." } } }, "*");
+    window.postMessage({ type: "end", summary: "Cancelled: 1 succeeded, 1 not run." }, "*");
+  });
+  await page.waitForSelector(".cancelled");
+  await page.waitForTimeout(50);
+  assert.equal(await page.locator(".running").count(), 0);
+  const notes = await page.locator(".cancelled").allTextContents();
+  assert.deepEqual(notes, [
+    "Cancelled after 1 min 5 s.",
+    "Timed out (grebe.duckdb.queryTimeout) after 30.0 s.",
+    "Cancelled after 3,100 ms. DuckDB did not stop within 3 s, so the session was ended: TEMP tables and in-memory data are gone.",
+  ]);
+});

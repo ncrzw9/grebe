@@ -115,16 +115,23 @@ async function show(view, arg) {
   }
   const sqls = [v.before, v.sql].filter(Boolean).map((f) => f(file));
   for (const sql of sqls) {
+    results.running(`Reading ${path.basename(file)}`);
     let r;
     try {
       r = await sess.run(sql);
     } catch (e) {
-      r = { kind: "error", type: "Session", message: String(e.message ?? e) };
+      r = e && e.cancelled
+        ? { kind: "cancelled", reason: "cancel", ended: true, message: e.message }
+        : { kind: "error", type: "Session", message: String(e.message ?? e) };
     }
     if (r.kind === "rows") r = { kind: "rows", ms: r.ms, ...columnar(r, 100000) };
     results.add({ id: ++nextId, uri: uri.toString(), line: null, preview: sql, result: r, exportable: false });
     if (r.kind === "error") {
       log.error("duckdb", `${v.title} of ${file}: ${r.type} Error: ${r.message}`);
+      break;
+    }
+    if (r.kind === "cancelled") {
+      log.info("duckdb", `${v.title} of ${file}: cancelled`);
       break;
     }
   }
@@ -177,6 +184,11 @@ const hoverProvider = {
     } catch {
       return null;
     }
+    // Too slow for a hover (a large CSV being sniffed): stop it, so it does
+    // not hold up the next inspection. Only if it is the hover's own query.
+    if (cols === undefined && session && session.running && session.running.startsWith(`DESCRIBE FROM ${reader(file)}`)) {
+      session.cancel("timeout");
+    }
     if (!cols) return null;
     const md = new vscode.MarkdownString(undefined, true);
     const views = ["stats", "preview", ...(isParquet(file) ? ["parquet"] : []), ...(isDelimited(file) ? ["dialect"] : [])];
@@ -208,10 +220,15 @@ function activate(context) {
   );
 }
 
+/** Stop what the inspection session is running, if anything. */
+function cancel() {
+  return session ? session.cancel("cancel") : false;
+}
+
 /** End the inspection session, if one is running. */
 function dispose() {
   if (session) session.dispose();
   session = null;
 }
 
-module.exports = { activate, dispose, reader, literalAt, VIEWS, show, hoverProvider, inspector, cwdOf, DATA };
+module.exports = { activate, dispose, cancel, reader, literalAt, VIEWS, show, hoverProvider, inspector, cwdOf, DATA };

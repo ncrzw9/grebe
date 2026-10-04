@@ -71,7 +71,8 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
 | **▶ Run** above a statement | run just that statement |
 | ▶ in the editor title bar | the same as the keys, with the mouse |
 | **grebe: Choose DuckDB Database** | `:memory:` or a `.duckdb` file |
-| **grebe: Restart DuckDB Session** | start fresh (also stops a long query) |
+| **grebe: Cancel Running Query** | stop the statement running now; the session carries on |
+| **grebe: Restart DuckDB Session** | start fresh |
 
 - **One session stays open**, like a terminal: `TEMP` tables, `SET` options
   and in-memory data survive from one run to the next.
@@ -85,6 +86,32 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
 - **DuckDB 1.5 and 2.0** both work; point `grebe.duckdb.path` at the one
   you want. A database file written by 2.0 cannot be opened by 1.5, and if
   that is why a run fails, the error says so.
+
+## Stopping a long query
+
+While a run is going, the status bar shows a clock (**DuckDB · 12 s**),
+the editor's ▶ becomes ■, and the results show **Running statement 2 of 5**
+with a **Cancel** button. Any of those, or **grebe: Cancel Running
+Query**, stops it:
+
+- **The query stops within milliseconds and the session carries on**:
+  `TEMP` tables, `SET` options and in-memory data are all still there. The
+  rest of the run does not run.
+- **A cancelled export leaves nothing behind**: no partial file, and a file
+  you were about to overwrite is left as it was.
+- **`grebe.duckdb.queryTimeout`** cancels any statement that runs longer
+  than that many seconds, if you want a safety net (off by default).
+- Starting a run while another is going offers to cancel the first, rather
+  than quietly queueing behind it.
+- In the rare case DuckDB does not stop within 3 seconds, the session is
+  ended instead and the next run starts a fresh one; the results say so.
+  On **Windows**, where one process cannot interrupt another, cancelling
+  always ends the session this way.
+
+**No stray `duckdb` processes.** Every DuckDB process the extension starts
+ends with it: on a normal shutdown, and also if the editor crashes or is
+force-quit in the middle of a query, when a small watchdog process ends
+them.
 
 ## The results grid
 
@@ -195,6 +222,8 @@ timing, and on a failure the whole statement and where DuckDB stopped),
 - `grebe.duckdb.maxRows`: most rows kept per result, and read from a data
   file opened in the grid (default 100,000). The full row count of a query
   is always reported, and Export always writes every row.
+- `grebe.duckdb.queryTimeout`: cancel a statement that runs longer than
+  this many seconds (default 0: never).
 - `grebe.duckdb.codeLens`: the **▶ Run** link above each statement (default
   on).
 - `grebe.path`: a `grebe` executable of your own. Leave it empty to use the

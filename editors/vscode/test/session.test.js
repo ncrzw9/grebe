@@ -239,7 +239,9 @@ unix("a start that never answers fails after the timeout, not never", async () =
 });
 
 unix("a start that prints without end is cut off, and does not hoard it", async () => {
-  const s = new Session({ cli: "yes", database: ":memory:", cwd: os.tmpdir(), startTimeoutMs: 300 });
+  // `exec yes`, not `yes`: the session passes -interactive, which `yes`
+  // would refuse instead of printing.
+  const s = new Session({ cli: script("chatty", "exec yes"), database: ":memory:", cwd: os.tmpdir(), startTimeoutMs: 300 });
   await assert.rejects(s.start(), /did not answer/);
   assert.ok(s.chunks.length <= 2, `${s.chunks.length} chunks kept`);
   s.dispose();
@@ -338,6 +340,169 @@ live("export writes the full result in each format", async () => {
     assert.deepEqual(back.rows, [[5]]);
     const summary = await s.exportTo("SUMMARIZE t;", path.join(dir, "summary.csv"), "csv");
     assert.notEqual(summary.kind, "error", JSON.stringify(summary));
+  } finally {
+    s.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------- cancel, and zombies --
+
+// Runs until stopped: billions of rows, nothing to read from disk.
+const ENDLESS = "SELECT count(*) FROM range(3000000) a, range(3000000) b WHERE (a.range * b.range) % 1000003 = 7";
+const interruptible = CLI && fs.existsSync(CLI) && process.platform !== "win32" ? test : test.skip;
+
+interruptible("cancel stops a long query and keeps the session, TEMP tables included", async () => {
+  const s = session();
+  await s.start();
+  try {
+    await s.run("CREATE TEMP TABLE keep AS SELECT 42 AS v");
+    const running = s.run(ENDLESS);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(s.busy, true);
+    const t0 = Date.now();
+    assert.equal(await s.cancel(), true);
+    const r = await running;
+    assert.deepEqual([r.kind, r.reason], ["cancelled", "cancel"]);
+    assert.ok(Date.now() - t0 < 2000, `stopped in ${Date.now() - t0} ms`);
+    assert.equal(s.alive, true);
+    assert.equal(s.busy, false);
+    assert.deepEqual((await s.run("SELECT v FROM keep")).rows, [[42]]);
+    // Nothing running: nothing to cancel, and the session is unharmed.
+    assert.equal(s.cancel(), false);
+    assert.deepEqual((await s.run("SELECT 1 AS one")).rows, [[1]]);
+  } finally {
+    s.dispose();
+  }
+});
+
+interruptible("a timeout cancels the statement the same way", async () => {
+  const s = session();
+  await s.start();
+  try {
+    const r = await s.run(ENDLESS, { timeoutMs: 300 });
+    assert.deepEqual([r.kind, r.reason], ["cancelled", "timeout"]);
+    assert.ok(r.ms < 2500, `${r.ms} ms`);
+    // A statement that finishes in time is untouched by its timeout.
+    assert.deepEqual((await s.run("SELECT 2 AS two", { timeoutMs: 5000 })).rows, [[2]]);
+  } finally {
+    s.dispose();
+  }
+});
+
+interruptible("statements run here stay out of ~/.duckdb_history", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-history-"));
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+  const s = new Session({ cli: CLI, database: ":memory:", cwd: home });
+  try {
+    await s.start();
+    await s.run("SELECT 'secret' AS s");
+  } finally {
+    s.dispose();
+    process.env.HOME = prevHome;
+  }
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fs.existsSync(path.join(home, ".duckdb_history")), false);
+});
+
+// A CLI that ignores interrupts while "running": speaks just enough of the
+// protocol (echoes .print markers), and hangs on HANG.
+unix("a statement that ignores the interrupt is ended after the grace period", async () => {
+  const cli = script(
+    "stubborn",
+    `trap '' INT
+while IFS= read -r line; do
+  case "$line" in
+    .print*) echo "\${line#.print }" ;;
+    HANG*) sleep 60 ;;
+  esac
+done`,
+  );
+  const ended = [];
+  const s = new Session({ cli, database: ":memory:", cwd: os.tmpdir(), cancelGraceMs: 300, onExit: (r) => ended.push(r) });
+  await s.start();
+  const running = s.run("HANG");
+  await new Promise((r) => setTimeout(r, 100));
+  s.cancel();
+  const t0 = Date.now();
+  await assert.rejects(running, (e) => e.cancelled === true && e.ended === true && /did not stop within 0\.3 s/.test(e.message));
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(s.alive, false);
+  assert.deepEqual(ended, [], "an end we chose is not reported as a crash");
+});
+
+live("disposeAll ends every session, busy ones included", async () => {
+  const a = session();
+  const b = session();
+  await a.start();
+  await b.start();
+  const running = a.run(ENDLESS);
+  await new Promise((r) => setTimeout(r, 300));
+  Session.disposeAll();
+  await assert.rejects(running, /session closed/);
+  await Promise.all([a, b].map((s) => new Promise((r) => (s.proc.exitCode !== null || s.proc.signalCode ? r() : s.proc.once("exit", r)))));
+  assert.equal(a.alive || b.alive, false);
+});
+
+live("if the editor dies mid-query, its duckdb dies too", { skip: process.platform === "win32" }, async () => {
+  // A stand-in extension host: starts a session, runs a query that will not
+  // finish, says the CLI's pid, then waits to be killed.
+  const host = `
+    const { Session } = require(${JSON.stringify(path.join(__dirname, "..", "duckdb-session"))});
+    (async () => {
+      const s = new Session({ cli: ${JSON.stringify(CLI)}, database: ":memory:", cwd: ${JSON.stringify(os.tmpdir())} });
+      await s.start();
+      s.run(${JSON.stringify(ENDLESS)}).catch(() => {});
+      console.log(s.proc.pid);
+      setInterval(() => {}, 1000);
+    })();`;
+  const { spawn } = require("child_process");
+  const parent = spawn(process.execPath, ["-e", host], { stdio: ["ignore", "pipe", "inherit"] });
+  const pid = await new Promise((resolve) => parent.stdout.once("data", (d) => resolve(Number(String(d).trim()))));
+  const alive = (p) => {
+    try {
+      process.kill(p, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(alive(pid), "duckdb is running the query");
+  parent.kill("SIGKILL"); // no deactivate, no cleanup: a crash
+  const t0 = Date.now();
+  while (alive(pid) && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(alive(pid), false, `duckdb ${pid} outlived its parent by ${Date.now() - t0} ms`);
+});
+
+interruptible("a cancelled export leaves nothing behind, and an existing file intact", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-export-cancel-"));
+  const s = session();
+  await s.start();
+  try {
+    for (const fmt of ["parquet", "csv"]) {
+      // A new file: nothing at the path afterwards.
+      const fresh = path.join(dir, `new.${fmt}`);
+      let job = s.exportTo(ENDLESS, fresh, fmt);
+      await new Promise((r) => setTimeout(r, 400));
+      s.cancel();
+      assert.equal((await job).kind, "cancelled");
+      assert.deepEqual(fs.readdirSync(dir).filter((f) => f.includes("new")), [], `${fmt}: no partial file`);
+
+      // An existing file: still there, unchanged; no tmp_ file.
+      const kept = path.join(dir, `kept.${fmt}`);
+      assert.notEqual((await s.exportTo("SELECT 1 AS old", kept, fmt)).kind, "error");
+      const before = fs.readFileSync(kept);
+      job = s.exportTo(ENDLESS, kept, fmt);
+      await new Promise((r) => setTimeout(r, 400));
+      s.cancel();
+      assert.equal((await job).kind, "cancelled");
+      assert.deepEqual(fs.readFileSync(kept), before, `${fmt}: the old file is untouched`);
+      assert.equal(fs.existsSync(path.join(dir, `tmp_kept.${fmt}`)), false);
+    }
+    // And the session is still fine.
+    assert.deepEqual((await s.run("SELECT 3 AS three")).rows, [[3]]);
   } finally {
     s.dispose();
     fs.rmSync(dir, { recursive: true, force: true });
