@@ -3,7 +3,7 @@
   "displayName": "grebe",
   "description": "DuckDB SQL diagnostics, quick fixes and formatting via the grebe LSP server",
   "publisher": "ncrzw9",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "license": "MIT",
   "icon": "icon.png",
   "galleryBanner": { "color": "#1f1f1f", "theme": "dark" },
@@ -12,13 +12,17 @@
   "main": "./extension.js",
   "activationEvents": ["onLanguage:sql"],
   "contributes": {
+    "commands": [
+      { "command": "grebe.restart", "title": "Restart Server", "category": "grebe" },
+      { "command": "grebe.showOutput", "title": "Show Output", "category": "grebe" }
+    ],
     "configuration": {
       "title": "grebe",
       "properties": {
         "grebe.path": {
           "type": "string",
           "default": "",
-          "description": "Path to the grebe executable (default: ~/.local/bin/grebe if it exists, otherwise `grebe` on PATH)"
+          "description": "Path to the grebe executable. Leave empty to use the binary bundled with this extension, then ~/.local/bin/grebe, then grebe on PATH. A path set here is checked with `--version` before the server starts, and used without falling back."
         },
         "grebe.select": {
           "type": "array",

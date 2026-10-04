@@ -54,6 +54,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: VS Code extension tests, against the grebe just built
+        run: |
+          cargo build --bin grebe
+          GREBE_BIN="$PWD/target/debug/grebe" node --test editors/vscode/test/*.test.js
       - run: cargo package --workspace
       # A tag pushed with the workflow's own token starts no new run, so this
       # run carries on as the release for it.
@@ -170,6 +174,14 @@ jobs:
         with:
           path: dist
 
+      - name: Collect the archives
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} out/ \;
+
+      # One .vsix per platform with that platform's grebe inside, plus a
+      # universal one without a binary for every other platform.
       - name: Package the VS Code extension
         run: |
           set -euo pipefail
@@ -178,17 +190,8 @@ jobs:
             echo "::error::editors/vscode/syntaxes/ is stale -- run 'node editors/vscode/build-grammar.js' and commit the result" >&2
             exit 1
           fi
-          cd editors/vscode
-          npm install --silent
-          npx --yes @vscode/vsce package
-          ls -la ./*.vsix
-
-      - name: Flatten artifacts and generate checksums
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} out/ \;
-          cp editors/vscode/*.vsix out/
+          (cd editors/vscode && npm install --silent)
+          node editors/vscode/package-targets.js out out
           ( cd out && sha256sum * > SHA256SUMS.txt )
           ls -la out
 
@@ -245,11 +248,20 @@ jobs:
           TAG: ${{ needs.verify.outputs.tag }}
         run: gh release download "$TAG" --pattern '*.vsix' --dir dist
 
-      # vsce reads the token from VSCE_PAT.
-      - name: Publish to the VS Code Marketplace
+      # vsce reads the token from VSCE_PAT. Platform packages are named
+      # grebe-<platform>-<version>.vsix, the universal one grebe-<version>.vsix.
+      # The universal one goes second, on its own: it only serves platforms
+      # without a package, and the platform packages must not wait on it.
+      - name: Publish the platform packages to the VS Code Marketplace
         if: ${{ env.VSCE_PAT != '' }}
-        run: npx --yes @vscode/vsce publish --packagePath dist/*.vsix
+        run: npx --yes @vscode/vsce publish --skip-duplicate --packagePath dist/grebe-[a-z]*-*.vsix
+
+      - name: Publish the universal package to the VS Code Marketplace
+        if: ${{ env.VSCE_PAT != '' }}
+        run: npx --yes @vscode/vsce publish --skip-duplicate --packagePath dist/grebe-[0-9]*.vsix
 
       - name: Publish to Open VSX
         if: ${{ env.OVSX_PAT != '' }}
-        run: npx --yes ovsx publish dist/*.vsix --pat "$OVSX_PAT"
+        run: |
+          set -euo pipefail
+          for f in dist/*.vsix; do npx --yes ovsx publish "$f" --pat "$OVSX_PAT"; done

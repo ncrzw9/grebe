@@ -33,6 +33,10 @@ cargo install grebe
 Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/ncrzw9/grebe/releases).
 
+For VS Code and its forks, install the **grebe** extension (`ncrzw9.grebe`)
+from the Marketplace; it brings its own binary on macOS, Linux and Windows
+x64.
+
 ## Usage
 
 ```

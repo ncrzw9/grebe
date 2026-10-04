@@ -6,37 +6,52 @@ DuckDB SQL. It spawns the `grebe` binary and hands everything to
 
 ## Install
 
-1. Get the `.vsix` (see [Build from source](#build-from-source)).
-2. Install it one of two ways:
+Install **grebe** from the Extensions view (publisher `ncrzw9`), or:
 
-   Command line:
+```sh
+code --install-extension ncrzw9.grebe
+```
 
-   ```sh
-   code --install-extension grebe-0.5.1.vsix
-   ```
+(substitute your editor's CLI — `antigravity-ide`, `cursor`, `codium`, ...)
 
-   (substitute your editor's CLI — `antigravity-ide`, `cursor`, `codium`, ...)
+That is all. On macOS, Linux and Windows x64 the extension carries its own
+`grebe` binary, the same version as the extension. On other platforms, install
+the binary first (`cargo install grebe`, or an archive from the
+[releases](https://github.com/ncrzw9/grebe/releases)) and the extension finds
+it in `~/.local/bin` or on `PATH`.
 
-   Or from the Extensions view: open the `...` menu in the Extensions
-   sidebar, choose **Install from VSIX...**, and pick the file.
+## Is it running?
 
-3. Make sure the `grebe` binary is reachable. If `grebe` is already on your
-   `PATH`, there is nothing else to do. Otherwise, open Settings and set
-   `grebe.path` to the full path of the binary (for example
-   `~/.local/bin/grebe`). GUI-launched editors do not always inherit your
-   shell's `PATH`, so this matters even if `grebe` works fine from a
-   terminal.
+Open a `.sql` file and look at the status bar, bottom right:
 
-4. Open a `.sql` file. If the server starts, lint diagnostics from `grebe`
-   appear as squiggles in the editor. If it does not start (missing binary,
-   wrong path, crash on launch), you'll get an error notification naming the
-   `grebe.path` setting rather than silent failure.
+- **grebe 0.5.2** with a check mark — the server is up and linting.
+- **grebe** with an error icon, on a red background — it could not start. Click it to open
+  the **grebe** output channel, which says which binary was tried and why it
+  was rejected. An error notification says the same, with buttons for the
+  setting and the install instructions.
+
+A file with no findings shows no squiggles, so paste this in to see some:
+
+```sql
+SELECT * FROM events LIMIT 10;
+select count(*) from events where year(ts) = 2024;
+```
+
+`LIMIT` without `ORDER BY`, `count(*)`, and `year(ts)` (which stops DuckDB
+skipping row groups by date) each get a squiggle. Hover for the
+message; `Cmd/Ctrl .` for the fix where there is one.
+
+**grebe: Restart Server** and **grebe: Show Output** are in the Command
+Palette.
 
 ## Settings
 
-- `grebe.path` — path to the `grebe` executable. When unset,
-  `~/.local/bin/grebe` is used if that file exists, and otherwise `grebe`
-  on `PATH`.
+- `grebe.path` — path to a `grebe` executable, for a build of your own.
+  Leave it empty to use the bundled binary, then `~/.local/bin/grebe`, then
+  `grebe` on `PATH`. Whatever it names is run with `--version` first and
+  used only if it answers as grebe, so pointing it at the wrong program gives
+  an error rather than a server that never answers. Changing it restarts the
+  server.
 - `grebe.select` — the MOD rules to lint for, same meaning as the CLI's
   `grebe check --select` flag: only the listed rules run, and any of them
   that are off by default get turned on. Defaults to `["ALL"]`, every MOD
@@ -130,7 +145,10 @@ editor wins over the file's `select`.
 
 ## What this does NOT do
 
-- **No completion, no hover.** The exchange is `didOpen`, `didChange` (full
+- **It does not run SQL.** grebe reads your SQL; it never connects to a
+  database or executes anything, so there is no Run command and no results
+  view. Pair it with whatever you use to run DuckDB.
+- **No completion.** The exchange is `didOpen`, `didChange` (full
   sync), `didSave`, `didClose`, semantic tokens, code actions and
   formatting.
 
@@ -144,4 +162,14 @@ npm install
 npx @vscode/vsce package
 ```
 
-This produces `grebe-0.5.1.vsix` in this directory.
+This produces `grebe-0.5.2.vsix` in this directory: the universal package,
+with no binary inside, so set `grebe.path` or put `grebe` on `PATH`.
+`package-targets.js` builds the per-platform packages from the release
+archives.
+
+The tests run with Node's own test runner; `GREBE_BIN` names a `grebe` to run
+the real server against:
+
+```sh
+GREBE_BIN=$(command -v grebe) node --test editors/vscode/test/*.test.js
+```

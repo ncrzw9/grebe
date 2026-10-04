@@ -1,3 +1,5 @@
 package-lock.json
 *.vsix
 build-grammar.js
+test/
+package-targets.js
