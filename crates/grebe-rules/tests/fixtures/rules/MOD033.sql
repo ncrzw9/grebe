@@ -22,3 +22,11 @@ SELECT g, count(*) FROM t GROUP BY g HAVING g IN (SELECT x FROM b);
 
 -- GROUP BY ALL names no columns to check against.
 SELECT g, count(*) FROM t GROUP BY ALL HAVING g > 1;
+
+-- A volatile call draws once per group here, once per row as a WHERE.
+SELECT g, count(*) FROM t GROUP BY g HAVING random() < 0.5;
+
+SELECT g, count(*) FROM t GROUP BY g HAVING g > random();
+
+-- No column at all: nothing shows the condition belongs to the rows.
+SELECT g, count(*) FROM t GROUP BY g HAVING true;

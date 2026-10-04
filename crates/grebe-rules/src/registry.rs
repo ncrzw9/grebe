@@ -494,8 +494,8 @@ pub static RULES: &[Rule] = &[
         // Warning: the query returns far fewer rows than it asks for.
         default_severity: Severity::Warning,
         fix_safety: FixSafety::None,
-        message: "USING SAMPLE n ROWS samples before WHERE filters, so far fewer than n rows \
-                   come back; filter in a subquery and sample its result.",
+        message: "USING SAMPLE n [ROWS] samples before WHERE filters, so far fewer than n \
+                   rows come back; filter in a subquery and sample its result.",
     },
     Rule {
         code: "MOD039",

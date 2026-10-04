@@ -132,6 +132,17 @@ static AGGREGATE_FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
+/// DuckDB's volatile functions -- a fresh value per call -- from
+/// `duckdb_functions()` where `stability = 'VOLATILE'`, checked in for the
+/// same reason as [`AGGREGATE_FUNCTIONS`]. Used by MOD033.
+static VOLATILE_FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    include_str!("../vendor/volatile.list")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
+});
+
 /// Node names that introduce a nested query scope. A "top-level only, no
 /// subquery recursion" walk must stop at these rather than cross into them —
 /// otherwise it would find a subquery's or CTE's own clause instead of (or
@@ -271,6 +282,11 @@ pub fn from_first(tree: &Tree, _src: &str) -> Vec<Finding> {
         if child(tree, sfc, "FromClause").is_none() {
             continue;
         }
+        // `DISTINCT` and `DISTINCT ON` live in the select clause and have no
+        // FROM-first spelling, so deleting the clause would drop them.
+        if child(tree, select_clause, "DistinctClause").is_some() {
+            continue;
+        }
         let Some(target_list) = child(tree, select_clause, "TargetList") else {
             continue;
         };
@@ -380,6 +396,20 @@ fn check_top_level_star(tree: &Tree, root: NodeId) -> Vec<Finding> {
 /// inside a table function's own argument list (`FROM foo(1, 2)`) belongs to
 /// a different, nested `List(FunctionArgument)` production entirely and is
 /// never a direct child of `FromClause`, so it can't reach this check.
+/// Byte offset in `src` of the first `,` token in `start..end`. Tokenized,
+/// never searched as text: a comma inside a comment or a string literal is
+/// not a separator, and treating it as one deletes half a comment.
+fn first_comma(src: &str, start: usize, end: usize) -> Option<usize> {
+    let between = &src[start..end];
+    grebe_syntax::token::tokenize(between)
+        .into_iter()
+        .find(|t| {
+            matches!(t.kind, grebe_syntax::token::TokenKind::Punct)
+                && &between[t.span.start as usize..t.span.end as usize] == ","
+        })
+        .map(|t| start + t.span.start as usize)
+}
+
 pub fn implicit_cross_join(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for clause in tree.find("FromClause") {
@@ -395,9 +425,7 @@ pub fn implicit_cross_join(tree: &Tree, src: &str) -> Vec<Finding> {
         // Fire once, at the comma between the first and second `TableRef`.
         let first_end = tree.node(refs[0]).span.end as usize;
         let second_start = tree.node(refs[1]).span.start as usize;
-        let between = &src[first_end..second_start];
-        let comma_offset = between.find(',').unwrap_or(0) as u32;
-        let start = first_end as u32 + comma_offset;
+        let start = first_comma(src, first_end, second_start).unwrap_or(first_end) as u32;
         out.push(Finding {
             code: "MOD010",
             span: Span::new(start, start + 1),
@@ -579,6 +607,12 @@ fn is_aggregate_call(tree: &Tree, func: NodeId, src: &str) -> bool {
         .is_some_and(|id| AGGREGATE_FUNCTIONS.contains(ident(tree.text(id, src)).as_str()))
 }
 
+/// Is this `FunctionExpression` a call to a volatile function?
+fn is_volatile_call(tree: &Tree, func: NodeId, src: &str) -> bool {
+    child(tree, func, "FunctionIdentifier")
+        .is_some_and(|id| VOLATILE_FUNCTIONS.contains(ident(tree.text(id, src)).as_str()))
+}
+
 /// Last name segment of a column reference, lowercased: `t.x` → `x`.
 fn column_name(tree: &Tree, column: NodeId, src: &str) -> String {
     ident(
@@ -604,6 +638,11 @@ fn column_name(tree: &Tree, column: NodeId, src: &str) -> String {
 /// excluded outright -- executed, `HAVING g IS NULL` under `ROLLUP` keeps
 /// the subtotal row that `WHERE g IS NULL` cannot see. A condition with any
 /// subquery is skipped, as is `GROUP BY ALL` (it names no columns).
+///
+/// The condition must name at least one grouped column and call no volatile
+/// function. `HAVING random() < 0.5` keeps or drops whole groups; as a
+/// `WHERE` it would keep or drop single rows, and every group's aggregates
+/// would change.
 pub fn having_without_aggregate(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for having in tree.find("HavingClause") {
@@ -626,7 +665,8 @@ pub fn having_without_aggregate(tree: &Tree, src: &str) -> Vec<Finding> {
             let rule = tree.rule_name(d);
             rule.starts_with("Select")
                 || rule.contains("Subquery")
-                || (rule == "FunctionExpression" && is_aggregate_call(tree, d, src))
+                || (rule == "FunctionExpression"
+                    && (is_aggregate_call(tree, d, src) || is_volatile_call(tree, d, src)))
         });
         if disqualified {
             continue;
@@ -637,11 +677,12 @@ pub fn having_without_aggregate(tree: &Tree, src: &str) -> Vec<Finding> {
             .filter(|&d| tree.rule_name(d) == "ColumnReference")
             .map(|d| column_name(tree, d, src))
             .collect();
-        let all_grouped = inside
+        let columns: Vec<String> = inside
             .iter()
             .filter(|&&d| tree.rule_name(d) == "ColumnReference")
-            .all(|&d| grouped.contains(&column_name(tree, d, src)));
-        if all_grouped && !grouped.is_empty() {
+            .map(|&d| column_name(tree, d, src))
+            .collect();
+        if !columns.is_empty() && columns.iter().all(|c| grouped.contains(c)) {
             out.push(Finding {
                 code: "MOD033",
                 span: tree.node(having).span,
@@ -845,27 +886,42 @@ pub fn unused_cte(tree: &Tree, src: &str) -> Vec<Finding> {
             // entry plus the comma that follows; middle or last -> the comma
             // that precedes plus the entry (for a middle entry either comma
             // would do; the preceding one is used consistently).
-            let fix_span = if entries.len() == 1 {
-                tree.node(with_clause).span
+            // Comments and whitespace between the entry and its comma are
+            // kept: the edit removes the entry and the comma token, nothing
+            // a reader wrote around them.
+            let (start, end) = (entry_span.start as usize, entry_span.end as usize);
+            let kept = |trivia: &str| {
+                if trivia.trim().is_empty() {
+                    String::new()
+                } else {
+                    trivia.to_string()
+                }
+            };
+            let fix = if entries.len() == 1 {
+                Some(Fix {
+                    span: tree.node(with_clause).span,
+                    replacement: String::new(),
+                })
             } else if idx == 0 {
                 let next_start = tree.node(entries[1]).span.start as usize;
-                let between = &src[entry_span.end as usize..next_start];
-                let comma_offset = between.find(',').unwrap_or(0) as u32;
-                Span::new(entry_span.start, entry_span.end + comma_offset + 1)
+                first_comma(src, end, next_start).map(|comma| Fix {
+                    span: Span::new(start as u32, comma as u32 + 1),
+                    replacement: kept(&src[end..comma]),
+                })
             } else {
                 let prev_end = tree.node(entries[idx - 1]).span.end as usize;
-                let between = &src[prev_end..entry_span.start as usize];
-                let comma_offset = between.find(',').unwrap_or(0) as u32;
-                Span::new(prev_end as u32 + comma_offset, entry_span.end)
+                first_comma(src, prev_end, start).map(|comma| Fix {
+                    span: Span::new(comma as u32, end as u32),
+                    replacement: kept(&src[comma + 1..start]),
+                })
             };
 
             out.push(Finding {
                 code: "MOD016",
                 span: tree.node(name_node).span,
-                fix: Some(Fix {
-                    span: fix_span,
-                    replacement: String::new(),
-                }),
+                // No separator token found would mean a tree this code does
+                // not understand: report the CTE, but offer no edit.
+                fix,
             });
         }
     }

@@ -11,3 +11,15 @@ source  = duckdb_functions(), function_type='aggregate'
 engine  = v1.5.5
 count   = 88
 vendored = 2026-08-29
+
+# Volatile function names, for MOD033 (having-without-aggregate): a volatile
+# call is evaluated once per group under HAVING but once per row under WHERE,
+# so moving it changes the result.
+#
+# DERIVED DATA, regenerable -- not hand-maintained:
+#   SELECT DISTINCT lower(function_name) FROM duckdb_functions()
+#   WHERE stability = 'VOLATILE' ORDER BY 1
+source  = duckdb_functions(), stability='VOLATILE'
+engine  = v1.5.5
+count   = 16
+vendored = 2026-10-04

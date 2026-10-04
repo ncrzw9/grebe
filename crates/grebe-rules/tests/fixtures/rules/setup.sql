@@ -9,6 +9,10 @@ CROSS JOIN (VALUES (true), (false), (NULL)) AS bs (a)
 CROSS JOIN (VALUES (1), (2)) AS gs (g)
 CROSS JOIN (VALUES ('shipped'), ('lost'), (NULL)) AS ss (status);
 
+-- Every g = 1 row twice: a rewrite that differs only on duplicate rows
+-- (dropping a DISTINCT, say) cannot hide either.
+INSERT INTO t SELECT * FROM t WHERE g = 1;
+
 -- Same columns, no rows: aggregates over empty input behave differently.
 CREATE TABLE empty_t AS SELECT * FROM t WHERE false;
 

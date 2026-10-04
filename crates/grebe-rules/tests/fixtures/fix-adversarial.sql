@@ -53,3 +53,11 @@ SELECT count(*) FROM t;
 -- A fixable finding whose statement carries a suppression: must not be fixed.
 -- grebe: ignore[MOD001]
 SELECT count(*) FROM suppressed_t;
+
+-- An unused CTE after a comment containing a comma: the separator is the
+-- comma token, never the one inside the comment.
+WITH a AS (SELECT 1 AS x) /* keep, note */ , unused AS (SELECT 2) SELECT * FROM a;
+
+-- The same with a line comment carrying a comma, and the unused CTE first.
+WITH unused AS (SELECT 2) -- first, then
+, b AS (SELECT 1 AS x) SELECT * FROM b;

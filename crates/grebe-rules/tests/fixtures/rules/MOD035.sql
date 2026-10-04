@@ -47,6 +47,9 @@ SELECT year(ts) = 2023 FROM events;
 -- A function this rule does not know is left alone.
 SELECT count(*) FROM events WHERE my_udf(ts) = 2023;
 
+-- The DATE cast is on a constant; the column is not cast.
+SELECT count(*) FROM events WHERE ts - '2023-01-01'::DATE > INTERVAL 1 DAY;
+
 -- Cast to another type.
 SELECT count(*) FROM events WHERE ts::VARCHAR >= '2023';
 

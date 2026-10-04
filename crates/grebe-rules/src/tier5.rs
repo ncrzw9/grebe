@@ -153,15 +153,24 @@ fn wrap_of(tree: &Tree, side: NodeId, src: &str) -> Option<Wrap> {
             n = only;
             continue;
         }
-        // `col::DATE`: the column followed by a cast indirection.
-        let cast_to_date = tree.descendants(n).into_iter().any(|d| {
-            tree.rule_name(d) == "CastOperator"
-                && child(tree, d, "Type").is_some_and(|ty| is_date_type(tree, ty, src))
-        });
-        let plain_column = children
-            .iter()
-            .any(|&c| descend_single(tree, c, "ColumnReference").is_some());
-        return (cast_to_date && plain_column).then_some(Wrap::CastToDate);
+        // `col::DATE`: exactly the column, then one cast indirection to DATE.
+        // A `::DATE` elsewhere in the side (`ts - '2023-01-01'::DATE`) casts
+        // a constant, not the column.
+        let [column, indirections] = children[..] else {
+            return None;
+        };
+        if descend_single(tree, column, "ColumnReference").is_none()
+            || tree.rule_name(indirections) != "IndirectionList"
+        {
+            return None;
+        }
+        let [indirection] = tree.children(indirections)[..] else {
+            return None;
+        };
+        let cast_to_date = child(tree, indirection, "CastOperator")
+            .and_then(|cast| child(tree, cast, "Type"))
+            .is_some_and(|ty| is_date_type(tree, ty, src));
+        return cast_to_date.then_some(Wrap::CastToDate);
     }
 }
 
@@ -349,8 +358,9 @@ pub fn row_at_a_time_insert(tree: &Tree, src: &str) -> Vec<Finding> {
 /// rewrite is equivalent only where nothing runs between the FROM and the
 /// sample: `USING SAMPLE` samples before `WHERE` filters (executed: 9 rows
 /// back, not 1,000), and before grouping, `DISTINCT`, aggregates and window
-/// functions. Any of those, an `OFFSET`, a set operation, or another
-/// ordering key, and this does not fire. Detect-only: the sample is random,
+/// functions, and before `unnest` multiplies rows. Any of those, an
+/// `OFFSET`, a `LIMIT` that is not an integer literal, a set operation, or
+/// another ordering key, and this does not fire. Detect-only: the sample is random,
 /// so there is no result to compare a rewrite against.
 pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -380,10 +390,16 @@ pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
         ) {
             continue;
         }
-        if tree
-            .text(limit, src)
-            .split_whitespace()
-            .any(|w| w.eq_ignore_ascii_case("OFFSET"))
+        // Only `LIMIT <integer>`: `USING SAMPLE n ROWS` needs a literal
+        // count, and `LIMIT 10%` or `LIMIT $1` have no direct counterpart.
+        // An `OFFSET` makes the word count three or more.
+        let limit_words: Vec<&str> = tree.text(limit, src).split_whitespace().collect();
+        let [limit_kw, count] = limit_words[..] else {
+            continue;
+        };
+        if !limit_kw.eq_ignore_ascii_case("LIMIT")
+            || count.is_empty()
+            || !count.bytes().all(|b| b.is_ascii_digit())
         {
             continue;
         }
@@ -414,9 +430,11 @@ pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
             .iter()
             .any(|&d| match tree.rule_name(d) {
                 "DistinctClause" | "OverClause" => true,
+                // `unnest` in the select list multiplies rows after the
+                // sample would be taken.
                 "FunctionExpression" => child(tree, d, "FunctionIdentifier").is_some_and(|id| {
-                    AGGREGATE_FUNCTIONS
-                        .contains(tree.text(id, src).trim().to_ascii_lowercase().as_str())
+                    let name = tree.text(id, src).trim().to_ascii_lowercase();
+                    name == "unnest" || AGGREGATE_FUNCTIONS.contains(name.as_str())
                 }),
                 _ => false,
             });
@@ -439,24 +457,25 @@ pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
 /// WHERE filters, so far fewer than n rows come back.
 ///
 /// Executed on 1M rows where 1% match: `WHERE v = 1 USING SAMPLE 1000 ROWS`
-/// returned 9 rows. Only a fixed row count is flagged; a percentage keeps
+/// returned 9 rows. Only a fixed row count is flagged, with or without the
+/// `ROWS` keyword; a percentage keeps
 /// the same fraction whether taken before or after filtering, and is the
 /// usual way to approximate an aggregate. `TABLESAMPLE` on a table is not
 /// flagged: written on the table, it reads as what it does.
-pub fn sample_before_where(tree: &Tree, src: &str) -> Vec<Finding> {
+pub fn sample_before_where(tree: &Tree, _src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for sample in tree.find("SampleClause") {
         let has_where = tree
             .parent(sample)
             .is_some_and(|select| child(tree, select, "WhereClause").is_some());
-        let counts_rows = tree.descendants(sample).iter().any(|&d| {
-            tree.rule_name(d) == "SampleUnit"
-                && tree
-                    .text(d, src)
-                    .trim()
-                    .to_ascii_uppercase()
-                    .starts_with("ROW")
-        });
+        // A count with no unit is a row count, the same as `ROWS`
+        // (executed: `USING SAMPLE 1000` and `reservoir(1000)` both return
+        // 1,000 rows). Only `%` / `PERCENT` makes it a fraction.
+        let inside = tree.descendants(sample);
+        let counts_rows = inside.iter().any(|&d| tree.rule_name(d) == "SampleCount")
+            && !inside
+                .iter()
+                .any(|&d| tree.rule_name(d) == "SamplePercentage");
         if has_where && counts_rows {
             out.push(Finding {
                 code: "MOD038",
@@ -543,7 +562,16 @@ pub fn delete_then_insert(tree: &Tree, src: &str) -> Vec<Finding> {
             };
             let delete_reads = sources(delete, child(tree, delete, "TargetOptAlias"));
             let insert_reads = sources(insert, child(tree, insert, "InsertTarget"));
-            if !delete_reads.is_disjoint(&insert_reads) {
+            // The target reading itself is not a shared source: `DELETE FROM
+            // t WHERE y = (SELECT max(y) FROM t)` then `INSERT INTO t SELECT
+            // ... FROM t` rewrites t from t, with no changes table to merge.
+            // Compared by last name segment, so `t` and `main.t` match.
+            let last = |name: &str| name.rsplit('.').next().unwrap_or_default().to_string();
+            let target = deleted.as_deref().map(last);
+            let shared = delete_reads
+                .intersection(&insert_reads)
+                .any(|name| Some(last(name)) != target);
+            if shared {
                 out.push(Finding {
                     code: "MOD039",
                     span: tree.node(delete).span,
@@ -566,8 +594,10 @@ pub fn delete_then_insert(tree: &Tree, src: &str) -> Vec<Finding> {
 pub fn csv_full_sniff(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for function in tree.find("TableFunction") {
+        // The function's own name, not one nested in its arguments.
         let is_csv_reader = tree.descendants(function).into_iter().any(|d| {
             tree.rule_name(d) == "TableFunctionName"
+                && tree.ancestor(d, "TableFunction") == Some(function)
                 && matches!(
                     tree.text(d, src).trim().to_ascii_lowercase().as_str(),
                     "read_csv" | "read_csv_auto"

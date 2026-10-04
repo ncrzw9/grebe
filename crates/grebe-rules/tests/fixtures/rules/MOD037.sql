@@ -21,6 +21,12 @@ SELECT x, row_number() OVER (ORDER BY y) FROM t ORDER BY random() LIMIT 5;
 -- OFFSET too.
 SELECT * FROM t ORDER BY random() LIMIT 10 OFFSET 5;
 
+-- A percentage or a parameter has no USING SAMPLE n ROWS counterpart.
+SELECT * FROM t ORDER BY random() LIMIT 10%;
+
+-- unnest multiplies rows after the sample would be taken.
+SELECT unnest([x, y]) FROM t ORDER BY random() LIMIT 5;
+
 -- Ordered by something else as well.
 SELECT * FROM t ORDER BY g, random() LIMIT 10;
 

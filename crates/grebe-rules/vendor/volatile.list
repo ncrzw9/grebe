@@ -1,0 +1,16 @@
+current_connection_id
+current_query
+current_query_id
+current_transaction_id
+currval
+error
+gen_random_uuid
+nextval
+random
+setseed
+sleep_ms
+stats
+uuid
+uuidv4
+uuidv7
+write_log

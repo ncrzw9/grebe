@@ -119,6 +119,9 @@ const ORDER_SENSITIVE_WINDOW_FNS: &[&str] = &[
     "ntile",
     "lag",
     "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
 ];
 
 /// The bare, lowercased name of the function `func_expr` (a
@@ -139,7 +142,9 @@ fn function_name(tree: &Tree, func_expr: NodeId, src: &str) -> Option<String> {
 ///
 /// `WindowFrameContents <- WindowPartition? OrderByClause? FrameClause?`
 /// (`statements/expression.gram`) -- a plain inline window definition
-/// with no `OrderByClause` child. `OVER window_name` and `OVER (window_name
+/// with no `OrderByClause` child, and no `ORDER BY` inside the call's own
+/// arguments either (`row_number(ORDER BY x) OVER ()`, which DuckDB orders
+/// by x). `OVER window_name` and `OVER (window_name
 /// ...)`, which reference a named `WINDOW` clause definition this detector
 /// does not resolve, are left alone rather than guessed at -- a real miss
 /// is better than a wrong one.
@@ -162,6 +167,14 @@ pub fn window_without_order_by(tree: &Tree, src: &str) -> Vec<Finding> {
             continue;
         };
         if child(tree, contents, "OrderByClause").is_some() {
+            continue;
+        }
+        // DuckDB also takes the order inside the call: `lag(x ORDER BY y)
+        // OVER (PARTITION BY g)` is ordered by y.
+        let ordered_in_arguments = child(tree, func_expr, "FunctionExpressionArguments")
+            .and_then(|args| child(tree, args, "FunctionExpressionArgumentList"))
+            .is_some_and(|list| child(tree, list, "OrderByClause").is_some());
+        if ordered_in_arguments {
             continue;
         }
         out.push(Finding {
@@ -294,9 +307,10 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
 /// - an operand containing a `ParensExpression` anywhere is skipped --
 ///   parenthesised sub-conditions can carry their own `OR` or their own
 ///   `IS NULL` guard, and this does not parse back into them.
-/// - a reference wrapped in `coalesce(...)` is not counted: defaulting a
-///   `NULL` before comparing it is exactly how someone keeps an outer
-///   join's unmatched rows on purpose.
+/// - a reference is counted only when nothing between it and the predicate
+///   can turn its `NULL` into a value: a function call (`coalesce`,
+///   `ifnull`), a `CASE`, an `IN (...)` list or a subquery each count as a
+///   guard (see [`NULL_PROPAGATING`]).
 ///
 /// One finding per offending `AND` operand, named after the first
 /// defeated join found in it. No fix: whether the predicate belongs in
@@ -509,9 +523,9 @@ fn defeated_join(tree: &Tree, operand: NodeId, targets: &[String], src: &str) ->
     joined_side_reference(tree, comparison, targets, src)
 }
 
-/// The left-joined target that `scope` reads a column of, unless that read
-/// is wrapped in `coalesce(...)` or the scope has parentheses this does not
-/// look inside.
+/// The left-joined target that `scope` reads a column of, unless every such
+/// read is guarded (see [`NULL_PROPAGATING`]) or the scope has parentheses
+/// this does not look inside.
 fn joined_side_reference(
     tree: &Tree,
     scope: NodeId,
@@ -540,36 +554,76 @@ fn joined_side_reference(
         let Some(target) = targets.iter().find(|t| **t == name) else {
             continue;
         };
-        if !coalesce_guards(tree, qualifier, scope, src) {
+        if !null_guarded(tree, qualifier, scope) {
             return Some(target.clone());
         }
     }
     None
 }
 
-/// True if a `coalesce(...)` call sits between `node` and `boundary`
-/// (exclusive) -- i.e. `node` is being defaulted before anything compares
-/// it, which is exactly how an outer join's unmatched rows are kept on
-/// purpose.
+/// Nodes a `NULL` passes through unchanged on its way up to a predicate:
+/// the operator-precedence chain (each level and its `...Tail`), a column
+/// reference, a cast, and `BETWEEN`'s bounds. Every operator here returns
+/// `NULL` for a `NULL` operand, so a `NULL` from the joined side still makes
+/// the predicate reject the row.
 ///
-/// `COALESCE` has its own dedicated grammar production, `CoalesceExpression
-/// <- 'COALESCE' Parens(List(Expression))` under `SpecialFunctionExpression`
-/// -- it is not a plain `FunctionExpression` call the way `coalesce` reads,
-/// and `'COALESCE'` is a bare keyword, not a `FunctionName` node, so this
-/// checks the rule name directly rather than going through
-/// [`function_name`].
-fn coalesce_guards(tree: &Tree, node: NodeId, boundary: NodeId, _src: &str) -> bool {
+/// Everything else is a guard. A function or `CASE` can turn a `NULL` into a
+/// value (`coalesce`, `ifnull`, `concat`, `CASE WHEN b.x IS NULL ...`), an
+/// `IN (...)` list item can be `NULL` while the test still succeeds
+/// (`1 IN (NULL, 1)` is true), and a qualifier inside a subquery may name the
+/// subquery's own table rather than the join's. Listing what propagates
+/// rather than what guards keeps an unfamiliar shape from becoming a false
+/// positive; it costs findings like `lower(b.label) = 'x'`.
+const NULL_PROPAGATING: &[&str] = &[
+    "AdditiveExpression",
+    "AdditiveExpressionTail",
+    "AtTimeZoneExpression",
+    "AtTimeZoneExpressionTail",
+    "BaseExpression",
+    "BetweenClause",
+    "BetweenInLikeExpression",
+    "BetweenInLikeOp",
+    "BetweenInLikeOpExpression",
+    "BitwiseExpression",
+    "BitwiseExpressionTail",
+    "CastExpression",
+    "CollateExpression",
+    "CollateExpressionTail",
+    "ColumnReference",
+    "ComparisonExpression",
+    "ComparisonExpressionTail",
+    "ExponentiationExpression",
+    "ExponentiationExpressionTail",
+    "Expression",
+    "IsDistinctFromExpression",
+    "IsExpression",
+    "LambdaArrowExpression",
+    "LogicalAndExpression",
+    "LogicalNotExpression",
+    "LogicalOrExpression",
+    "MultiplicativeExpression",
+    "MultiplicativeExpressionTail",
+    "OtherOperatorExpression",
+    "OtherOperatorTail",
+    "PrefixExpression",
+    "SingleExpression",
+    "TableReservedColumnName",
+];
+
+/// True unless every node strictly between `node` and `boundary` is in
+/// [`NULL_PROPAGATING`].
+fn null_guarded(tree: &Tree, node: NodeId, boundary: NodeId) -> bool {
     let mut n = node;
     while let Some(p) = tree.parent(n) {
         if p == boundary {
             return false;
         }
-        if tree.rule_name(p) == "CoalesceExpression" {
+        if !NULL_PROPAGATING.contains(&tree.rule_name(p)) {
             return true;
         }
         n = p;
     }
-    false
+    true
 }
 
 /// Every detector in this module.

@@ -18,3 +18,7 @@ SELECT * FROM read_csv('events.csv', columns = {'id': 'BIGINT', 'v': 'BIGINT'}, 
 
 -- Not a CSV reader.
 SELECT * FROM read_parquet('events.parquet');
+
+-- The CSV reader is nested in a Parquet read's arguments; the outer call's
+-- options are not the CSV reader's.
+SELECT * FROM read_parquet((SELECT list(f) FROM read_csv('files.csv')), sample_size = -1);
