@@ -214,12 +214,12 @@ jobs:
 
   # Publishing waits on the `release` environment, which requires a manual
   # approval: every tag builds and tests on its own, nothing reaches a
-  # registry until a person approves it. crates.io authenticates with a
-  # short-lived OIDC token (trusted publishing), so no crates.io token is
-  # stored anywhere. The extension marketplaces have no equivalent for a
-  # personal publisher: each takes a token stored as a secret on the
-  # `release` environment, readable only by approved runs, and each step is
-  # skipped until its secret exists.
+  # registry until a person approves it. crates.io and Open VSX
+  # authenticate with a short-lived OIDC token (trusted publishing), so no
+  # token for either is stored anywhere. The VS Code Marketplace has no
+  # equivalent for a personal publisher: it takes a token stored as a secret
+  # on the `release` environment, readable only by approved runs, and its
+  # steps are skipped until that secret exists.
   publish:
     name: publish to crates.io and the extension marketplaces
     needs: [verify, release]
@@ -231,7 +231,6 @@ jobs:
       id-token: write
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
-      OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -269,8 +268,9 @@ jobs:
         if: ${{ env.VSCE_PAT != '' }}
         run: npx --yes @vscode/vsce publish --skip-duplicate --packagePath dist/grebe-[0-9]*.vsix
 
+      # ovsx trades this job's OIDC token (id-token: write above) for a
+      # short-lived publishing token.
       - name: Publish to Open VSX
-        if: ${{ env.OVSX_PAT != '' }}
         run: |
           set -euo pipefail
-          for f in dist/*.vsix; do npx --yes ovsx publish "$f" --skip-duplicate --pat "$OVSX_PAT"; done
+          for f in dist/*.vsix; do npx --yes ovsx@1.2.0 publish "$f" --skip-duplicate --trusted-publishing; done
