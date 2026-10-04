@@ -1,8 +1,20 @@
 # grebe for VS Code (and forks: Antigravity, Cursor, VSCodium, ...)
 
-Thin client for `grebe lsp` — a stdio LSP server that lints and formats
-DuckDB SQL. It spawns the `grebe` binary and hands everything to
-`vscode-languageclient`; all behavior lives in the server.
+**Write, check and run DuckDB SQL without leaving the editor.** grebe lints
+and formats DuckDB SQL with a parser built from DuckDB's own grammar, and
+runs your SQL with **your own `duckdb` CLI**: the version you installed,
+not a copy bundled into the editor.
+
+- **Run SQL**: `Cmd/Ctrl+Enter` runs the statement at the cursor (or every
+  statement in the selection), `Cmd/Ctrl+Shift+Enter` the file, **▶ Run**
+  above a statement just that one. Results land in a fast grid you can put
+  anywhere.
+- **Catalog**: the tables, views and columns in your database, and in any
+  `.duckdb` file you browse.
+- **Data files in the grid**: open a `.parquet` file and its rows appear in
+  the grid, with column types; CSV and TSV through **Open With...**.
+- **Lint as you type, quick fixes, formatting** and DuckDB-aware
+  highlighting.
 
 ## Install
 
@@ -12,57 +24,194 @@ Install **grebe** from the Extensions view (publisher `ncrzw9`), or:
 code --install-extension ncrzw9.grebe
 ```
 
-(substitute your editor's CLI — `antigravity-ide`, `cursor`, `codium`, ...)
+(substitute your editor's CLI: `antigravity-ide`, `cursor`, `codium`, ...)
 
-That is all. On macOS, Linux and Windows x64 the extension carries its own
-`grebe` binary, the same version as the extension. On other platforms, install
-the binary first (`cargo install grebe`, or an archive from the
-[releases](https://github.com/ncrzw9/grebe/releases)) and the extension finds
-it in `~/.local/bin` or on `PATH`.
+Linting, formatting and highlighting work at once. On macOS, Linux and
+Windows x64 the extension carries its own `grebe` binary, the same version
+as the extension; on other platforms install it first (`cargo install
+grebe`, or an archive from the
+[releases](https://github.com/ncrzw9/grebe/releases)).
+
+To **run** SQL, install the DuckDB CLI (macOS: `brew install duckdb`;
+others: [duckdb.org](https://duckdb.org)). If the
+editor does not find it on `PATH` -- an editor launched from the Dock often
+does not inherit your shell's -- set its path:
+
+```json
+"grebe.duckdb.path": "/opt/homebrew/bin/duckdb"
+```
 
 ## Is it running?
 
-Open a `.sql` file and look at the status bar, bottom right:
+Two status bar items, bottom right:
 
-- **grebe 0.5.2** with a check mark — the server is up and linting.
-- **grebe** with an error icon, on a red background — it could not start. Click it to open
-  the **grebe** output channel, which says which binary was tried and why it
-  was rejected. An error notification says the same, with buttons for the
-  setting and the install instructions.
+- **grebe 0.6.0** with a check mark: the language server is up and linting.
+  With an error icon on red, it could not start; click it for the reason.
+- **DuckDB 1.5.5 · :memory:**: the CLI SQL runs with, and the database.
+  Click it to choose `:memory:` or a database file. A warning icon means the
+  CLI could not be used; hover it for why.
 
-A file with no findings shows no squiggles, so paste this in to see some:
+Paste this into a `.sql` file to see both at work:
 
 ```sql
+CREATE TABLE events AS SELECT range AS id, DATE '2024-01-01' + range::INT AS ts FROM range(100);
 SELECT * FROM events LIMIT 10;
 select count(*) from events where year(ts) = 2024;
 ```
 
-`LIMIT` without `ORDER BY`, `count(*)`, and `year(ts)` (which stops DuckDB
-skipping row groups by date) each get a squiggle. Hover for the
-message; `Cmd/Ctrl .` for the fix where there is one.
+The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
+`year(ts)`); `Cmd/Ctrl+Shift+Enter` runs all three and shows the results.
 
-**grebe: Restart Server** and **grebe: Show Output** are in the Command
-Palette.
+## Running SQL
+
+| key or command | what it does |
+|---|---|
+| `Cmd/Ctrl+Enter` | run the statement at the cursor, or every statement the selection touches |
+| `Cmd/Ctrl+Shift+Enter` | run the whole file |
+| **▶ Run** above a statement | run just that statement |
+| ▶ in the editor title bar | the same as the keys, with the mouse |
+| **grebe: Choose DuckDB Database** | `:memory:` or a `.duckdb` file |
+| **grebe: Restart DuckDB Session** | start fresh (also stops a long query) |
+
+- **One session stays open**, like a terminal: `TEMP` tables, `SET` options
+  and in-memory data survive from one run to the next.
+- **Statements run one at a time** and each result shows under its own
+  statement. grebe's own tokenizer splits them, so a `;` inside a string or
+  a comment never splits a statement.
+- **A run stops at the first error**, marks it in the editor where DuckDB
+  reported it, and shows the line with a caret under the spot in the grid.
+- **Relative paths** in SQL (`read_csv('data/orders.csv')`) resolve from
+  the workspace folder, as if you ran `duckdb` from the project root.
+- **DuckDB 1.5 and 2.0** both work; point `grebe.duckdb.path` at the one
+  you want. A database file written by 2.0 cannot be opened by 1.5, and if
+  that is why a run fails, the error says so.
+
+## The results grid
+
+Results appear in the **DuckDB Results** view, which starts in the bottom
+panel. Put it wherever suits you:
+
+- **Drag its tab** to the side bar, the secondary side bar, or back to the
+  panel, like any view. It keeps showing the current results when moved.
+- **Open Results in Editor** (the icon in the view's title bar) puts the
+  same results in an editor tab, which can sit in any editor group, split
+  beside your SQL, or be moved into a window of its own (right-click the
+  tab, **Move into New Window**). Both stay in step while open.
+
+The grid draws only what is in view, so 100,000 rows or 200 columns scroll
+at full speed.
+
+- **Select**: click or drag cells; click a **header** for the column
+  (Shift+click or drag across headers for several), a **row number** for
+  the row. Arrows, `Shift`+arrows, `Home`/`End`, `PgUp`/`PgDn` move and
+  extend; `Cmd/Ctrl`+arrows jump to the edge; `Ctrl+Space`/`Shift+Space`
+  select the column/row; `Cmd/Ctrl+A` everything.
+- **Copy**: `Cmd/Ctrl+C` copies tab-separated text that pastes into a
+  spreadsheet, with the column names when whole columns are selected. NULL
+  pastes as an empty cell.
+- **Sort and size**: the **↕** at a header's right edge sorts ascending,
+  descending, off (NULLs last). Drag a header's edge to resize it,
+  double-click it to fit.
+- **Export** a query's result as **CSV, TSV, Parquet or JSON**. DuckDB
+  writes the file itself (`COPY`), so it has every row with exact types, not
+  only what is on screen. Export runs the query again, so values from
+  `now()` or `random()` may differ from what you saw, and it is offered
+  only for queries, never for statements that change data.
+- **Types** of each column show in its header.
+
+## Catalog
+
+The **DuckDB** icon in the activity bar opens the **Catalog**: what your
+session's database holds (`:memory:` or a `.duckdb` file, anything you
+`ATTACH`, your `TEMP` tables), as databases, schemas, tables and views with
+estimated rows and column counts, and each table's columns with their
+types. It refreshes after every run, so a table you just created is there.
+Like any view, it can be dragged to another side bar or the panel.
+
+Click a table to preview it in the grid; right-click for **Show Columns**,
+**Show Stats**, **Count Rows**, **Copy Qualified Name** or **Insert Name
+into Editor**.
+
+To look inside another `.duckdb` file, right-click it in the Explorer, then
+**Browse DuckDB File** (or use the folder icon on the Catalog). It opens
+**read-only** in a separate session, so browsing can never change it.
+**Use as Session Database** makes it the database your runs use.
+
+## Data files
+
+**Open a `.parquet` file** and it opens in the grid, in an editor tab of its
+own: the first `grebe.duckdb.maxRows` rows, each column's type in its
+header, read again whenever the file changes on disk. For a **CSV or TSV**
+(also `.csv.gz`), right-click it, **Open With...**, **DuckDB Grid**, or use
+**Open in Grid** from the Explorer's context menu; choose it as the
+default there if you want CSVs to always open as a grid.
+
+More views, from the Explorer's context menu or the Command Palette
+(*grebe: Data file*):
+
+| | |
+|---|---|
+| **Show Columns** | names and types, as DuckDB reads them |
+| **Show Stats** | `SUMMARIZE`: min, max, approx. distinct, avg, std, quartiles, count, null % per column |
+| **Preview Rows** | the first 1,000 rows, in the results grid |
+| **Show Parquet Metadata** | rows and row groups, then per column: physical type, compression, compressed and uncompressed bytes, min/max, nulls |
+| **Show CSV Dialect** | what DuckDB detects: delimiter, quoting, header, column types, and a ready `read_csv(...)` call to copy |
+
+In SQL, **hover a file path** (`FROM 'orders.parquet'`,
+`read_csv('data/people.tsv')`, globs like `'data/*.parquet'`) to see its
+columns and types, with links to the views above.
+
+Data files are read with your `duckdb` CLI in a separate in-memory session:
+looking at a file never touches the database your script is working on.
+
+## When something goes wrong
+
+Everything the extension does is logged in one place: the **grebe** output
+channel (**grebe: Show Output**, or click either status bar item). Each line
+is timestamped and tagged with where it came from: `server` (the language
+server), `duckdb` (the session: every statement run with its outcome and
+timing, and on a failure the whole statement and where DuckDB stopped),
+`catalog`, `grid`.
+
+- **Errors are shown when they happen**, not at your next run: a
+  `grebe.duckdb.path` that is missing, not executable or not DuckDB; a
+  broken `~/.duckdbrc`; a database file this CLI cannot open (checked the
+  moment you choose it); a session that crashes while idle; a CLI that never
+  answers (given up on after 20 seconds instead of hanging).
+- **Every notification has Show Output**, and the ones a setting fixes have
+  a button for that setting.
+- **Nothing fails silently**: if a command hits an unexpected error, it is
+  shown and logged with its stack trace -- please include that when
+  reporting a bug.
+- If you never set `grebe.duckdb.path` and have no `duckdb`, nothing nags
+  you until you run something: linting and formatting do not need it.
 
 ## Settings
 
-- `grebe.path` — path to a `grebe` executable, for a build of your own.
-  Leave it empty to use the bundled binary, then `~/.local/bin/grebe`, then
-  `grebe` on `PATH`. Whatever it names is run with `--version` first and
-  used only if it answers as grebe, so pointing it at the wrong program gives
-  an error rather than a server that never answers. Changing it restarts the
-  server.
-- `grebe.select` — the MOD rules to lint for, same meaning as the CLI's
+- `grebe.duckdb.path`: the `duckdb` CLI to run SQL with (default: `duckdb`
+  on `PATH`). grebe never bundles or links DuckDB.
+- `grebe.duckdb.database`: `:memory:` (the default) or a database file;
+  relative paths resolve against the workspace folder.
+- `grebe.duckdb.maxRows`: most rows kept per result, and read from a data
+  file opened in the grid (default 100,000). The full row count of a query
+  is always reported, and Export always writes every row.
+- `grebe.duckdb.codeLens`: the **▶ Run** link above each statement (default
+  on).
+- `grebe.path`: a `grebe` executable of your own. Leave it empty to use the
+  bundled binary, then `~/.local/bin/grebe`, then `grebe` on `PATH`. It is
+  run with `--version` first and used only if it answers as grebe, so
+  pointing it at the wrong program gives an error rather than a server that
+  never answers. Changing it restarts the server.
+- `grebe.select`: the MOD rules to lint for, same meaning as the CLI's
   `grebe check --select` flag: only the listed rules run, and any of them
   that are off by default get turned on. Defaults to `["ALL"]`, every MOD
   rule there is, so the editor is loud out of the box even though bare
-  `grebe check` on the command line stays quiet -- and stays loud as new
-  rules ship, with no setting to update. Parse errors (`PRS`) and
-  other-dialect notices (`SRC`) are always shown unless `grebe.toml` sets
-  them to `off` under `[severity]`. List codes explicitly to pick a subset
-  instead; the change takes effect immediately, no reload needed. A code
-  that doesn't name a real rule is dropped and reported with a warning
-  notification rather than silently ignored.
+  `grebe check` on the command line stays quiet, and stays loud as new
+  rules ship. Parse errors (`PRS`) and other-dialect notices (`SRC`) are
+  always shown unless `grebe.toml` sets them to `off` under `[severity]`.
+  List codes explicitly to pick a subset instead; the change takes effect
+  immediately. A code that doesn't name a real rule is dropped and reported
+  with a warning.
 
 ## Syntax highlighting
 
@@ -145,12 +294,11 @@ editor wins over the file's `select`.
 
 ## What this does NOT do
 
-- **It does not run SQL.** grebe reads your SQL; it never connects to a
-  database or executes anything, so there is no Run command and no results
-  view. Pair it with whatever you use to run DuckDB.
-- **No completion.** The exchange is `didOpen`, `didChange` (full
-  sync), `didSave`, `didClose`, semantic tokens, code actions and
-  formatting.
+- **No bundled DuckDB.** Running SQL uses the `duckdb` CLI you point it at;
+  grebe itself links no database engine.
+- **No completion.** The language server's exchange is `didOpen`,
+  `didChange` (full sync), `didSave`, `didClose`, semantic tokens, code
+  actions, formatting, and the statement boundaries a run uses.
 
 Run `grebe rules` for the current rule table.
 
@@ -162,14 +310,17 @@ npm install
 npx @vscode/vsce package
 ```
 
-This produces `grebe-0.5.2.vsix` in this directory: the universal package,
+This produces `grebe-0.6.0.vsix` in this directory: the universal package,
 with no binary inside, so set `grebe.path` or put `grebe` on `PATH`.
 `package-targets.js` builds the per-platform packages from the release
 archives.
 
-The tests run with Node's own test runner; `GREBE_BIN` names a `grebe` to run
-the real server against:
+The tests run with Node's own test runner. `GREBE_BIN` names a `grebe` to
+run the real language server against, `DUCKDB_CLI` a `duckdb` CLI to run
+SQL with; tests that need one are skipped without it. The grid's browser
+test needs Playwright:
 
 ```sh
-GREBE_BIN=$(command -v grebe) node --test editors/vscode/test/*.test.js
+GREBE_BIN=$(command -v grebe) DUCKDB_CLI=$(command -v duckdb) \
+  NODE_PATH=$(npm root -g) node --test editors/vscode/test/*.test.js
 ```

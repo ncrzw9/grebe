@@ -502,3 +502,92 @@ fn grebe_toml_severity_override_changes_the_published_diagnostic_severity() {
         "grebe.toml's [severity] override must win over MOD001's registry default"
     );
 }
+
+/// `grebe/statements` over the real framing: a cursor and a
+/// whole-document request, with a `;` inside a string that must not split.
+#[test]
+fn grebe_statements_returns_the_statements_to_run() {
+    const URI: &str = "file:///run.sql";
+    const SQL: &str = "-- load\nCREATE TABLE t AS SELECT ';' AS s;\nSELECT s FROM t";
+
+    let mut input: Vec<u8> = Vec::new();
+    transport::write_message(
+        &mut input,
+        &request(
+            1,
+            "initialize",
+            Json::object(vec![("capabilities".into(), Json::object(vec![]))]),
+        ),
+    )
+    .unwrap();
+    transport::write_message(&mut input, &did_open(URI, SQL)).unwrap();
+    let at = |line: f64, character: f64| {
+        Json::object(vec![
+            ("line".into(), Json::num(line)),
+            ("character".into(), Json::num(character)),
+        ])
+    };
+    transport::write_message(
+        &mut input,
+        &request(
+            2,
+            "grebe/statements",
+            Json::object(vec![
+                ("textDocument".into(), text_document(URI, vec![])),
+                (
+                    "range".into(),
+                    Json::object(vec![
+                        ("start".into(), at(2.0, 3.0)),
+                        ("end".into(), at(2.0, 3.0)),
+                    ]),
+                ),
+            ]),
+        ),
+    )
+    .unwrap();
+    transport::write_message(
+        &mut input,
+        &request(
+            3,
+            "grebe/statements",
+            Json::object(vec![("textDocument".into(), text_document(URI, vec![]))]),
+        ),
+    )
+    .unwrap();
+    transport::write_message(&mut input, &request(4, "shutdown", Json::Null)).unwrap();
+    transport::write_message(&mut input, &notification("exit", Json::Null)).unwrap();
+
+    let mut output: Vec<u8> = Vec::new();
+    assert_eq!(server::run(Cursor::new(input), &mut output), 0);
+    let messages = read_all_messages(output);
+    let texts = |id: f64| -> Vec<String> {
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Json::as_f64) == Some(id))
+            .expect("a response");
+        match resp.get("result") {
+            Some(Json::Array(items)) => items
+                .iter()
+                .map(|i| i.get("text").and_then(Json::as_str).unwrap().to_string())
+                .collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    };
+    assert_eq!(texts(2.0), ["SELECT s FROM t"]);
+    assert_eq!(
+        texts(3.0),
+        ["CREATE TABLE t AS SELECT ';' AS s;", "SELECT s FROM t"]
+    );
+
+    // The range points at the statement, past its leading comment.
+    let resp = messages
+        .iter()
+        .find(|m| m.get("id").and_then(Json::as_f64) == Some(3.0))
+        .unwrap();
+    let Some(Json::Array(items)) = resp.get("result") else {
+        unreachable!()
+    };
+    let start = items[0].get("range").and_then(|r| r.get("start")).unwrap();
+    assert_eq!(start.get("line").and_then(Json::as_f64), Some(1.0));
+    assert_eq!(start.get("character").and_then(Json::as_f64), Some(0.0));
+}

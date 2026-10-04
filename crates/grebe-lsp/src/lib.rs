@@ -11,7 +11,9 @@
 //! `textDocument/didOpen|didChange|didSave|didClose`, each publishing the
 //! diagnostics `grebe check` would report; quick fixes
 //! (`textDocument/codeAction`); whole-document formatting; semantic tokens;
-//! and `workspace/didChangeConfiguration` for the `grebe.select` setting.
+//! `workspace/didChangeConfiguration` for the `grebe.select` setting; and
+//! `grebe/statements`, which tells an editor where each statement of a
+//! document begins and ends so it can run them one at a time.
 //!
 //! Everything but [`serve`] is `pub(crate)`-shaped in spirit but kept
 //! `pub` where tests in `tests/` need it; [`serve`] is the only API the
@@ -22,6 +24,7 @@ pub mod json;
 pub mod position;
 pub mod semantic;
 pub mod server;
+pub mod statements;
 pub mod transport;
 
 /// Run the LSP server on the real `stdin`/`stdout`. Blocks until the

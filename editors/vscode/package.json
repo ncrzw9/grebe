@@ -1,20 +1,174 @@
 {
   "name": "grebe",
   "displayName": "grebe",
-  "description": "DuckDB SQL diagnostics, quick fixes and formatting via the grebe LSP server",
+  "description": "DuckDB SQL in the editor: lint, quick fixes and formatting, plus running SQL with your own duckdb CLI, a results grid, a catalog, and Parquet and CSV files in the grid.",
   "publisher": "ncrzw9",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ncrzw9/grebe"
+  },
+  "bugs": {
+    "url": "https://github.com/ncrzw9/grebe/issues"
+  },
   "icon": "icon.png",
-  "galleryBanner": { "color": "#1f1f1f", "theme": "dark" },
-  "engines": { "vscode": "^1.82.0" },
-  "categories": ["Linters", "Formatters", "Programming Languages"],
+  "galleryBanner": {
+    "color": "#1f1f1f",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Linters",
+    "Formatters",
+    "Programming Languages",
+    "Data Science"
+  ],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:sql"],
+  "activationEvents": [
+    "onLanguage:sql"
+  ],
   "contributes": {
     "commands": [
-      { "command": "grebe.restart", "title": "Restart Server", "category": "grebe" },
-      { "command": "grebe.showOutput", "title": "Show Output", "category": "grebe" }
+      {
+        "command": "grebe.restart",
+        "title": "Restart Server",
+        "category": "grebe"
+      },
+      {
+        "command": "grebe.showOutput",
+        "title": "Show Output",
+        "category": "grebe"
+      },
+      {
+        "command": "grebe.duckdb.runStatement",
+        "title": "Run Statement (or Selection) with DuckDB",
+        "category": "grebe",
+        "icon": "$(play)"
+      },
+      {
+        "command": "grebe.duckdb.runFile",
+        "title": "Run File with DuckDB",
+        "category": "grebe",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "grebe.duckdb.chooseDatabase",
+        "title": "Choose DuckDB Database",
+        "category": "grebe"
+      },
+      {
+        "command": "grebe.duckdb.restart",
+        "title": "Restart DuckDB Session",
+        "category": "grebe"
+      },
+      {
+        "command": "grebe.duckdb.runRange",
+        "title": "Run This Statement with DuckDB",
+        "category": "grebe"
+      },
+      {
+        "command": "grebe.inspect.columns",
+        "title": "Show Columns",
+        "category": "grebe: Data file"
+      },
+      {
+        "command": "grebe.inspect.stats",
+        "title": "Show Stats (SUMMARIZE)",
+        "category": "grebe: Data file"
+      },
+      {
+        "command": "grebe.inspect.preview",
+        "title": "Preview Rows",
+        "category": "grebe: Data file"
+      },
+      {
+        "command": "grebe.inspect.parquet",
+        "title": "Show Parquet Metadata",
+        "category": "grebe: Data file"
+      },
+      {
+        "command": "grebe.inspect.dialect",
+        "title": "Show CSV Dialect (sniff)",
+        "category": "grebe: Data file"
+      },
+      {
+        "command": "grebe.catalog.refresh",
+        "title": "Refresh",
+        "category": "grebe: Catalog",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "grebe.catalog.start",
+        "title": "Start DuckDB Session",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.preview",
+        "title": "Preview",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.columns",
+        "title": "Show Columns",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.stats",
+        "title": "Show Stats (SUMMARIZE)",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.count",
+        "title": "Count Rows",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.copyName",
+        "title": "Copy Qualified Name",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.insertName",
+        "title": "Insert Name into Editor",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.catalog.browseFile",
+        "title": "Browse DuckDB File…",
+        "category": "grebe: Catalog",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "grebe.catalog.closeFile",
+        "title": "Close",
+        "category": "grebe: Catalog",
+        "icon": "$(close)"
+      },
+      {
+        "command": "grebe.catalog.useAsDatabase",
+        "title": "Use as Session Database",
+        "category": "grebe: Catalog"
+      },
+      {
+        "command": "grebe.results.openInEditor",
+        "title": "Open Results in Editor",
+        "category": "grebe",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "grebe.results.show",
+        "title": "Show Results",
+        "category": "grebe"
+      },
+      {
+        "command": "grebe.openInGrid",
+        "title": "Open in Grid",
+        "category": "grebe: Data file",
+        "icon": "$(table)"
+      }
     ],
     "configuration": {
       "title": "grebe",
@@ -26,9 +180,34 @@
         },
         "grebe.select": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": ["ALL"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "ALL"
+          ],
           "description": "The MOD rules to lint for, same as the grebe CLI's --select flag. Only the MOD rules listed here run, and any of them that are off by default are turned on. The default, [\"ALL\"], is every MOD rule there is -- including ones added after this setting, so the editor stays loud rather than needing an update to see a new rule; list codes explicitly to pick a subset instead. Parse errors (PRS) and other-dialect notices (SRC) are always shown unless set to off in grebe.toml's [severity]."
+        },
+        "grebe.duckdb.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the duckdb CLI used to run SQL (default: `duckdb` on PATH). grebe never bundles or links DuckDB; the version you point at is the version your SQL runs on."
+        },
+        "grebe.duckdb.database": {
+          "type": "string",
+          "default": ":memory:",
+          "description": "Database to run SQL against: `:memory:` or a file path (relative paths resolve against the workspace folder). One session stays open, so TEMP tables and SET options persist between runs until the session restarts."
+        },
+        "grebe.duckdb.maxRows": {
+          "type": "integer",
+          "default": 100000,
+          "minimum": 1,
+          "description": "Most rows kept per result in the results grid, and read from a data file opened in the grid. The grid draws only what is in view, so this can be large. A query's row count is always reported in full, and Export always writes every row."
+        },
+        "grebe.duckdb.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a ▶ Run link above each SQL statement."
         }
       }
     },
@@ -36,11 +215,256 @@
       {
         "scopeName": "source.duckdb.keywords",
         "path": "./syntaxes/duckdb-keywords.injection.json",
-        "injectTo": ["source.sql"]
+        "injectTo": [
+          "source.sql"
+        ]
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "grebe.duckdb.runStatement",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == sql"
+      },
+      {
+        "command": "grebe.duckdb.runFile",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "editorTextFocus && editorLangId == sql"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "grebe.duckdb.runStatement",
+          "when": "editorLangId == sql",
+          "group": "navigation@1"
+        },
+        {
+          "command": "grebe.duckdb.runFile",
+          "when": "editorLangId == sql",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "grebe.duckdb.runRange",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.preview",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.columns",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.stats",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.count",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.copyName",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.insertName",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.closeFile",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.useAsDatabase",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.start",
+          "when": "false"
+        },
+        {
+          "command": "grebe.openInGrid",
+          "when": "true"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "grebe.openInGrid",
+          "when": "resourceExtname =~ /^\\.(parquet|csv|tsv)$/i || resourceFilename =~ /\\.(csv|tsv)\\.(gz|zst)$/i",
+          "group": "navigation@9"
+        },
+        {
+          "command": "grebe.inspect.columns",
+          "when": "resourceExtname =~ /^\\.(parquet|csv|tsv|txt|json|jsonl|ndjson|gz|zst)$/i",
+          "group": "7_grebe@1"
+        },
+        {
+          "command": "grebe.inspect.stats",
+          "when": "resourceExtname =~ /^\\.(parquet|csv|tsv|txt|json|jsonl|ndjson|gz|zst)$/i",
+          "group": "7_grebe@2"
+        },
+        {
+          "command": "grebe.inspect.preview",
+          "when": "resourceExtname =~ /^\\.(parquet|csv|tsv|txt|json|jsonl|ndjson|gz|zst)$/i",
+          "group": "7_grebe@3"
+        },
+        {
+          "command": "grebe.inspect.parquet",
+          "when": "resourceExtname =~ /^\\.parquet$/i",
+          "group": "7_grebe@4"
+        },
+        {
+          "command": "grebe.inspect.dialect",
+          "when": "resourceExtname =~ /^\\.(csv|tsv|txt)$/i",
+          "group": "7_grebe@5"
+        },
+        {
+          "command": "grebe.catalog.browseFile",
+          "when": "resourceExtname =~ /^\\.(duckdb|ddb|db)$/i",
+          "group": "7_grebe@0"
+        },
+        {
+          "command": "grebe.catalog.useAsDatabase",
+          "when": "resourceExtname =~ /^\\.(duckdb|ddb|db)$/i",
+          "group": "7_grebe@0"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "grebe.catalog.browseFile",
+          "when": "view == grebe.catalog",
+          "group": "navigation@1"
+        },
+        {
+          "command": "grebe.catalog.refresh",
+          "when": "view == grebe.catalog",
+          "group": "navigation@2"
+        },
+        {
+          "command": "grebe.results.openInEditor",
+          "when": "view == grebe.results",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "grebe.catalog.preview",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "group": "1_view@1"
+        },
+        {
+          "command": "grebe.catalog.columns",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "group": "1_view@2"
+        },
+        {
+          "command": "grebe.catalog.stats",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "group": "1_view@3"
+        },
+        {
+          "command": "grebe.catalog.count",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "group": "1_view@4"
+        },
+        {
+          "command": "grebe.catalog.copyName",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "group": "2_name@1"
+        },
+        {
+          "command": "grebe.catalog.insertName",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "group": "2_name@2"
+        },
+        {
+          "command": "grebe.catalog.closeFile",
+          "when": "view == grebe.catalog && viewItem == grebe.fileRoot",
+          "group": "inline"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "grebe-duckdb",
+          "title": "DuckDB",
+          "icon": "media/duckdb.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "grebe-results",
+          "title": "DuckDB Results",
+          "icon": "media/duckdb.svg"
+        }
+      ]
+    },
+    "views": {
+      "grebe-duckdb": [
+        {
+          "id": "grebe.catalog",
+          "name": "Catalog",
+          "contextualTitle": "DuckDB"
+        }
+      ],
+      "grebe-results": [
+        {
+          "type": "webview",
+          "id": "grebe.results",
+          "name": "Results",
+          "contextualTitle": "DuckDB"
+        }
+      ]
+    },
+    "customEditors": [
+      {
+        "viewType": "grebe.dataFile",
+        "displayName": "DuckDB Grid",
+        "selector": [
+          {
+            "filenamePattern": "*.parquet"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "grebe.delimitedFile",
+        "displayName": "DuckDB Grid",
+        "selector": [
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.tsv"
+          },
+          {
+            "filenamePattern": "*.csv.gz"
+          },
+          {
+            "filenamePattern": "*.tsv.gz"
+          }
+        ],
+        "priority": "option"
       }
     ]
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
-  }
+  },
+  "keywords": [
+    "duckdb",
+    "sql",
+    "linter",
+    "formatter",
+    "parquet",
+    "csv",
+    "data engineering"
+  ]
 }

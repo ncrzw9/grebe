@@ -92,6 +92,10 @@ pub fn run<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> i32 {
                 let result = handle_formatting(&params, &mut state, &mut writer);
                 respond(&mut writer, id, result);
             }
+            Some("grebe/statements") => {
+                let result = handle_statements(&params, &state);
+                respond(&mut writer, id, result);
+            }
             Some("workspace/didChangeConfiguration") => {
                 handle_did_change_configuration(&params, &mut state, &mut writer);
             }
@@ -647,6 +651,65 @@ fn handle_formatting<W: Write>(params: &Json, state: &mut State, writer: &mut W)
         ("newText".into(), Json::str(formatted)),
     ]);
     Json::Array(vec![edit])
+}
+
+/// `grebe/statements`: the statements a run should execute, as
+/// `[{ range, text, kind }]` in source order (`kind`: see
+/// [`crate::statements::kind`]). `params.range` is optional; absent,
+/// every statement in the document. The text is sent too, so the client runs
+/// exactly the bytes the server split, not a re-slice of a buffer that may
+/// have changed since.
+fn handle_statements(params: &Json, state: &State) -> Json {
+    let Some(text) = params
+        .get("textDocument")
+        .and_then(|d| d.get("uri"))
+        .and_then(Json::as_str)
+        .and_then(|uri| state.documents.get(uri))
+    else {
+        return Json::Array(vec![]);
+    };
+    let encoding = state.encoding;
+    let num = |v: Option<&Json>| v.and_then(Json::as_f64).unwrap_or(0.0) as u32;
+    let to_byte = |p: &Json| {
+        position::position_to_byte(text, num(p.get("line")), num(p.get("character")), encoding)
+    };
+    let spans = match params
+        .get("range")
+        .and_then(|r| Some((r.get("start")?, r.get("end")?)))
+    {
+        Some((start, end)) => {
+            crate::statements::select(text, Span::new(to_byte(start), to_byte(end)))
+        }
+        None => crate::statements::all(text),
+    };
+    Json::Array(
+        spans
+            .into_iter()
+            .map(|s| {
+                let (sl, sc) = position::byte_to_position(text, s.start, encoding);
+                let (el, ec) = position::byte_to_position(text, s.end, encoding);
+                Json::object(vec![
+                    (
+                        "range".into(),
+                        Json::object(vec![
+                            ("start".into(), pos(sl, sc)),
+                            ("end".into(), pos(el, ec)),
+                        ]),
+                    ),
+                    (
+                        "text".into(),
+                        Json::str(text[s.start as usize..s.end as usize].to_string()),
+                    ),
+                    (
+                        "kind".into(),
+                        Json::str(crate::statements::kind(
+                            &text[s.start as usize..s.end as usize],
+                        )),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn pos(line: u32, character: u32) -> Json {

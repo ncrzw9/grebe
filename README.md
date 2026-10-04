@@ -34,8 +34,9 @@ Prebuilt binaries for Linux, macOS and Windows are attached to each
 [release](https://github.com/ncrzw9/grebe/releases).
 
 For VS Code and its forks, install the **grebe** extension (`ncrzw9.grebe`)
-from the Marketplace; it brings its own binary on macOS, Linux and Windows
-x64.
+from the Marketplace. It brings its own binary on macOS, Linux and Windows
+x64, and adds running SQL with your own `duckdb` CLI, a results grid, a
+catalog of your database, and Parquet and CSV files opened in the grid.
 
 ## Usage
 

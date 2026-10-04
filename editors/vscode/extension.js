@@ -1,11 +1,22 @@
-// Thin client for `grebe lsp`: find a working grebe binary, spawn the server
-// over stdio, and hand everything to vscode-languageclient. All linting and
-// formatting behavior lives in the server; this file only makes sure the
-// server starts, and says so plainly when it does not.
+// The extension's entry point. Two halves:
+//
+//   - `grebe lsp`, the language server: diagnostics, fixes, formatting,
+//     highlighting. This file finds a working grebe binary, starts it, and
+//     says so plainly when it cannot.
+//   - running SQL with the user's own `duckdb` CLI (run.js), the results
+//     grid (results.js), the Catalog view (catalog.js), data files in the
+//     grid (inspect.js, dataEditor.js). The language server tells run.js
+//     where statements begin and end; nothing else here needs it.
 const cp = require("child_process");
 const { commands, StatusBarAlignment, ThemeColor, window, workspace } = require("vscode");
 const { LanguageClient, State } = require("vscode-languageclient/node");
 const { resolveServer } = require("./server");
+const logger = require("./log");
+const results = require("./results");
+const runner = require("./run");
+const inspect = require("./inspect");
+const catalog = require("./catalog");
+const dataEditor = require("./dataEditor");
 
 // A server that has not answered `initialize` by then is not going to: a
 // healthy grebe answers in milliseconds.
@@ -15,25 +26,41 @@ let output;
 let status;
 let client;
 let generation = 0;
+// The running language client, or null once a start has failed. Replaced on
+// every (re)start; run.js awaits whichever is current.
+let ready = Promise.resolve(null);
+let settle = () => {};
 
 exports.activate = function activate(context) {
   // Created up front, not on the client's first log line, so "grebe" is in
   // the Output view from the start and every start attempt is recorded.
-  output = window.createOutputChannel("grebe");
+  output = logger.output();
   status = window.createStatusBarItem(StatusBarAlignment.Right, 100);
   status.name = "grebe";
   status.command = "grebe.showOutput";
   context.subscriptions.push(
     output,
     status,
-    commands.registerCommand("grebe.showOutput", () => output.show(true)),
-    commands.registerCommand("grebe.restart", () => restart(context)),
+    logger.command("grebe.showOutput", () => output.show(true)),
+    logger.command("grebe.restart", () => restart(context)),
     // grebe.select reaches the running server on its own (see `synchronize`
     // below); a new grebe.path needs a new process.
     workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("grebe.path")) restart(context);
     }),
   );
+  results.init(context.extensionUri);
+  results.register(context);
+  runner.activate(context, () => ready);
+  inspect.activate(context);
+  dataEditor.activate(context);
+  catalog.activate(context, {
+    currentSession: runner.currentSession,
+    liveSession: runner.liveSession,
+    onDidRun: runner.onDidRun,
+    settings: runner.settings,
+    cli: () => runner.settings().cli,
+  });
   return start(context);
 };
 
@@ -61,6 +88,10 @@ async function stopClient() {
 
 async function start(context) {
   const attempt = ++generation;
+  settle(null);
+  ready = new Promise((resolve) => {
+    settle = resolve;
+  });
   const cfg = workspace.getConfiguration("grebe");
   const explicit = cfg.get("path", "");
   setStatus("$(sync~spin) grebe", "Starting the grebe language server");
@@ -73,6 +104,7 @@ async function start(context) {
       ? `grebe.path is "${explicit}", which is not a working grebe binary (${tried[0].reason}).`
       : "No grebe binary was found: not bundled with this extension, not in ~/.local/bin, not on PATH.";
     fail(where);
+    settle(null);
     return;
   }
   log(`using ${found.command} (grebe ${found.version})`);
@@ -116,6 +148,8 @@ async function start(context) {
   try {
     await Promise.race([next.start(), timeout]);
     log("server running");
+    settle(next);
+    runner.clientChanged();
   } catch (err) {
     if (client !== next) return;
     server?.kill();
@@ -126,6 +160,7 @@ async function start(context) {
       // Already torn down by the failed start.
     }
     fail(err.message ?? String(err));
+    settle(null);
   } finally {
     clearTimeout(timer);
   }
@@ -152,5 +187,5 @@ function setStatus(text, tooltip, error = false) {
 }
 
 function log(line) {
-  output.appendLine(`[${new Date().toLocaleTimeString()}] ${line}`);
+  logger.info("server", line);
 }

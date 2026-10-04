@@ -81,9 +81,20 @@ const vscode = {
   },
   commands: { registerCommand: () => ({ dispose() {} }), executeCommand() {} },
 };
+// What runs SQL and shows results has its own tests (run-e2e.test.js);
+// here it only has to be activated, and told when the server changes.
+let clientChanges = 0;
+const quiet = {
+  "./results": { init() {}, register() {} },
+  "./run": { activate() {}, clientChanged: () => clientChanges++, currentSession() {}, liveSession() {}, onDidRun() {}, settings: () => ({}) },
+  "./inspect": { activate() {} },
+  "./catalog": { activate() {} },
+  "./dataEditor": { activate() {} },
+};
 const realLoad = Module._load;
 Module._load = function (request, ...rest) {
   if (request === "vscode") return vscode;
+  if (request in quiet) return quiet[request];
   if (request === "vscode-languageclient/node") return { LanguageClient: FakeClient, State };
   return realLoad.call(this, request, ...rest);
 };
@@ -139,6 +150,7 @@ test("the real grebe starts, and the status bar shows its version", { skip: !pro
   await extension.activate(context());
   assert.deepEqual(shown, []);
   assert.match(statusItem.text, /^\$\(check\) grebe \d+\.\d+\.\d+/);
+  assert.ok(clientChanges > 0, "run.js hears that the server is up");
   await extension.deactivate();
   assert.ok(spawned[0].killed, "deactivate stops the server");
 });
