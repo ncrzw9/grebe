@@ -550,7 +550,7 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
 
   [root] = await ex.getChildren();
   const dbs = await ex.getChildren(root);
-  assert.deepEqual(labels(dbs), ["memory", "temp"], "the session database, then temp");
+  assert.deepEqual(labels(dbs).slice(0, 2), ["memory (in-memory)", "temp (TEMP objects)"], "the session database, then temp");
   const schemas = await ex.getChildren(dbs[0]);
   assert.deepEqual(labels(schemas), ["main (1)", "staging (1)"]);
   const [orders] = await ex.getChildren(schemas[1]);
@@ -571,10 +571,63 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
   await ex.browseFile({ fsPath: other });
   await ex.browseFile({ fsPath: other });
   const roots = await ex.getChildren();
-  assert.deepEqual(labels(roots), ["Session · :memory:", "warehouse.duckdb (read-only)"]);
+  assert.deepEqual(labels(roots).map((l) => l.replace(/ \(.* in use\)$/, "")), ["Session · :memory:", "warehouse.duckdb (read-only)"]);
   assert.deepEqual(labels(await ex.getChildren(roots[1])), ["dim_customer (~42 rows · 1 col)"]);
   await ex.closeFile(roots[1]);
   assert.equal((await ex.getChildren()).length, 1);
+
+  // --- everything else the session holds.
+  for (const q of [
+    "CREATE MACRO add1(x) AS x + 1",
+    "CREATE MACRO staging.recent(n) AS TABLE SELECT * FROM staging.orders ORDER BY id DESC LIMIT n",
+    "CREATE SEQUENCE order_ids",
+    "CREATE TYPE mood AS ENUM ('ok', 'bad')",
+    "SET VARIABLE cutoff = DATE '2024-01-01'",
+    "ATTACH ':memory:' AS scratchpad",
+  ]) {
+    assert.notEqual((await sess.run(q)).kind, "error", q);
+  }
+  [root] = await ex.getChildren();
+  assert.match(root.item.description, /^[\d.]+ \w+ of [\d.]+ \w+ in use$/, "memory in use on the session line");
+  const top = await ex.getChildren(root);
+  assert.deepEqual(labels(top).slice(0, 3), ["memory (in-memory)", "scratchpad (attached · in-memory)", "temp (TEMP objects)"]);
+  assert.equal(top[1].item.contextValue, "grebe.attachedDb");
+  assert.equal(top[0].item.contextValue, "grebe.db", "the session's own database cannot be detached");
+  assert.deepEqual(labels(top.slice(3)).map((l) => l.replace(/\d+ loaded/, "N loaded")), ["Variables (1)", "Extensions (N loaded)"]);
+  assert.deepEqual(labels(await ex.getChildren(top[3])), ["cutoff (2024-01-01 · DATE)"]);
+  const inMain = await ex.getChildren((await ex.getChildren(top[0]))[0]);
+  assert.deepEqual(labels(inMain), ["v_orders (1 col)", "Macros (1)", "Sequences (1)", "Types (1)"]);
+  assert.deepEqual(labels(await ex.getChildren(inMain[1])), ["add1(x) (macro)"]);
+  assert.equal((await ex.getChildren(inMain[1]))[0].item.tooltip, "(x + 1)");
+  assert.deepEqual(labels(await ex.getChildren(inMain[3])), ["mood (ENUM)"]);
+  const inStaging = await ex.getChildren((await ex.getChildren(top[0]))[1]);
+  assert.deepEqual(labels(inStaging), ["orders (~100 rows · 2 cols)", "Macros (1)"]);
+  assert.deepEqual(labels(await ex.getChildren(inStaging[1])), ["recent(n) (table macro)"]);
+
+  // --- attach a file to the session, read-only, then detach it.
+  vscode.window.showQuickPick = async (items) => items[0];
+  await ex.attach({ fsPath: other });
+  let dbsNow = labels(await ex.getChildren(root));
+  assert.ok(dbsNow.includes("warehouse (attached · warehouse.duckdb · read-only)"), dbsNow.join(" | "));
+  const r = await sess.run("SELECT count(*) AS n FROM warehouse.dim_customer");
+  assert.deepEqual(r.rows, [[42]], "queries can use it by its alias");
+  assert.equal((await sess.run("CREATE TABLE warehouse.x AS SELECT 1")).kind, "error", "read-only means read-only");
+  // A second attach of another file with a clashing alias gets its own.
+  const other2 = path.join(dir, "sub", "warehouse.duckdb");
+  fs.mkdirSync(path.dirname(other2));
+  fs.copyFileSync(other, other2);
+  await ex.attach({ fsPath: other2 });
+  dbsNow = labels(await ex.getChildren(root));
+  assert.ok(dbsNow.some((l) => l.startsWith("warehouse_ (attached")), dbsNow.join(" | "));
+  const wh = (await ex.getChildren(root)).find((n) => n.item.label === "warehouse");
+  await ex.detach(wh);
+  dbsNow = labels(await ex.getChildren(root));
+  assert.ok(!dbsNow.some((l) => l.startsWith("warehouse (")), dbsNow.join(" | "));
+  // A file that is not a database: the error is shown, with the reason.
+  const notDb = path.join(dir, "notes.duckdb");
+  fs.writeFileSync(notDb, "not a database");
+  await ex.attach({ fsPath: notDb });
+  assert.match(shown.errors.at(-1), /^grebe: could not attach notes\.duckdb: IO Error: .*not a valid DuckDB database file/);
 });
 
 /** Wait until `cond()` holds (a notification is shown without awaiting). */

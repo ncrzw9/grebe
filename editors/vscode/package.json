@@ -142,6 +142,18 @@
         "category": "grebe: Catalog"
       },
       {
+        "command": "grebe.catalog.attach",
+        "title": "Attach Database to Session…",
+        "category": "grebe: Catalog",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "grebe.catalog.detach",
+        "title": "Detach",
+        "category": "grebe: Catalog",
+        "icon": "$(debug-disconnect)"
+      },
+      {
         "command": "grebe.catalog.browseFile",
         "title": "Browse DuckDB File…",
         "category": "grebe: Catalog",
@@ -312,6 +324,10 @@
         {
           "command": "grebe.duckdb.cancel",
           "when": "grebe.duckdb.running"
+        },
+        {
+          "command": "grebe.catalog.detach",
+          "when": "false"
         }
       ],
       "explorer/context": [
@@ -354,9 +370,19 @@
           "command": "grebe.catalog.useAsDatabase",
           "when": "resourceExtname =~ /^\\.(duckdb|ddb|db)$/i",
           "group": "7_grebe@0"
+        },
+        {
+          "command": "grebe.catalog.attach",
+          "when": "resourceExtname =~ /^\\.(duckdb|ddb|db|sqlite|sqlite3)$/i",
+          "group": "7_grebe@0"
         }
       ],
       "view/title": [
+        {
+          "command": "grebe.catalog.attach",
+          "when": "view == grebe.catalog",
+          "group": "navigation@0"
+        },
         {
           "command": "grebe.catalog.browseFile",
           "when": "view == grebe.catalog",
@@ -396,18 +422,28 @@
         },
         {
           "command": "grebe.catalog.copyName",
-          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view|macro|sequence|type)$/",
           "group": "2_name@1"
         },
         {
           "command": "grebe.catalog.insertName",
-          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view)$/",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(table|view|macro|sequence|type)$/",
           "group": "2_name@2"
         },
         {
           "command": "grebe.catalog.closeFile",
           "when": "view == grebe.catalog && viewItem == grebe.fileRoot",
           "group": "inline"
+        },
+        {
+          "command": "grebe.catalog.detach",
+          "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
+          "group": "inline"
+        },
+        {
+          "command": "grebe.catalog.detach",
+          "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
+          "group": "1_view@1"
         }
       ]
     },

@@ -148,21 +148,39 @@ at full speed.
 
 ## Catalog
 
-The **DuckDB** icon in the activity bar opens the **Catalog**: what your
-session's database holds (`:memory:` or a `.duckdb` file, anything you
-`ATTACH`, your `TEMP` tables), as databases, schemas, tables and views with
-estimated rows and column counts, and each table's columns with their
-types. It refreshes after every run, so a table you just created is there.
-Like any view, it can be dragged to another side bar or the panel.
+The **DuckDB** icon in the activity bar opens the **Catalog**: everything
+your session holds, refreshed after every run. Like any view, it can be
+dragged to another side bar or the panel.
+
+- **The session line** shows how much memory DuckDB is using, of its
+  limit.
+- **Databases**: the session's own (`:memory:` or a file) first, then every
+  attached one, described in a few words: `attached · warehouse.duckdb ·
+  read-only`, `attached · in-memory`, or its type when it is not DuckDB
+  (`sqlite`, `postgres`, ...). Then **TEMP** tables and views.
+- **In each schema**: tables and views, with estimated rows and column
+  counts, and their columns with types; then **Macros** (with their
+  parameters; hover for the definition), **Sequences** and **Types**.
+- **Variables** set with `SET VARIABLE`, with their values; **Secrets**, by
+  name, type and scope only (never the secret itself); and the
+  **Extensions** loaded.
 
 Click a table to preview it in the grid; right-click for **Show Columns**,
 **Show Stats**, **Count Rows**, **Copy Qualified Name** or **Insert Name
 into Editor**.
 
-To look inside another `.duckdb` file, right-click it in the Explorer, then
-**Browse DuckDB File** (or use the folder icon on the Catalog). It opens
-**read-only** in a separate session, so browsing can never change it.
-**Use as Session Database** makes it the database your runs use.
+**Attach Database to Session...** (the plug icon on the Catalog, or
+right-click a `.duckdb` or `.sqlite` file in the Explorer) attaches a file
+to the session, read-only or read-write, under a name taken from the file:
+`warehouse.duckdb` becomes `warehouse`, so `FROM warehouse.orders` works in
+your SQL. **Detach** (on an attached database) removes it. Attaching
+happens in the session, so it lasts until the session restarts, the same as
+an `ATTACH` in your own SQL.
+
+To look inside a `.duckdb` file without attaching it, right-click it in the
+Explorer, then **Browse DuckDB File**: it opens **read-only** in a separate
+session, so browsing can never change it or get in the way of a run. **Use
+as Session Database** makes a file the database your runs use.
 
 ## Data files
 

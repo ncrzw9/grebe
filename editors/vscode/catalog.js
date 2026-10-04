@@ -37,7 +37,30 @@ const OBJECTS = (dbs) => {
     `ORDER BY 1, 2, 4, 3`
   );
 };
-const DATABASES = `SELECT database_name AS db, path, readonly FROM duckdb_databases() WHERE NOT internal OR database_name = 'temp'`;
+const DATABASES =
+  `SELECT database_name AS db, path, readonly, type, database_name = current_database() AS current ` +
+  `FROM duckdb_databases() WHERE NOT internal OR database_name = 'temp'`;
+
+/** Macros, sequences and user-defined types in `dbs` (all when null). */
+const EXTRAS = (dbs) => {
+  const where = dbs ? ` AND database_name IN (${dbs.map(lit).join(", ")})` : "";
+  return (
+    `SELECT database_name AS db, schema_name AS sch, function_name AS name, function_type AS kind, ` +
+    `array_to_string(parameters, ', ') AS detail, macro_definition AS def ` +
+    `FROM duckdb_functions() WHERE NOT internal AND function_type IN ('macro', 'table_macro')${where} ` +
+    `UNION ALL SELECT database_name, schema_name, sequence_name, 'sequence', NULL, NULL FROM duckdb_sequences() WHERE true${where} ` +
+    `UNION ALL SELECT database_name, schema_name, type_name, 'type', logical_type, NULL FROM duckdb_types() WHERE NOT internal${where} ` +
+    `ORDER BY 1, 2, 4, 3`
+  );
+};
+
+// What the session holds outside any database. Secrets are listed by name,
+// type and scope only: the secret itself is never read.
+const VARIABLES = `SELECT name, value, type FROM duckdb_variables() ORDER BY name`;
+const SECRETS = `SELECT name, type, provider, storage, array_to_string(scope, ', ') AS scope FROM duckdb_secrets() ORDER BY name`;
+const EXTENSIONS = `SELECT extension_name AS name, extension_version AS version FROM duckdb_extensions() WHERE loaded ORDER BY 1`;
+// Process-wide figures: every row carries the same two.
+const MEMORY = `SELECT memory_usage AS used, memory_limit AS "limit" FROM pragma_database_size() LIMIT 1`;
 const COLUMNS = (o) =>
   `SELECT column_name AS name, data_type AS type, is_nullable AS nullable FROM duckdb_columns() ` +
   `WHERE database_name = ${lit(o.db)} AND schema_name = ${lit(o.schema)} AND table_name = ${lit(o.name)} ORDER BY column_index`;
@@ -71,7 +94,8 @@ class Explorer {
       if (!node) return this.roots();
       if (node.kind === "root") return this.sourceChildren(node);
       if (node.kind === "db") return this.dbChildren(node);
-      if (node.kind === "schema") return node.objects.map((o) => this.objectNode(node.source, o));
+      if (node.kind === "schema") return this.schemaChildren(node.source, node.objects, node.extras);
+      if (node.kind === "group") return node.children;
       if (node.kind === "object") return this.columnNodes(node);
     } catch (e) {
       log.error("catalog", `could not list ${node ? node.item.label : "the catalog"}: ${e.message ?? e}`, e);
@@ -80,14 +104,19 @@ class Explorer {
     return [];
   }
 
-  roots() {
+  async roots() {
     const s = this.deps.settings();
     const label = s.database === ":memory:" ? ":memory:" : path.basename(s.database);
+    // How much memory the session holds, when it is running. Asked here,
+    // not with the children: the root's own line is drawn before them.
+    const live = this.deps.liveSession();
+    const mem = live ? (objects(await live.run(MEMORY).catch(() => ({ kind: "error" }))) || [])[0] : null;
     const roots = [
       node("root", `Session · ${label}`, vscode.TreeItemCollapsibleState.Expanded, {
         source: "session",
         icon: "database",
-        tooltip: `The database your runs use: ${s.database}`,
+        description: mem ? `${mem.used} of ${mem.limit} in use` : undefined,
+        tooltip: `The database your runs use: ${s.database}` + (mem ? `\nMemory in use: ${mem.used} (limit ${mem.limit})` : ""),
         contextValue: "grebe.sessionRoot",
       }),
     ];
@@ -129,48 +158,162 @@ class Explorer {
     const sess = await this.sessionFor(root.source);
     const dbFilter = root.source === "file" ? [root.alias] : null;
     const objs = objects(await sess.run(OBJECTS(dbFilter))) || [];
+    const extras = objects(await sess.run(EXTRAS(dbFilter))) || [];
     let dbs;
     if (root.source === "file") {
-      dbs = [{ db: root.alias }];
+      dbs = [{ db: root.alias, current: true }];
     } else {
-      dbs = (objects(await sess.run(DATABASES)) || []).filter((d) => d.db !== "temp" || objs.some((o) => o.db === "temp"));
-      // The session file's own database first, then attached ones, temp last.
-      dbs.sort((a, b) => (a.db === "temp") - (b.db === "temp"));
+      const holds = (db) => objs.some((o) => o.db === db) || extras.some((x) => x.db === db);
+      dbs = (objects(await sess.run(DATABASES)) || []).filter((d) => d.db !== "temp" || holds("temp"));
+      // The session's own database first, then attached ones by name, temp last.
+      const rank = (d) => (d.current ? 0 : d.db === "temp" ? 2 : 1);
+      dbs.sort((a, b) => rank(a) - rank(b) || a.db.localeCompare(b.db));
     }
-    const nodes = dbs.map((d) =>
-      node("db", d.db, vscode.TreeItemCollapsibleState.Expanded, {
+    const nodes = dbs.map((d) => {
+      const attached = root.source === "session" && !d.current && d.db !== "temp";
+      return node("db", d.db, vscode.TreeItemCollapsibleState.Expanded, {
         source: root.source,
         db: d.db,
         objects: objs.filter((o) => o.db === d.db),
+        extras: extras.filter((x) => x.db === d.db),
         icon: d.db === "temp" ? "clock" : "database",
-        description: d.readonly ? "read-only" : d.path ? path.basename(d.path) : "",
-      }),
-    );
-    if (nodes.length === 0) return [message("No tables yet")];
+        description: describeDb(d),
+        tooltip: d.path ? `${d.db}: ${d.path}` : d.db,
+        contextValue: attached ? "grebe.attachedDb" : "grebe.db",
+      });
+    });
+    const session = root.source === "session" ? await this.sessionGroups(sess) : [];
+    if (nodes.length === 0) return [message("No tables yet"), ...session];
     // One database: show its contents directly.
-    return nodes.length === 1 ? this.dbChildren(nodes[0]) : nodes;
+    return nodes.length === 1 ? [...this.dbChildren(nodes[0]), ...session] : [...nodes, ...session];
+  }
+
+  /** Variables, secrets and extensions: what the session holds outside any
+   *  database. */
+  async sessionGroups(sess) {
+    const vars = objects(await sess.run(VARIABLES)) || [];
+    const secrets = objects(await sess.run(SECRETS)) || [];
+    const exts = objects(await sess.run(EXTENSIONS)) || [];
+    const leaf = (label, icon, description, tooltip) =>
+      node("leaf", label, vscode.TreeItemCollapsibleState.None, { icon, description, tooltip });
+    const groups = [];
+    if (vars.length) {
+      groups.push(
+        group("Variables", "symbol-variable", vars.map((v) => leaf(v.name, "symbol-variable", `${v.value} · ${v.type}`, `getvariable('${v.name}')`))),
+      );
+    }
+    if (secrets.length) {
+      const what = (x) => [x.type, x.provider, x.storage].filter(Boolean).join(" · ");
+      groups.push(group("Secrets", "key", secrets.map((x) => leaf(x.name, "key", what(x), x.scope ? `scope: ${x.scope}` : undefined))));
+    }
+    if (exts.length) {
+      groups.push(group("Extensions", "extensions", exts.map((x) => leaf(x.name, "extensions", x.version || "")), "loaded"));
+    }
+    return groups;
   }
 
   dbChildren(dbNode) {
     const bySchema = new Map();
+    const entry = (sch) => {
+      if (!bySchema.has(sch)) bySchema.set(sch, { objects: [], extras: [] });
+      return bySchema.get(sch);
+    };
     for (const o of dbNode.objects) {
-      if (!bySchema.has(o.sch)) bySchema.set(o.sch, []);
-      bySchema.get(o.sch).push({ db: o.db, schema: o.sch, name: o.name, kind: o.kind, est: o.est, cols: o.cols, tmp: o.tmp });
+      entry(o.sch).objects.push({ db: o.db, schema: o.sch, name: o.name, kind: o.kind, est: o.est, cols: o.cols, tmp: o.tmp });
+    }
+    for (const x of dbNode.extras || []) {
+      entry(x.sch).extras.push({ db: x.db, schema: x.sch, name: x.name, kind: x.kind, detail: x.detail, def: x.def });
     }
     if (bySchema.size === 0) return [message("No tables yet")];
-    const schemas = [...bySchema.entries()].map(([name, objs]) =>
+    const schemas = [...bySchema.entries()].map(([name, { objects: objs, extras }]) =>
       node("schema", name, vscode.TreeItemCollapsibleState.Collapsed, {
         source: dbNode.source,
         objects: objs,
+        extras,
         icon: "symbol-namespace",
-        description: `${objs.length}`,
+        description: `${objs.length + extras.length}`,
       }),
     );
-    // A lone `main` schema: show its tables and views directly.
+    // A lone `main` schema: show what is in it directly.
     if (schemas.length === 1 && schemas[0].item.label === "main") {
-      return schemas[0].objects.map((o) => this.objectNode(dbNode.source, o));
+      return this.schemaChildren(dbNode.source, schemas[0].objects, schemas[0].extras);
     }
     return schemas;
+  }
+
+  /** A schema's tables and views, then a folder each for its macros,
+   *  sequences and types. */
+  schemaChildren(source, objs, extras = []) {
+    const out = objs.map((o) => this.objectNode(source, o));
+    const of = (...kinds) => extras.filter((x) => kinds.includes(x.kind));
+    const leaf = (x, label, icon, description, tooltip, contextValue) =>
+      node("leaf", label, vscode.TreeItemCollapsibleState.None, { icon, description, tooltip, object: x, contextValue });
+    const macros = of("macro", "table_macro");
+    if (macros.length) {
+      const items = macros.map((m) =>
+        leaf(m, `${m.name}(${m.detail || ""})`, "symbol-function", m.kind === "table_macro" ? "table macro" : "macro", m.def || undefined, "grebe.macro"),
+      );
+      out.push(group("Macros", "symbol-function", items));
+    }
+    const seqs = of("sequence");
+    if (seqs.length) {
+      out.push(group("Sequences", "symbol-number", seqs.map((q) => leaf(q, q.name, "symbol-number", "", `nextval('${q.name}')`, "grebe.sequence"))));
+    }
+    const types = of("type");
+    if (types.length) {
+      out.push(group("Types", "symbol-enum", types.map((y) => leaf(y, y.name, "symbol-enum", y.detail || "", undefined, "grebe.type"))));
+    }
+    return out;
+  }
+
+  /** ATTACH a database file to the session, so its tables can be queried. */
+  async attach(uri) {
+    if (!uri) {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: "Attach",
+        filters: { Databases: ["duckdb", "ddb", "db", "sqlite", "sqlite3"], "All files": ["*"] },
+      });
+      uri = picked && picked[0];
+    }
+    if (!uri) return;
+    const mode = await vscode.window.showQuickPick(
+      [
+        { label: "Read-only", description: "queries can read it; nothing can change it", readOnly: true },
+        { label: "Read and write", description: "CREATE, INSERT and the rest work on it too", readOnly: false },
+      ],
+      { placeHolder: `Attach ${path.basename(uri.fsPath)} to the session` },
+    );
+    if (!mode) return;
+    const sess = await this.deps.currentSession();
+    const taken = new Set((objects(await sess.run("SELECT database_name AS db FROM duckdb_databases()")) || []).map((d) => d.db));
+    let alias = path.basename(uri.fsPath).replace(/\.[^.]+$/, "").replace(/[^A-Za-z0-9_]/g, "_") || "db";
+    if (/^[0-9]/.test(alias)) alias = `db_${alias}`;
+    while (taken.has(alias)) alias += "_";
+    // A SQLite file needs saying so; DuckDB loads its sqlite extension.
+    const opts = [/\.sqlite3?$/i.test(uri.fsPath) ? "TYPE sqlite" : null, mode.readOnly ? "READ_ONLY" : null].filter(Boolean);
+    const sql = `ATTACH ${lit(uri.fsPath)} AS ${ident(alias)}${opts.length ? ` (${opts.join(", ")})` : ""}`;
+    const r = await sess.run(sql);
+    if (r.kind === "error") {
+      log.report("catalog", `could not attach ${path.basename(uri.fsPath)}: ${r.type} Error: ${r.message}`);
+      return;
+    }
+    log.info("catalog", sql);
+    this.refresh();
+    vscode.window.setStatusBarMessage(`grebe: attached as ${alias}; query it as ${alias}.<table>`, 5000);
+  }
+
+  /** DETACH an attached database from the session. */
+  async detach(n) {
+    if (!n || n.kind !== "db") return;
+    const sess = await this.deps.currentSession();
+    const r = await sess.run(`DETACH ${ident(n.db)}`);
+    if (r.kind === "error") {
+      log.report("catalog", `could not detach ${n.db}: ${r.type} Error: ${r.message}`);
+      return;
+    }
+    log.info("catalog", `DETACH ${ident(n.db)}`);
+    this.refresh();
   }
 
   objectNode(source, o) {
@@ -259,6 +402,28 @@ class Explorer {
 
 let nextId = 2e9;
 
+/** What a database is, in a few words: attached or not, its type when it is
+ *  not DuckDB, where it lives, and whether it can be written. */
+function describeDb(d) {
+  if (d.db === "temp") return "TEMP objects";
+  const parts = [];
+  if (!d.current) parts.push("attached");
+  if (d.type && d.type !== "duckdb") parts.push(d.type);
+  if (d.path) parts.push(path.basename(d.path));
+  else if (!d.type || d.type === "duckdb") parts.push("in-memory");
+  if (d.readonly) parts.push("read-only");
+  return parts.join(" · ");
+}
+
+/** A folder of `children`, labelled with how many there are. */
+function group(label, icon, children, note) {
+  return node("group", label, vscode.TreeItemCollapsibleState.Collapsed, {
+    icon,
+    children,
+    description: note ? `${children.length} ${note}` : `${children.length}`,
+  });
+}
+
 function node(kind, label, state, extra = {}) {
   const item = new vscode.TreeItem(label, state);
   if (extra.icon) item.iconPath = new vscode.ThemeIcon(extra.icon);
@@ -297,6 +462,8 @@ function activate(context, deps) {
       if (ed) ed.edit((b) => b.replace(ed.selection, qname(n.object)));
     })),
     on("browseFile", (uri) => explorer.browseFile(uri)),
+    on("attach", (uri) => explorer.attach(uri)),
+    on("detach", (n) => explorer.detach(n)),
     on("closeFile", (n) => explorer.closeFile(n)),
     on("useAsDatabase", async (uri) => {
       if (!uri) return;
