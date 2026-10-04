@@ -61,13 +61,16 @@
 
   // --- layout -------------------------------------------------------------
   //
-  // One run on one page: a header line; a compact log, one line for each
-  // statement that returned no rows (and the error, if any); a tab for each
-  // result set, the active one's grid filling the rest of the page; and a
-  // status line for that result.
+  // One run on one page: a header line; a tab strip with a tab for each
+  // result set and one for Messages (every statement echoed, with its
+  // outcome, and the error if any); the active tab filling the page; and a
+  // status line for a result. A filter at the right of the tab strip
+  // narrows the grid shown.
   const el = (id) => document.getElementById(id);
-  let tabs = []; // { entry, button, view, dispose }
+  let tabs = []; // { kind: "result"|"messages", entry, button, view, dispose, note }
   let active = -1;
+  let messages = null; // the Messages tab
+  let errors = 0;
 
   const fmtMs = (ms) => {
     if (ms === undefined || ms === null) return "";
@@ -83,12 +86,15 @@
     for (const t of tabs) if (t.dispose) t.dispose();
     tabs = [];
     active = -1;
+    errors = 0;
     el("title").textContent = header.title;
     el("summary").textContent = header.detail || "";
-    for (const id of ["log", "tabs", "main", "status"]) el(id).replaceChildren();
-    el("log").hidden = true;
+    for (const id of ["tablist", "main", "status"]) el(id).replaceChildren();
     el("tabs").hidden = true;
-    document.body.classList.remove("has-results");
+    el("filter").hidden = true;
+    el("filter-text").value = "";
+    messages = { kind: "messages", button: $("button", "tab", "Messages"), view: $("div", "messages"), entry: null };
+    messages.button.addEventListener("click", () => show(tabs.indexOf(messages)));
   }
 
   /** A statement's line link, back to where it is in the file. */
@@ -100,71 +106,89 @@
     return a;
   }
 
-  /** One line in the log: a mark, the line link, the statement, the outcome. */
-  function logLine(entry, cls, mark, outcome) {
+  /** One line in Messages: a mark, the line link, the statement, the outcome. */
+  function message(entry, cls, mark, outcome) {
     const line = $("div", "line " + cls);
     line.append($("span", "mark", mark));
     const link = lineLink(entry);
     if (link) line.append(link);
-    line.append($("span", "sql", entry.preview), $("span", "outcome", outcome));
-    el("log").append(line);
-    el("log").hidden = false;
+    const sql = $("span", "sql", entry.preview);
+    sql.title = entry.preview;
+    line.append(sql, $("span", "outcome", outcome));
+    messages.view.append(line);
     return line;
   }
 
-  function addResult(entry) {
-    const r = entry.result;
-    if (r.kind === "ok") {
-      logLine(entry, "ok", "✓", fmtMs(r.ms));
-    } else if (r.kind === "error") {
-      logLine(entry, "error", "✗", "");
-      const msg = $("div", "detail error", r.type + " Error: " + r.message);
-      el("log").append(msg);
-      // Where in the statement DuckDB stopped: the line, and a caret.
-      if (r.context) {
-        const n = String(r.context.line + 1);
-        el("log").append($("pre", "context", `${n} | ${r.context.text}\n${" ".repeat(n.length)} | ${" ".repeat(r.context.column)}^`));
-      }
-      msg.scrollIntoView({ block: "nearest" });
-    } else if (r.kind === "cancelled") {
-      const why = r.reason === "timeout" ? "timed out (grebe.duckdb.queryTimeout)" : "cancelled";
-      logLine(entry, "cancelled", "■", fmtMs(r.ms));
-      el("log").append($("div", "detail cancelled", `${why[0].toUpperCase()}${why.slice(1)}${r.ms ? " after " + fmtMs(r.ms) : ""}.` + (r.ended ? " " + r.message : "")));
-    } else {
-      addTab(entry);
-    }
-  }
-
-  // --- result tabs ----------------------------------------------------------
   function rowsLabel(r) {
     const shown = r.data.length ? r.data[0].length : 0;
-    if (r.more) return `first ${shown.toLocaleString()} rows`;
+    if (r.more) return `${shown.toLocaleString()}+ rows`;
     if (shown < r.total) return `${shown.toLocaleString()} of ${r.total.toLocaleString()} rows`;
     return `${r.total.toLocaleString()} row${r.total === 1 ? "" : "s"}`;
   }
 
+  function addResult(entry) {
+    const r = entry.result;
+    if (!tabs.includes(messages)) {
+      tabs.push(messages);
+      el("tablist").append(messages.button);
+    }
+    if (r.kind === "ok") {
+      message(entry, "ok", "✓", fmtMs(r.ms));
+    } else if (r.kind === "error") {
+      errors++;
+      message(entry, "error", "✗", "");
+      messages.view.append($("div", "detail error", r.type + " Error: " + r.message));
+      // Where in the statement DuckDB stopped: the line, and a caret.
+      if (r.context) {
+        const n = String(r.context.line + 1);
+        messages.view.append($("pre", "context", `${n} | ${r.context.text}\n${" ".repeat(n.length)} | ${" ".repeat(r.context.column)}^`));
+      }
+    } else if (r.kind === "cancelled") {
+      const why = r.reason === "timeout" ? "Timed out (grebe.duckdb.queryTimeout)" : "Cancelled";
+      message(entry, "cancelled", "■", fmtMs(r.ms));
+      messages.view.append($("div", "detail cancelled", `${why}${r.ms ? " after " + fmtMs(r.ms) : ""}.` + (r.ended ? " " + r.message : "")));
+    } else {
+      message(entry, "ok", "✓", `${r.kind === "rows" ? rowsLabel(r) : "text"} · ${fmtMs(r.ms)}`);
+      addTab(entry);
+      return;
+    }
+    messages.button.textContent = errors ? `Messages (${errors} error${errors === 1 ? "" : "s"})` : "Messages";
+    // An error or a stop: Messages is where the answer is.
+    if (r.kind !== "ok" || !tabs.some((t) => t.kind === "result")) show(tabs.indexOf(messages));
+    else refreshTabs();
+  }
+
+  // --- tabs -----------------------------------------------------------------
   function addTab(entry) {
     const r = entry.result;
     const button = $("button", "tab");
-    const what = r.kind === "rows" ? (r.more ? `${(r.data.length ? r.data[0].length : 0).toLocaleString()}+ rows` : rowsLabel(r)) : "text";
-    button.textContent = (typeof entry.line === "number" ? `L${entry.line + 1} · ` : "") + what;
+    button.textContent = (typeof entry.line === "number" ? `L${entry.line + 1} · ` : "") + (r.kind === "rows" ? rowsLabel(r) : "text");
     button.title = entry.preview;
-    const i = tabs.length;
-    button.addEventListener("click", () => show(i));
-    el("tabs").append(button);
-    tabs.push({ entry, button, view: null, dispose: null });
-    // Two or more result sets: the tabs say which is which.
-    el("tabs").hidden = tabs.length < 2;
-    document.body.classList.add("has-results");
-    show(i);
+    const t = { kind: "result", entry, button, view: null, dispose: null, note: "" };
+    button.addEventListener("click", () => show(tabs.indexOf(t)));
+    // Result tabs before Messages, in the order they ran.
+    const at = tabs.indexOf(messages);
+    tabs.splice(at, 0, t);
+    el("tablist").insertBefore(button, messages.button);
+    show(tabs.indexOf(t));
+  }
+
+  /** The strip holds the tabs and the filter. A data file's page (one
+   *  result, nothing to report) needs no tabs, only the filter. */
+  function refreshTabs() {
+    el("tabs").hidden = tabs.length === 0;
+    const results = tabs.filter((t) => t.kind === "result");
+    const quiet = errors === 0 && !messages.view.querySelector(".cancelled");
+    el("tablist").hidden = quiet && results.length === 1 && typeof results[0].entry.line !== "number";
   }
 
   function show(i) {
+    if (i < 0 || !tabs[i]) return;
     if (active >= 0 && tabs[active]) tabs[active].button.classList.remove("active");
     active = i;
     const t = tabs[i];
     t.button.classList.add("active");
-    if (!t.view) {
+    if (t.kind === "result" && !t.view) {
       const r = t.entry.result;
       if (r.kind === "rows" && r.columns.length) {
         t.view = grid(r);
@@ -177,21 +201,33 @@
     }
     el("main").replaceChildren(t.view);
     if (t.view.repaint) requestAnimationFrame(() => t.view.repaint(true));
+    // The filter belongs to a grid; each tab keeps its own.
+    const isGrid = Boolean(t.view && t.view.filter);
+    el("filter").hidden = !isGrid;
+    if (isGrid) {
+      t.filterState = t.filterState || { text: "", mode: "contains", col: -1 };
+      fillFilter(t);
+    }
+    refreshTabs();
     status(t);
   }
 
-  /** The status line for a result: its size and time, and what can be done
-   *  with it. */
+  /** The status line: a result's size and time, and what can be done with it. */
   function status(t) {
-    const r = t.entry.result;
     const bar = el("status");
     bar.replaceChildren();
-    const count = $("span", "count", r.kind === "rows" ? `${rowsLabel(r)} × ${r.columns.length}` : "text");
-    count.dataset.countFor = String(t.entry.id);
-    bar.append(count, $("span", "ms", fmtMs(r.ms)));
-    const sql = $("span", "sql", t.entry.preview);
-    sql.title = t.entry.preview;
-    bar.append(sql);
+    if (t.kind !== "result") {
+      bar.hidden = true;
+      return;
+    }
+    bar.hidden = false;
+    const r = t.entry.result;
+    let label = r.kind === "rows" ? `${rowsLabel(r)} × ${r.columns.length}` : "text";
+    if (t.matched !== undefined && t.filterState && t.filterState.text) {
+      label = `${t.matched.toLocaleString()} of ${rowsLabel(r)} match × ${r.columns.length}`;
+    }
+    const count = $("span", "count", label);
+    bar.append(count, $("span", "ms", fmtMs(r.ms)), $("span", "spacer"));
     const actions = $("span", "actions");
     if (t.entry.exportable && r.more) {
       const b = $("button", "", "Count");
@@ -203,19 +239,92 @@
       actions.append(b);
     }
     if (t.entry.exportable) {
-      for (const [fmt, label] of [["csv", "CSV"], ["tsv", "TSV"], ["parquet", "Parquet"], ["json", "JSON"]]) {
-        const b = $("button", "", label);
-        b.title = `Save every row as ${label} with DuckDB's COPY (runs the query again)`;
+      for (const [fmt, name] of [["csv", "CSV"], ["tsv", "TSV"], ["parquet", "Parquet"], ["json", "JSON"]]) {
+        const b = $("button", "", name);
+        b.title = `Save every row as ${name} with DuckDB's COPY (runs the query again; the filter does not apply)`;
         b.addEventListener("click", () => vscode.postMessage({ type: "export", id: t.entry.id, format: fmt }));
         actions.append(b);
       }
     }
     const note = $("span", "note");
     note.dataset.exportNote = String(t.entry.id);
-    if (t.note) note.textContent = t.note;
+    note.textContent = t.note || "";
     actions.append(note);
     bar.append(actions);
   }
+
+  // --- the filter -------------------------------------------------------------
+  // Matches as you type, not case-sensitive; "contains" unless changed.
+  const MATCHERS = {
+    contains: (q) => (v) => v.toLowerCase().includes(q),
+    equals: (q) => (v) => v.toLowerCase() === q,
+    starts: (q) => (v) => v.toLowerCase().startsWith(q),
+    regex: (q, raw) => {
+      const re = new RegExp(raw, "i");
+      return (v) => re.test(v);
+    },
+  };
+
+  function fillFilter(t) {
+    const st = t.filterState;
+    el("filter-text").value = st.text;
+    el("filter-mode").value = st.mode;
+    const sel = el("filter-col");
+    sel.replaceChildren($("option", "", "all columns"));
+    sel.firstChild.value = "-1";
+    t.entry.result.columns.forEach((c, i) => {
+      const o = $("option", "", c);
+      o.value = String(i);
+      sel.append(o);
+    });
+    sel.value = String(st.col);
+  }
+
+  let filterTimer = null;
+  function applyFilter() {
+    const t = tabs[active];
+    if (!t || !t.view || !t.view.filter) return;
+    const st = t.filterState;
+    st.text = el("filter-text").value;
+    st.mode = el("filter-mode").value;
+    st.col = Number(el("filter-col").value);
+    el("filter-text").classList.remove("invalid");
+    let match = null;
+    if (st.text) {
+      try {
+        match = MATCHERS[st.mode](st.text.toLowerCase(), st.text);
+      } catch {
+        el("filter-text").classList.add("invalid"); // a regex that does not compile
+        return;
+      }
+    }
+    t.matched = t.view.filter(match, st.col);
+    status(t);
+  }
+  const later = () => {
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(applyFilter, 60);
+  };
+  el("filter-text").addEventListener("input", later);
+  el("filter-mode").addEventListener("change", applyFilter);
+  el("filter-col").addEventListener("change", applyFilter);
+  el("filter-text").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      el("filter-text").value = "";
+      applyFilter();
+    } else if (e.key === "Enter" || e.key === "ArrowDown") {
+      const t = tabs[active];
+      if (t && t.view && t.view.focusGrid) t.view.focusGrid();
+    }
+  });
+  // Cmd/Ctrl+F anywhere on the page: to the filter.
+  window.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && !el("filter").hidden) {
+      e.preventDefault();
+      el("filter-text").focus();
+      el("filter-text").select();
+    }
+  });
 
   // --- what is running now, with a way to stop it --------------------------
   let ticking = null;
@@ -259,6 +368,11 @@
     } else if (data.type === "end") {
       stopRunning();
       el("summary").textContent = data.summary;
+      if (tabs.length === 0) {
+        // Nothing ran (a file that could not be read, Restricted Mode): the
+        // summary is the whole message.
+        el("main").replaceChildren();
+      }
     } else if (data.type === "exported" || data.type === "counted") {
       const t = tabs.find((x) => x.entry.id === data.id);
       if (data.type === "counted" && t && typeof data.total === "number") {
@@ -279,12 +393,16 @@
     const types = r.types || [];
     const data = r.data; // data[c][row] : string | null
     const num = r.num || [];
-    const n = data.length ? data[0].length : 0;
+    // `total`: the rows loaded. `n`: the rows in view, fewer while a filter
+    // is on. Everything that draws or moves works in view rows; at() maps a
+    // view row to its data row through the filter and the sort.
+    const total = data.length ? data[0].length : 0;
+    let n = total;
 
     const root = $("div", "grid");
     root.tabIndex = 0;
     root.setAttribute("role", "grid");
-    root.setAttribute("aria-label", `${n} rows, ${cols.length} columns`);
+    root.setAttribute("aria-label", `${total} rows, ${cols.length} columns`);
     const viewport = $("div", "viewport");
     const canvas = $("canvas");
     const sizer = $("div", "sizer");
@@ -294,7 +412,7 @@
 
     // Row-number column wide enough for the last row number.
     ctx.font = theme.small;
-    const NUMW = Math.ceil(ctx.measureText(String(n)).width) + PAD * 2 + 4;
+    const NUMW = Math.ceil(ctx.measureText(String(total)).width) + PAD * 2 + 4;
 
     // Widths: header and the first 1,000 values, clamped.
     const widths = cols.map((name, c) => fit(c, 1000));
@@ -307,7 +425,7 @@
       ctx.font = theme.font;
       const col = data[c];
       let widest = 0;
-      for (let k = 0, m = Math.min(n, sample); k < m; k++) {
+      for (let k = 0, m = Math.min(total, sample); k < m; k++) {
         const t = col[k];
         if (t !== null && t.length > widest) {
           // Measure only strings longer than any seen so far: the editor
@@ -555,16 +673,28 @@
       vscode.postMessage({ type: "copy", text: lines.join("\n") });
     }
 
+    // Rows the filter keeps (data rows, in order), or null for all of them.
+    let kept = null;
+
     function sortBy(c) {
       const dir = sort.col === c ? (sort.dir === 1 ? -1 : sort.dir === -1 ? 0 : 1) : 1;
       sort = { col: dir ? c : -1, dir };
+      applySort();
+      repaint();
+    }
+
+    function applySort() {
+      const { col: c, dir } = sort;
       if (!dir) {
-        order = null;
+        order = kept;
       } else {
         const col = data[c];
         const keys = num[c] ? Float64Array.from(col, (s) => (s === null ? NaN : Number(s))) : col;
-        const idx = new Int32Array(n);
-        for (let k = 0; k < n; k++) idx[k] = k;
+        let idx = kept;
+        if (!idx) {
+          idx = new Int32Array(total);
+          for (let k = 0; k < total; k++) idx[k] = k;
+        }
         const numeric = num[c];
         const cmp = (a, b) => {
           const ka = keys[a];
@@ -577,7 +707,37 @@
         };
         order = Array.from(idx).sort(cmp);
       }
-      repaint();
+    }
+
+    /**
+     * Keep only the rows `match(text)` accepts in column `c`, or in any column
+     * when `c` is -1; null clears the filter. NULL is matched as the text
+     * "NULL". Returns how many rows are kept.
+     */
+    function filter(match, c) {
+      if (!match) {
+        kept = null;
+      } else {
+        const colsToTest = c >= 0 ? [c] : cols.map((_, i) => i);
+        const out = [];
+        for (let k = 0; k < total; k++) {
+          for (const ci of colsToTest) {
+            const v = data[ci][k];
+            if (match(v === null ? "NULL" : v)) {
+              out.push(k);
+              break;
+            }
+          }
+        }
+        kept = Int32Array.from(out);
+      }
+      n = kept ? kept.length : total;
+      applySort();
+      sel = null;
+      layout();
+      viewport.scrollTop = 0;
+      repaint(true);
+      return n;
     }
 
     // --- events -----------------------------------------------------------
@@ -591,7 +751,7 @@
         const edge = edgeAt(px);
         if (edge >= 0) {
           if (e.detail === 2) {
-            widths[edge] = fit(edge, n);
+            widths[edge] = fit(edge, total);
             layout();
             repaint();
             return;
@@ -710,6 +870,8 @@
     const ro = new ResizeObserver(() => repaint(true));
     ro.observe(viewport);
 
+    root.filter = filter;
+    root.focusGrid = () => root.focus();
     const g = {
       repaint: (resize) => repaint(resize),
       dispose: () => {

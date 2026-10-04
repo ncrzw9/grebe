@@ -273,4 +273,4 @@ jobs:
         if: ${{ env.OVSX_PAT != '' }}
         run: |
           set -euo pipefail
-          for f in dist/*.vsix; do npx --yes ovsx publish "$f" --pat "$OVSX_PAT"; done
+          for f in dist/*.vsix; do npx --yes ovsx publish "$f" --skip-duplicate --pat "$OVSX_PAT"; done

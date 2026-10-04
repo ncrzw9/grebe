@@ -1114,3 +1114,57 @@ live("Restricted Mode: nothing starts DuckDB, and each place says why", async (t
   assert.equal(Session.cancelAll(), false);
   assert.equal(shown.errors.length, 0, shown.errors.join("\n"));
 });
+
+live("file commands given a tree item (not a file) ask for a file instead of failing", async (t) => {
+  const { vscode, shown } = makeVscode({ path: CLI, database: ":memory:", maxRows: 100 });
+  class TreeItem {
+    constructor(label, state) {
+      this.label = label;
+      this.collapsibleState = state;
+    }
+  }
+  Object.assign(vscode, {
+    TreeItem,
+    ThemeIcon: class {
+      constructor(id) {
+        this.id = id;
+      }
+    },
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+  });
+  const dialogs = [];
+  vscode.window.showOpenDialog = async (opts) => {
+    dialogs.push(opts.openLabel || "open");
+    return undefined; // the user cancels
+  };
+  vscode.window.createTreeView = () => ({ dispose() {} });
+  vscode.window.registerCustomEditorProvider = () => ({ dispose() {} });
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  t.after(() => {
+    Module._load = origLoad;
+  });
+  for (const m of ["../catalog", "../dataEditor", "../inspect", "../results", "../log", "../trust"]) delete require.cache[require.resolve(m)];
+  require("../results").init({ fsPath: path.join(__dirname, "..") });
+  const subs = [];
+  require("../catalog").activate({ subscriptions: subs }, {
+    currentSession: async () => null,
+    liveSession: () => null,
+    onDidRun: () => ({ dispose() {} }),
+    settings: () => ({ cli: CLI, database: ":memory:" }),
+    cli: () => CLI,
+  });
+  require("../dataEditor").activate({ subscriptions: subs });
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+
+  // What VS Code hands a view's title-bar command: the selected tree item.
+  const treeItem = { kind: "group", item: new TreeItem("Extensions", 1), children: [] };
+  for (const name of ["grebe.catalog.browseFile", "grebe.catalog.attach", "grebe.openInGrid"]) {
+    await shown.commands.get(name)(treeItem);
+  }
+  await shown.commands.get("grebe.catalog.useAsDatabase")(treeItem);
+  assert.deepEqual(shown.errors, [], "no command failed");
+  assert.equal(dialogs.length, 3, "browse, attach and open-in-grid each asked for a file");
+});

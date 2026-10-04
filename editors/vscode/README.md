@@ -120,14 +120,17 @@ panel. One run fills it:
 
 - a **header** line: the file, the statement count, and while it runs, a
   clock and **Cancel**;
-- a **log**: one line per statement that returned no rows (`✓ L2 CREATE
-  TEMP TABLE recent  13 ms`), or the error, with the line and a caret under
-  the spot DuckDB reported;
-- a **tab** for each result set when there is more than one; the newest
-  is shown;
-- the **grid**, filling the rest;
-- a **status line** for it: `first 10,000 rows × 3 · 23 ms`, the
-  statement, and **Count**, **CSV**, **TSV**, **Parquet**, **JSON**.
+- a **tab for each result set** (`L2 · 37 rows`), and a **Messages** tab:
+  every statement echoed with its outcome and time, and an error in full,
+  with the line and a caret under the spot DuckDB reported. A run that
+  fails opens on Messages; otherwise on its newest result;
+- the **grid**, filling the rest, with a **filter** above it: type to keep
+  the rows that match, *contains* by default (or *equals*, *starts with*,
+  *regex*), in all columns or one, not case-sensitive. `Cmd/Ctrl+F` jumps
+  to it and `Esc` clears it. It filters the rows loaded; export and Count
+  always work on the whole result;
+- a **status line**: `37 rows × 2 · 3.7 ms`, or `5 of 37 rows match`, and
+  **Count**, **CSV**, **TSV**, **Parquet**, **JSON**.
 
 It is built to be fast. A query shows at most `grebe.duckdb.maxRows` rows
 (10,000 by default) and DuckDB stops producing rows there, so a query that

@@ -237,8 +237,7 @@ function html(scriptUri, cspSource) {
   .running { margin-left: auto; display: inline-flex; gap: 8px; align-items: baseline; white-space: nowrap; }
   .running button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); padding: 0 8px; border-radius: 2px; }
   .running button:hover { background: var(--vscode-button-hoverBackground); text-decoration: none; }
-  #log { flex: none; max-height: 30vh; overflow: auto; padding: 0 10px 4px; font-family: var(--vscode-editor-font-family); font-size: 11px; }
-  body:not(.has-results) #log { flex: 1; max-height: none; }
+  .messages { overflow: auto; padding: 4px 10px; font-family: var(--vscode-editor-font-family); font-size: 11px; }
   .line { display: flex; gap: 8px; align-items: baseline; white-space: nowrap; line-height: 17px; color: var(--vscode-descriptionForeground); }
   .line .mark { width: 1ch; flex: none; }
   .line.ok .mark { color: var(--vscode-testing-iconPassed, #73c991); }
@@ -251,7 +250,13 @@ function html(scriptUri, cspSource) {
   .detail.error { color: var(--vscode-errorForeground); }
   .detail.cancelled { color: var(--vscode-editorWarning-foreground); }
   pre.context { margin: 2px 0 2px calc(1ch + 8px); color: var(--vscode-descriptionForeground); font-family: inherit; }
-  #tabs { flex: none; display: flex; gap: 2px; padding: 0 10px; border-bottom: 1px solid var(--vscode-panel-border); overflow-x: auto; }
+  #tabs { flex: none; display: flex; align-items: center; gap: 12px; padding: 0 10px; border-bottom: 1px solid var(--vscode-panel-border); min-width: 0; }
+  #tablist { display: flex; gap: 2px; overflow-x: auto; min-width: 0; }
+  #filter { margin-left: auto; display: flex; gap: 4px; align-items: center; flex: none; padding: 2px 0; }
+  #filter input, #filter select { font: inherit; font-size: 11px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 1px 4px; }
+  #filter input { width: 16em; }
+  #filter input:focus, #filter select:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+  #filter input.invalid { border-color: var(--vscode-inputValidation-errorBorder, red); }
   .tab { color: var(--vscode-descriptionForeground); padding: 3px 8px; border-bottom: 1px solid transparent; margin-bottom: -1px; white-space: nowrap; }
   .tab:hover { color: var(--vscode-foreground); text-decoration: none; }
   .tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
@@ -260,8 +265,7 @@ function html(scriptUri, cspSource) {
   pre.text { margin: 0; padding: 6px 10px; overflow: auto; font-family: var(--vscode-editor-font-family); font-size: 12px; }
   .empty { padding: 6px 10px; color: var(--vscode-descriptionForeground); }
   #status { flex: none; display: flex; gap: 12px; align-items: baseline; padding: 3px 10px; border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; min-width: 0; }
-  body:not(.has-results) #status { display: none; }
-  #status .sql { overflow: hidden; text-overflow: ellipsis; color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family); font-size: 11px; flex: 1; min-width: 0; }
+  #status .spacer { flex: 1; }
   #status .actions { display: inline-flex; gap: 2px; align-items: baseline; }
   .grid { outline: none; display: flex; }
   .viewport { overflow: auto; position: relative; flex: 1; }
@@ -271,10 +275,9 @@ function html(scriptUri, cspSource) {
 </head>
 <body>
 <header id="bar"><span id="title">No results yet.</span><span id="summary" class="meta">Run a statement, or open a data file.</span></header>
-<div id="log" hidden></div>
-<nav id="tabs" hidden></nav>
+<nav id="tabs" hidden><div id="tablist"></div><div id="filter" hidden><input id="filter-text" type="text" placeholder="Filter" aria-label="Filter rows" spellcheck="false"><select id="filter-mode" aria-label="How to match"><option value="contains">contains</option><option value="equals">equals</option><option value="starts">starts with</option><option value="regex">regex</option></select><select id="filter-col" aria-label="Which column"></select></div></nav>
 <div id="main"></div>
-<footer id="status"></footer>
+<footer id="status" hidden></footer>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

@@ -25,6 +25,11 @@ const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
 const qname = (o) => [o.db, o.schema, o.name].map(ident).join(".");
 
+// A command's argument when it is a file. From the Explorer's context menu
+// it is the file's Uri; from a view's title bar VS Code passes the view's
+// selected item instead, which is not a file and means "ask".
+const fileArg = (a) => (a && typeof a.fsPath === "string" ? a : undefined);
+
 /** All tables and views in `dbs` (every non-internal database when null),
  *  with estimated rows and column counts, in one query. */
 const OBJECTS = (dbs) => {
@@ -274,8 +279,9 @@ class Explorer {
   }
 
   /** ATTACH a database file to the session, so its tables can be queried. */
-  async attach(uri) {
+  async attach(arg) {
     if (!trust.ok("Attaching a database")) return;
+    let uri = fileArg(arg);
     if (!uri) {
       const picked = await vscode.window.showOpenDialog({
         canSelectMany: false,
@@ -371,8 +377,9 @@ class Explorer {
     results.end(qname(o));
   }
 
-  async browseFile(uri) {
+  async browseFile(arg) {
     if (!trust.ok("Browsing a database file")) return;
+    let uri = fileArg(arg);
     if (!uri) {
       const picked = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { DuckDB: ["duckdb", "db", "ddb"] } });
       uri = picked && picked[0];
@@ -475,7 +482,8 @@ function activate(context, deps) {
     on("attach", (uri) => explorer.attach(uri)),
     on("detach", (n) => explorer.detach(n)),
     on("closeFile", (n) => explorer.closeFile(n)),
-    on("useAsDatabase", async (uri) => {
+    on("useAsDatabase", async (arg) => {
+      const uri = fileArg(arg);
       if (!uri) return;
       const target = vscode.workspace.workspaceFolders ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
       await vscode.workspace.getConfiguration("grebe.duckdb").update("database", uri.fsPath, target);

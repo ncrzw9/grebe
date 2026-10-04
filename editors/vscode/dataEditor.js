@@ -123,7 +123,10 @@ function activate(context) {
       }),
     ),
     // From the Explorer's context menu or the Command Palette.
-    log.command("grebe.openInGrid", async (uri) => {
+    log.command("grebe.openInGrid", async (arg) => {
+      // A file from the Explorer; anything else (a view's selected item)
+      // means ask for one.
+      let uri = arg && typeof arg.fsPath === "string" ? arg : undefined;
       if (!uri) {
         const picked = await vscode.window.showOpenDialog({
           canSelectMany: false,
