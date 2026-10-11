@@ -162,6 +162,9 @@ In the grid:
   descending, off (NULLs last). Drag a header's edge to resize it,
   double-click it to fit.
 - **Types** of each column show in its header.
+- **Screen readers** hear the cell you move to with its column and row,
+  how much a Shift+move selects, and each sort and filter. Sorting still
+  needs the mouse.
 
 ## Catalog
 
