@@ -1,0 +1,49 @@
+name: Bug report
+description: Wrong output, a crash, or a false finding
+labels: [bug]
+body:
+  - type: textarea
+    id: sql
+    attributes:
+      label: SQL
+      description: The smallest SQL that shows the problem.
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: The command you ran and its output, or what the editor showed.
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - grebe check
+        - grebe format
+        - VS Code extension
+        - Language server in another editor
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`grebe --version`, plus the extension version if it's an editor issue"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and DuckDB version
+      placeholder: macOS 15, DuckDB 1.5.5
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your `grebe.toml` or `[tool.grebe]`, if any.
+      render: toml

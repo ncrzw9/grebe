@@ -1,0 +1,27 @@
+name: Parser disagreement
+description: grebe rejects SQL DuckDB runs, or accepts SQL DuckDB rejects
+labels: [parser]
+body:
+  - type: textarea
+    id: sql
+    attributes:
+      label: SQL
+      render: sql
+    validations:
+      required: true
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      options:
+        - DuckDB accepts it, grebe rejects it
+        - DuckDB rejects it, grebe accepts it
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: grebe and DuckDB versions
+      placeholder: grebe 0.6.0, DuckDB 1.5.5
+    validations:
+      required: true
