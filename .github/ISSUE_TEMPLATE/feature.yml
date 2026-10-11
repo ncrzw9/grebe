@@ -1,0 +1,21 @@
+name: Feature or rule request
+description: A new rule, formatting option, or editor feature
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve?
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: For a rule, SQL it should flag and SQL it should leave alone. For formatting, the input and the output you want.
+      render: sql
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything else
+      description: Workarounds, other tools that do this, open questions.

@@ -4,7 +4,9 @@
 // Each result is a canvas grid: one <canvas> pinned over a native scrolling
 // area, repainted per frame with only the rows *and columns* in view -- no
 // per-cell DOM at all, so 100,000 rows or 200 columns cost the same to
-// scroll. Data arrives column-major as display text (null = NULL).
+// scroll. Data arrives column-major as display text (null = NULL). Screen
+// readers get an off-screen ARIA grid of a fixed size instead: the header
+// row and the active cell, which the grid's aria-activedescendant follows.
 //
 //   click / drag            select cells; click a row number: whole rows
 //   arrows, Home/End, PgUp/PgDn, Cmd/Ctrl+Home/End     move
@@ -57,6 +59,16 @@
     for (const g of grids) g.repaint(true);
   }
   const grids = new Set();
+  let gridIds = 0;
+
+  /** Say `text` through the page's live region, even when it repeats. */
+  let announceTimer = null;
+  function announce(text) {
+    const box = el("announce");
+    box.textContent = "";
+    clearTimeout(announceTimer);
+    announceTimer = setTimeout(() => (box.textContent = text), 50);
+  }
   new MutationObserver(() => readTheme()).observe(document.body, { attributes: true, attributeFilter: ["class"] });
 
   // --- layout -------------------------------------------------------------
@@ -300,6 +312,7 @@
     }
     t.matched = t.view.filter(match, st.col);
     status(t);
+    announce(st.text ? `${t.matched.toLocaleString()} ${t.matched === 1 ? "row matches" : "rows match"}` : "Filter cleared");
   }
   const later = () => {
     clearTimeout(filterTimer);
@@ -402,12 +415,44 @@
     const root = $("div", "grid");
     root.tabIndex = 0;
     root.setAttribute("role", "grid");
-    root.setAttribute("aria-label", `${total} rows, ${cols.length} columns`);
+    root.setAttribute("aria-label", "Results");
+    root.setAttribute("aria-multiselectable", "true");
+    root.setAttribute("aria-colcount", String(cols.length));
     const viewport = $("div", "viewport");
+    viewport.setAttribute("aria-hidden", "true");
     const canvas = $("canvas");
     const sizer = $("div", "sizer");
     viewport.append(canvas, sizer);
-    root.append(viewport);
+
+    // What screen readers see in place of the canvas: the header row, then
+    // the active cell alone in a row, placed by aria-rowindex/aria-colindex.
+    // Two such rows take turns, so every move is a new active descendant
+    // (which is what gets announced) and the DOM never grows with the data.
+    const gid = `g${++gridIds}`;
+    const access = $("div", "sr-only");
+    const headRow = $("div");
+    headRow.setAttribute("role", "row");
+    headRow.setAttribute("aria-rowindex", "1");
+    const heads = cols.map((name, c) => {
+      const h = $("div", null, name);
+      h.setAttribute("role", "columnheader");
+      h.setAttribute("aria-colindex", String(c + 1));
+      headRow.append(h);
+      return h;
+    });
+    access.append(headRow);
+    const slots = [0, 1].map((k) => {
+      const row = $("div");
+      row.setAttribute("role", "row");
+      row.hidden = true;
+      const cell = $("div");
+      cell.setAttribute("role", "gridcell");
+      cell.id = `${gid}-cell${k}`;
+      row.append(cell);
+      access.append(row);
+      return { row, cell };
+    });
+    root.append(viewport, access);
     const ctx = canvas.getContext("2d", { alpha: false });
 
     // Row-number column wide enough for the last row number.
@@ -477,8 +522,48 @@
       requestAnimationFrame(paint);
     }
 
+    // Point screen readers at the active cell, and say how much is
+    // selected, when either changed since the last frame.
+    let spoken = "";
+    let spokenRange = "";
+    let slot = 0;
+    function speak() {
+      root.setAttribute("aria-rowcount", String(n + 1));
+      const sr = range();
+      const key = sel && n ? [sel.r, sel.c, at(sel.r), ...sr].join() : "";
+      if (key === spoken) return;
+      spoken = key;
+      if (!key) {
+        spokenRange = "";
+        root.removeAttribute("aria-activedescendant");
+        for (const s of slots) s.row.hidden = true;
+        return;
+      }
+      const old = slots[slot];
+      const s = slots[(slot ^= 1)];
+      const val = data[sel.c][at(sel.r)];
+      s.cell.textContent = val === null ? "NULL" : val === "" ? "empty" : val;
+      s.row.setAttribute("aria-rowindex", String(sel.r + 2));
+      s.cell.setAttribute("aria-colindex", String(sel.c + 1));
+      const rows = sr[1] - sr[0] + 1;
+      const many = rows > 1 || sr[3] > sr[2];
+      s.cell.setAttribute("aria-selected", String(many));
+      s.row.hidden = false;
+      old.row.hidden = true;
+      root.setAttribute("aria-activedescendant", s.cell.id);
+      // Only a new range is said: a sort moves other data under the same
+      // selection, and its own announcement should stand.
+      const changed = sr.join() !== spokenRange;
+      spokenRange = sr.join();
+      if (many && changed) {
+        const width = sr[3] - sr[2] + 1;
+        announce(`${rows.toLocaleString()} ${rows === 1 ? "row" : "rows"} by ${width} ${width === 1 ? "column" : "columns"} selected`);
+      }
+    }
+
     function paint() {
       dirty = false;
+      speak();
       const t = theme;
       const sx = viewport.scrollLeft;
       const sy = viewport.scrollTop;
@@ -680,6 +765,8 @@
       const dir = sort.col === c ? (sort.dir === 1 ? -1 : sort.dir === -1 ? 0 : 1) : 1;
       sort = { col: dir ? c : -1, dir };
       applySort();
+      heads.forEach((h, i) => (i === sort.col ? h.setAttribute("aria-sort", dir > 0 ? "ascending" : "descending") : h.removeAttribute("aria-sort")));
+      announce(dir ? `Sorted by ${cols[c]}, ${dir > 0 ? "ascending" : "descending"}` : "Sort off");
       repaint();
     }
 
@@ -861,6 +948,7 @@
       }[e.key];
       if (go && n) {
         e.preventDefault();
+        if (!sel) return moveTo(0, 0, false);
         moveTo(go[0], go[1], e.shiftKey);
       }
     });
