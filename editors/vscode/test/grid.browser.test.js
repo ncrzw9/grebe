@@ -289,6 +289,29 @@ browserTest("screen readers get the active cell, the selection, sorting and filt
   });
   assert.equal(await said("Sorted by id, ascending"), "Sorted by id, ascending");
   assert.equal(await page.locator('[role="columnheader"]').first().getAttribute("aria-sort"), "ascending");
+  // S sorts the active cell's column from the keyboard, cycling like the
+  // toggle: name ascending (NULLs last), descending, then off.
+  await grid.focus();
+  await page.keyboard.press("s");
+  assert.equal(await said("Sorted by name, ascending"), "Sorted by name, ascending");
+  assert.equal(await page.locator('[role="columnheader"]').first().getAttribute("aria-sort"), null);
+  assert.equal(await page.locator('[role="columnheader"]').nth(1).getAttribute("aria-sort"), "ascending");
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("Control+ArrowUp");
+  await frame();
+  assert.equal((await active()).text, "name 1");
+  await page.keyboard.press("s");
+  assert.equal(await said("Sorted by name, descending"), "Sorted by name, descending");
+  await frame();
+  assert.equal((await active()).text, "name 9");
+  await page.keyboard.press("s");
+  assert.equal(await said("Sort off"), "Sort off");
+  assert.equal(await page.locator('[role="columnheader"]').nth(1).getAttribute("aria-sort"), null);
+  // Cmd/Ctrl+S is left alone (it is VS Code's save).
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(150);
+  assert.equal(await page.textContent("#announce"), "Sort off");
+
   await page.fill("#filter-text", "name 1");
   assert.equal(await said("1 row matches"), "1 row matches");
   await frame();

@@ -158,13 +158,12 @@ In the grid:
 - **Copy**: `Cmd/Ctrl+C` copies tab-separated text that pastes into a
   spreadsheet, with the column names when whole columns are selected. NULL
   pastes as an empty cell.
-- **Sort and size**: the **↕** at a header's right edge sorts ascending,
-  descending, off (NULLs last). Drag a header's edge to resize it,
+- **Sort and size**: the **↕** at a header's right edge, or `S` for the
+  active cell's column, sorts ascending, descending, off (NULLs last). Drag a header's edge to resize it,
   double-click it to fit.
 - **Types** of each column show in its header.
 - **Screen readers** hear the cell you move to with its column and row,
-  how much a Shift+move selects, and each sort and filter. Sorting still
-  needs the mouse.
+  how much a Shift+move selects, and each sort and filter.
 
 ## Catalog
 
