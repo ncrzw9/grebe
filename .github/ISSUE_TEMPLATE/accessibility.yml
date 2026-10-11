@@ -1,0 +1,22 @@
+name: Accessibility
+description: Something in the extension is hard or impossible to use with a keyboard, screen reader, zoom, or high-contrast theme
+labels: [accessibility]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What's the barrier?
+      description: Which view (results grid, catalog, messages, a data file) and what you tried to do.
+    validations:
+      required: true
+  - type: input
+    id: tech
+    attributes:
+      label: Assistive technology and setup
+      placeholder: NVDA 2025.1 on Windows 11, VS Code 1.105, high-contrast theme
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Extension version
