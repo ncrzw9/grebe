@@ -271,6 +271,7 @@ function html(scriptUri, cspSource) {
   .viewport { overflow: auto; position: relative; flex: 1; }
   .viewport canvas { position: sticky; top: 0; left: 0; display: block; }
   .sizer { pointer-events: none; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -278,6 +279,7 @@ function html(scriptUri, cspSource) {
 <nav id="tabs" hidden><div id="tablist"></div><div id="filter" hidden><input id="filter-text" type="text" placeholder="Filter" aria-label="Filter rows" spellcheck="false"><select id="filter-mode" aria-label="How to match"><option value="contains">contains</option><option value="equals">equals</option><option value="starts">starts with</option><option value="regex">regex</option></select><select id="filter-col" aria-label="Which column"></select></div></nav>
 <div id="main"></div>
 <footer id="status" hidden></footer>
+<div id="announce" class="sr-only" role="status"></div>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

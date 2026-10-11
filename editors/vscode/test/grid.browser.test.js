@@ -224,6 +224,78 @@ browserTest("the grid draws, selects, copies and sorts", async (t) => {
   assert.deepEqual(exp, [{ type: "export", id: 1, format: "parquet" }]);
 });
 
+browserTest("screen readers get the active cell, the selection, sorting and filtering", async (t) => {
+  const browser = await chromium.launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await page.setContent(html());
+  await page.evaluate((result) => {
+    window.postMessage({ type: "begin", header: { title: "q.sql", detail: "" } }, "*");
+    window.postMessage({ type: "result", entry: { id: 1, uri: "file:///q.sql", line: 0, preview: "SELECT 1", result } }, "*");
+    window.postMessage({ type: "end", summary: "" }, "*");
+  }, rowsResult(10));
+  await page.waitForSelector("canvas");
+  const frame = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  const grid = page.locator('[role="grid"]');
+  const active = () =>
+    page.evaluate(() => {
+      const g = document.querySelector('[role="grid"]');
+      const id = g.getAttribute("aria-activedescendant");
+      const c = id && document.getElementById(id);
+      return c && { text: c.textContent, row: c.parentElement.getAttribute("aria-rowindex"), col: c.getAttribute("aria-colindex"), selected: c.getAttribute("aria-selected") };
+    });
+  const said = async (text) => {
+    await page.waitForFunction((t) => document.getElementById("announce").textContent === t, text, { timeout: 2000 }).catch(() => {});
+    return page.textContent("#announce");
+  };
+
+  assert.equal(await grid.getAttribute("aria-rowcount"), "11");
+  assert.equal(await grid.getAttribute("aria-colcount"), "2");
+  assert.deepEqual(await page.locator('[role="columnheader"]').allTextContents(), ["id", "name"]);
+  assert.equal(await active(), null);
+
+  // The first arrow lands on the first cell; then each move is announced
+  // through a new active descendant, row 1 being the header.
+  await grid.focus();
+  await page.keyboard.press("ArrowDown");
+  await frame();
+  assert.deepEqual(await active(), { text: "0", row: "2", col: "1", selected: "false" });
+  await page.keyboard.press("ArrowRight");
+  await frame();
+  assert.deepEqual(await active(), { text: "NULL", row: "2", col: "2", selected: "false" });
+  const before = await page.evaluate(() => document.querySelectorAll("*").length);
+  await page.keyboard.press("ArrowDown");
+  await frame();
+  assert.deepEqual(await active(), { text: "name 1", row: "3", col: "2", selected: "false" });
+  assert.equal(await page.evaluate(() => document.querySelectorAll("*").length), before, "no DOM per move");
+
+  // Extending the selection says how much is selected.
+  await page.keyboard.press("Shift+ArrowDown");
+  await frame();
+  assert.equal((await active()).selected, "true");
+  assert.equal(await said("2 rows by 1 column selected"), "2 rows by 1 column selected");
+
+  // Sorting and filtering are announced; the header carries the sort.
+  await page.evaluate(() => {
+    const c = document.querySelector("canvas");
+    const b = c.getBoundingClientRect();
+    for (let x = b.left + 20; x < b.right; x += 2) {
+      c.dispatchEvent(new MouseEvent("mousemove", { clientX: x, clientY: b.top + 11, bubbles: true }));
+      if (c.title.startsWith("Sort")) {
+        c.dispatchEvent(new MouseEvent("mousedown", { clientX: x, clientY: b.top + 11, bubbles: true }));
+        return;
+      }
+    }
+  });
+  assert.equal(await said("Sorted by id, ascending"), "Sorted by id, ascending");
+  assert.equal(await page.locator('[role="columnheader"]').first().getAttribute("aria-sort"), "ascending");
+  await page.fill("#filter-text", "name 1");
+  assert.equal(await said("1 row matches"), "1 row matches");
+  await frame();
+  assert.equal(await grid.getAttribute("aria-rowcount"), "2");
+  assert.equal(await active(), null);
+});
+
 browserTest("errors, text, OK and a capped data file render as such", async (t) => {
   const browser = await chromium.launch();
   t.after(() => browser.close());
