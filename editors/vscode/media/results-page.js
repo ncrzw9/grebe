@@ -17,7 +17,8 @@
 //   click / drag headers    select whole columns (Shift+click extends)
 //   Ctrl+Space, Shift+Space select the current column(s) / row(s)
 //   Cmd/Ctrl+arrows         jump to the edge (with Shift: extend to it)
-//   the ↕ at a header's right edge   sort asc / desc / off (NULLs last)
+//   the ↕ at a header's right edge, or S   sort the column asc / desc / off
+//                           (NULLs last); S sorts the active cell's column
 //   drag a header edge      resize; double-click it to fit the content
 
 (function () {
@@ -925,6 +926,10 @@
         return copy();
       }
       const cur = sel || { ar: 0, ac: 0, r: 0, c: 0 };
+      if ((e.key === "s" || e.key === "S") && !mod && !e.altKey && !e.shiftKey && n) {
+        e.preventDefault();
+        return sortBy(cur.c);
+      }
       if (e.key === " " && n && (e.ctrlKey || e.shiftKey)) {
         e.preventDefault();
         // Ctrl+Space: the current column(s); Shift+Space: the current row(s).
