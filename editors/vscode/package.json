@@ -3,7 +3,7 @@
   "displayName": "grebe",
   "description": "DuckDB SQL in the editor: lint, quick fixes and formatting, plus running SQL with your own duckdb CLI, a results grid, a catalog, and Parquet and CSV files in the grid.",
   "publisher": "ncrzw9",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "license": "MIT",
   "repository": {
     "type": "git",

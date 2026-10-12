@@ -45,7 +45,7 @@ does not inherit your shell's -- set its path:
 
 Two status bar items, bottom right:
 
-- **grebe 0.6.0** with a check mark: the language server is up and linting.
+- **grebe 0.6.1** with a check mark: the language server is up and linting.
   With an error icon on red, it could not start; click it for the reason.
 - **DuckDB 1.5.5 · :memory:**: the CLI SQL runs with, and the database.
   Click it to choose `:memory:` or a database file. A warning icon means the
@@ -419,7 +419,7 @@ npm install
 npx @vscode/vsce package
 ```
 
-This produces `grebe-0.6.0.vsix` in this directory: the universal package,
+This produces `grebe-0.6.1.vsix` in this directory: the universal package,
 with no binary inside, so set `grebe.path` or put `grebe` on `PATH`.
 `package-targets.js` builds the per-platform packages from the release
 archives.
