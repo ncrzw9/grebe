@@ -639,6 +639,132 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
   assert.match(shown.errors.at(-1), /^grebe: could not attach notes\.duckdb: IO Error: .*not a valid DuckDB database file/);
 });
 
+// A PostgreSQL server to attach, as a libpq connection string with a
+// password ($PG_TEST_CONN). The test makes and drops a schema of its own.
+const PG = process.env.PG_TEST_CONN;
+const livePg = CLI && PG && fs.existsSync(CLI) ? test : test.skip;
+
+livePg("Catalog: attach PostgreSQL by connection string, never showing its password", async (t) => {
+  const { vscode, shown } = makeVscode({ path: CLI, database: ":memory:", maxRows: 100 });
+  class TreeItem {
+    constructor(label, state) {
+      this.label = label;
+      this.collapsibleState = state;
+    }
+  }
+  Object.assign(vscode, {
+    TreeItem,
+    ThemeIcon: class {
+      constructor(id) {
+        this.id = id;
+      }
+    },
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+  });
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  const savedPgPassword = process.env.PGPASSWORD;
+  delete process.env.PGPASSWORD; // so a string without one has to ask
+  t.after(() => {
+    Module._load = origLoad;
+    if (savedPgPassword !== undefined) process.env.PGPASSWORD = savedPgPassword;
+  });
+  for (const m of ["../catalog", "../results", "../log", "../conninfo"]) delete require.cache[require.resolve(m)];
+  const { Explorer } = require("../catalog");
+  const { parse } = require("../conninfo");
+  const { Session } = require("../duckdb-session");
+  const password = parse(PG).password;
+  assert.ok(password, "PG_TEST_CONN carries a password");
+  const schema = `grebe_test_${process.pid}`;
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-pg-"));
+  const sess = new Session({ cli: CLI, database: ":memory:", cwd: dir });
+  await sess.start();
+  const ex = new Explorer({
+    currentSession: async () => sess,
+    liveSession: () => sess,
+    settings: () => ({ cli: CLI, database: ":memory:" }),
+    cli: () => CLI,
+  });
+  t.after(async () => {
+    await sess.run(`CALL postgres_execute('setup', 'DROP SCHEMA IF EXISTS ${schema} CASCADE')`);
+    ex.dispose();
+    sess.dispose();
+  });
+  const labels = (nodes) => nodes.map((n) => `${n.item.label}${n.item.description ? " (" + n.item.description + ")" : ""}`);
+  // The user's answers, in order: connection string, alias, then a pick.
+  let answers = [];
+  const asked = [];
+  vscode.window.showInputBox = async (o) => {
+    asked.push(o.password ? "password" : o.title);
+    if (o.validateInput) assert.equal(o.validateInput(o.value || answers[0] || "x=y"), null);
+    return answers.shift();
+  };
+  vscode.window.showQuickPick = async (items) => {
+    const pick = items.find((i) => i.label === answers[0]);
+    assert.ok(pick, `${answers[0]} is offered`);
+    answers.shift();
+    return pick;
+  };
+
+  // Read-write first, to give the read-only attach below something to show.
+  answers = ["  " + PG + "  ", "setup", "Read and write"];
+  await ex.attachPostgres();
+  assert.deepEqual(shown.errors, []);
+  for (const sql of [
+    `CREATE SCHEMA setup.${schema}`,
+    `CREATE TABLE setup.${schema}.orders AS SELECT range::INT AS id, range * 1.5 AS amount FROM range(250)`,
+  ]) {
+    assert.equal((await sess.run(sql)).kind, "ok", sql);
+  }
+  assert.equal((await sess.run(`CALL postgres_execute('setup', 'CREATE VIEW ${schema}.big AS SELECT * FROM ${schema}.orders WHERE amount > 300')`)).kind, "rows");
+
+  // From the Catalog's plug icon: choose PostgreSQL, then the same questions.
+  answers = ["$(server) PostgreSQL…", PG, "local", "Read-only"];
+  await ex.attach(undefined);
+  assert.deepEqual(shown.errors, []);
+  const [root] = await ex.getChildren();
+  const top = await ex.getChildren(root);
+  const where = parse(PG).dbname + "@" + parse(PG).host + (parse(PG).port ? ":" + parse(PG).port : "");
+  const local = top.find((n) => n.item.label === "local");
+  assert.ok(local, labels(top).join(" | "));
+  assert.equal(local.item.description, `attached · postgres · ${where} · read-only`);
+  assert.equal(local.item.contextValue, "grebe.attachedDb", "it can be detached");
+  assert.match(local.item.tooltip, /password=\*\*\*/);
+  const inSchema = (await ex.getChildren(local)).find((n) => n.item.label === schema);
+  assert.ok(inSchema, labels(await ex.getChildren(local)).join(" | "));
+  assert.deepEqual(labels(await ex.getChildren(inSchema)), ["big (2 cols)", "orders (2 cols)"], "no made-up row estimate, no row types");
+  const r = await sess.run(`SELECT count(*) AS n FROM local.${schema}.orders`);
+  assert.deepEqual(r.rows, [[250]], "queries can use it by its alias");
+  assert.equal((await sess.run(`INSERT INTO local.${schema}.orders VALUES (1, 1)`)).kind, "error", "read-only means read-only");
+  assert.equal((await sess.run("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'postgres_scanner'")).rows[0][0], true);
+
+  // Without the password in the string: asked for, masked, then attached.
+  const noPassword = PG.replace(/\s*password\s*=\s*('(?:[^'\\]|\\.)*'|\S+)/i, "");
+  answers = [noPassword, "asked", "Read-only", password];
+  asked.length = 0;
+  await ex.attachPostgres();
+  assert.deepEqual(shown.errors, []);
+  assert.deepEqual(asked, ["Attach PostgreSQL Database", "Attach PostgreSQL Database", "password"]);
+  assert.deepEqual((await sess.run(`SELECT count(*) FROM asked.${schema}.orders`)).rows, [[250]]);
+
+  // A wrong password: the error is shown, with the password redacted.
+  answers = [`${noPassword} password=not-the-password`, "wrong", "Read-only"];
+  await ex.attachPostgres();
+  assert.match(shown.errors.at(-1), /^grebe: could not attach .*: IO Error: .*password=\*\*\*/);
+
+  // Detach.
+  await ex.detach((await ex.getChildren(root)).find((n) => n.item.label === "local"));
+  assert.ok(!labels(await ex.getChildren(root)).some((l) => l.startsWith("local (")));
+
+  // Nowhere the extension writes did the password appear.
+  const everything = [...shown.errors, ...shown.log, ...labels(await ex.getChildren(root))].join("\n");
+  assert.ok(!everything.includes(password), everything);
+  assert.ok(!everything.includes("not-the-password"), everything);
+});
+
 /** Wait until `cond()` holds (a notification is shown without awaiting). */
 async function until(cond, what, ms = 10000) {
   const t0 = Date.now();
@@ -1161,6 +1287,7 @@ live("file commands given a tree item (not a file) ask for a file instead of fai
 
   // What VS Code hands a view's title-bar command: the selected tree item.
   const treeItem = { kind: "group", item: new TreeItem("Extensions", 1), children: [] };
+  vscode.window.showQuickPick = async (items) => items[0]; // attach: a database file
   for (const name of ["grebe.catalog.browseFile", "grebe.catalog.attach", "grebe.openInGrid"]) {
     await shown.commands.get(name)(treeItem);
   }

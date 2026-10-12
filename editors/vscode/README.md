@@ -9,8 +9,8 @@ not a copy bundled into the editor.
   statement in the selection), `Cmd/Ctrl+Shift+Enter` the file, **▶ Run**
   above a statement just that one. Results land in a fast grid you can put
   anywhere.
-- **Catalog**: the tables, views and columns in your database, and in any
-  `.duckdb` file you browse.
+- **Catalog**: the tables, views and columns in your database, in any
+  `.duckdb` file you browse, and in PostgreSQL databases you attach.
 - **Data files in the grid**: open a `.parquet` file and its rows appear in
   the grid, with column types; CSV and TSV through **Open With...**.
 - **Lint as you type, quick fixes, formatting** and DuckDB-aware
@@ -45,7 +45,7 @@ does not inherit your shell's -- set its path:
 
 Two status bar items, bottom right:
 
-- **grebe 0.6.0** with a check mark: the language server is up and linting.
+- **grebe 0.6.1** with a check mark: the language server is up and linting.
   With an error icon on red, it could not start; click it for the reason.
 - **DuckDB 1.5.5 · :memory:**: the CLI SQL runs with, and the database.
   Click it to choose `:memory:` or a database file. A warning icon means the
@@ -195,6 +195,41 @@ to the session, read-only or read-write, under a name taken from the file:
 your SQL. **Detach** (on an attached database) removes it. Attaching
 happens in the session, so it lasts until the session restarts, the same as
 an `ATTACH` in your own SQL.
+
+### PostgreSQL
+
+From the plug icon choose **PostgreSQL...**, or run **grebe: Attach
+PostgreSQL Database...**, and give a connection string, either libpq's
+`key=value` form or a URI:
+
+```
+dbname=ub host=localhost port=5432 user=postgres
+postgresql://postgres@localhost:5432/ub
+```
+
+then a name to query it by (the database name unless you change it) and
+read-only or read-write. grebe loads DuckDB's `postgres` extension,
+installing it first the one time it is not installed, and attaches it; its
+schemas and tables appear in the Catalog as
+`local (attached · postgres · ub@localhost:5432 · read-only)`, and
+`FROM local.public.customers` works in your SQL.
+
+- **Passwords**: leave it out of the string and grebe asks for it, masked,
+  if the server wants one; it is used for that attach and not stored.
+  `PGPASSWORD` and `~/.pgpass` work too, as for `psql`. A password you do
+  give is never shown: the Catalog, the output channel and error messages
+  print `password=***`.
+- **The same in SQL**: an `ATTACH` you run yourself works the same way and
+  shows up in the Catalog too:
+
+  ```sql
+  ATTACH 'dbname=ub host=localhost port=5432 user=postgres' AS local (TYPE postgres, READ_ONLY);
+  ```
+
+  DuckDB loads the extension for it on its own, unless your `~/.duckdbrc`
+  turns off `autoinstall_known_extensions` or `autoload_known_extensions`.
+- Row estimates are not shown for PostgreSQL tables: DuckDB has none for
+  them. **Count Rows** gives the real number.
 
 To look inside a `.duckdb` file without attaching it, right-click it in the
 Explorer, then **Browse DuckDB File**: it opens **read-only** in a separate
@@ -384,14 +419,15 @@ npm install
 npx @vscode/vsce package
 ```
 
-This produces `grebe-0.6.0.vsix` in this directory: the universal package,
+This produces `grebe-0.6.1.vsix` in this directory: the universal package,
 with no binary inside, so set `grebe.path` or put `grebe` on `PATH`.
 `package-targets.js` builds the per-platform packages from the release
 archives.
 
 The tests run with Node's own test runner. `GREBE_BIN` names a `grebe` to
 run the real language server against, `DUCKDB_CLI` a `duckdb` CLI to run
-SQL with; tests that need one are skipped without it. The grid's browser
+SQL with, `PG_TEST_CONN` a PostgreSQL connection string (with a password)
+for the attach test; tests that need one are skipped without it. The grid's browser
 test needs Playwright:
 
 ```sh
