@@ -20,6 +20,7 @@ const { columnar } = require("./lenient-json");
 const results = require("./results");
 const log = require("./log");
 const trust = require("./trust");
+const conninfo = require("./conninfo");
 
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
@@ -183,14 +184,17 @@ class Explorer {
     }
     const nodes = dbs.map((d) => {
       const attached = root.source === "session" && !d.current && d.db !== "temp";
+      // PostgreSQL, SQLite, ...: DuckDB estimates no rows for their tables
+      // (it says 0), and lists each table's row type as a type of its own.
+      const foreign = d.type && d.type !== "duckdb";
       return node("db", d.db, vscode.TreeItemCollapsibleState.Expanded, {
         source: root.source,
         db: d.db,
-        objects: objs.filter((o) => o.db === d.db),
-        extras: extras.filter((x) => x.db === d.db),
+        objects: objs.filter((o) => o.db === d.db).map((o) => (foreign ? { ...o, est: null } : o)),
+        extras: extras.filter((x) => x.db === d.db && !(foreign && x.kind === "type")),
         icon: d.db === "temp" ? "clock" : "database",
         description: describeDb(d),
-        tooltip: d.path ? `${d.db}: ${d.path}` : d.db,
+        tooltip: d.path ? `${d.db}: ${conninfo.redact(d.path)}` : d.db,
         contextValue: attached ? "grebe.attachedDb" : "grebe.db",
       });
     });
@@ -278,11 +282,22 @@ class Explorer {
     return out;
   }
 
-  /** ATTACH a database file to the session, so its tables can be queried. */
+  /** ATTACH a database file, or a PostgreSQL database, to the session, so
+   *  its tables can be queried. From the Explorer it is the file clicked;
+   *  otherwise ask which. */
   async attach(arg) {
     if (!trust.ok("Attaching a database")) return;
     let uri = fileArg(arg);
     if (!uri) {
+      const kind = await vscode.window.showQuickPick(
+        [
+          { label: "$(file) Database file…", description: ".duckdb, .sqlite", postgres: false },
+          { label: "$(server) PostgreSQL…", description: "a connection string", postgres: true },
+        ],
+        { placeHolder: "Attach to the session" },
+      );
+      if (!kind) return;
+      if (kind.postgres) return this.attachPostgres();
       const picked = await vscode.window.showOpenDialog({
         canSelectMany: false,
         openLabel: "Attach",
@@ -300,10 +315,7 @@ class Explorer {
     );
     if (!mode) return;
     const sess = await this.deps.currentSession();
-    const taken = new Set((objects(await sess.run("SELECT database_name AS db FROM duckdb_databases()")) || []).map((d) => d.db));
-    let alias = path.basename(uri.fsPath).replace(/\.[^.]+$/, "").replace(/[^A-Za-z0-9_]/g, "_") || "db";
-    if (/^[0-9]/.test(alias)) alias = `db_${alias}`;
-    while (taken.has(alias)) alias += "_";
+    const alias = await freeAlias(sess, path.basename(uri.fsPath).replace(/\.[^.]+$/, ""));
     // A SQLite file needs saying so; DuckDB loads its sqlite extension.
     const opts = [/\.sqlite3?$/i.test(uri.fsPath) ? "TYPE sqlite" : null, mode.readOnly ? "READ_ONLY" : null].filter(Boolean);
     const sql = `ATTACH ${lit(uri.fsPath)} AS ${ident(alias)}${opts.length ? ` (${opts.join(", ")})` : ""}`;
@@ -315,6 +327,63 @@ class Explorer {
     log.info("catalog", sql);
     this.refresh();
     vscode.window.setStatusBarMessage(`grebe: attached as ${alias}; query it as ${alias}.<table>`, 5000);
+  }
+
+  /** ATTACH a PostgreSQL database by connection string, through DuckDB's
+   *  postgres extension, which is loaded first (and installed if it is not
+   *  yet) so a failure says which step failed. Asks for a password only if
+   *  the server wants one the string does not give. */
+  async attachPostgres() {
+    if (!trust.ok("Attaching a database")) return;
+    const conn = await vscode.window.showInputBox({
+      title: "Attach PostgreSQL Database",
+      prompt: "libpq connection string or URI. Leave the password out to be asked for it, or to use PGPASSWORD or ~/.pgpass.",
+      placeHolder: "dbname=mydb host=localhost port=5432 user=postgres   or   postgresql://postgres@localhost:5432/mydb",
+      ignoreFocusOut: true,
+      validateInput: (v) => (conninfo.isConnection(v.trim()) ? null : "Expected key=value pairs (dbname=... host=...) or a postgresql:// URI"),
+    });
+    if (!conn || !conn.trim()) return;
+    const sess = await this.deps.currentSession();
+    const suggested = await freeAlias(sess, conninfo.aliasFor(conn));
+    const typed = await vscode.window.showInputBox({
+      title: "Attach PostgreSQL Database",
+      prompt: `Name to query it by: ${suggested}.public.<table>`,
+      value: suggested,
+      ignoreFocusOut: true,
+      validateInput: (v) => (v.trim() ? null : "A name is needed"),
+    });
+    if (!typed || !typed.trim()) return;
+    const alias = typed.trim();
+    const where = conninfo.where(conn);
+    const mode = await vscode.window.showQuickPick(
+      [
+        { label: "Read-only", description: "queries can read it; nothing can change it", readOnly: true },
+        { label: "Read and write", description: "CREATE, INSERT, UPDATE and the rest go to PostgreSQL", readOnly: false },
+      ],
+      { placeHolder: `Attach ${where} as ${alias}` },
+    );
+    if (!mode) return;
+    if (!(await loadExtension(sess, "postgres"))) return;
+    const opts = ["TYPE postgres", mode.readOnly ? "READ_ONLY" : null].filter(Boolean).join(", ");
+    const attachSql = (c) => `ATTACH ${lit(c)} AS ${ident(alias)} (${opts})`;
+    let r = await sess.run(attachSql(conn));
+    if (r.kind === "error" && /password/i.test(r.message) && !conninfo.parse(conn).password) {
+      const password = await vscode.window.showInputBox({
+        title: `Password for ${where}`,
+        prompt: "The server asked for a password. It is used for this attach only and is not stored.",
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (password === undefined) return;
+      r = await sess.run(attachSql(conninfo.withPassword(conn, password)));
+    }
+    if (r.kind === "error") {
+      log.report("catalog", `could not attach ${where}: ${r.type} Error: ${r.message}`);
+      return;
+    }
+    log.info("catalog", attachSql(conn));
+    this.refresh();
+    vscode.window.setStatusBarMessage(`grebe: attached ${where} as ${alias}; query it as ${alias}.<schema>.<table>`, 5000);
   }
 
   /** DETACH an attached database from the session. */
@@ -418,6 +487,27 @@ class Explorer {
 
 let nextId = 2e9;
 
+/** `wanted` made into an identifier no database in `sess` already uses. */
+async function freeAlias(sess, wanted) {
+  const taken = new Set((objects(await sess.run("SELECT database_name AS db FROM duckdb_databases()")) || []).map((d) => d.db));
+  let alias = String(wanted).replace(/[^A-Za-z0-9_]/g, "_") || "db";
+  if (/^[0-9]/.test(alias)) alias = `db_${alias}`;
+  while (taken.has(alias)) alias += "_";
+  return alias;
+}
+
+/** LOAD a DuckDB extension, INSTALLing it first if it is not installed.
+ *  Reports what failed and returns false if it could not. */
+async function loadExtension(sess, name) {
+  if ((await sess.run(`LOAD ${name}`)).kind !== "error") return true;
+  log.info("catalog", `INSTALL ${name}`);
+  const installed = await sess.run(`INSTALL ${name}`);
+  const r = installed.kind === "error" ? installed : await sess.run(`LOAD ${name}`);
+  if (r.kind !== "error") return true;
+  log.report("catalog", `could not load DuckDB's ${name} extension: ${r.type} Error: ${r.message}`);
+  return false;
+}
+
 /** What a database is, in a few words: attached or not, its type when it is
  *  not DuckDB, where it lives, and whether it can be written. */
 function describeDb(d) {
@@ -425,7 +515,7 @@ function describeDb(d) {
   const parts = [];
   if (!d.current) parts.push("attached");
   if (d.type && d.type !== "duckdb") parts.push(d.type);
-  if (d.path) parts.push(path.basename(d.path));
+  if (d.path) parts.push(conninfo.where(d.path));
   else if (!d.type || d.type === "duckdb") parts.push("in-memory");
   if (d.readonly) parts.push("read-only");
   return parts.join(" · ");
@@ -480,6 +570,7 @@ function activate(context, deps) {
     })),
     on("browseFile", (uri) => explorer.browseFile(uri)),
     on("attach", (uri) => explorer.attach(uri)),
+    on("attachPostgres", () => explorer.attachPostgres()),
     on("detach", (n) => explorer.detach(n)),
     on("closeFile", (n) => explorer.closeFile(n)),
     on("useAsDatabase", async (arg) => {

@@ -6,11 +6,13 @@
 // DuckDB session and the views without their lines being confused. Commands
 // are registered through `command()`, which catches whatever a handler
 // throws: an unexpected error is logged with its stack and shown, never
-// left in the extension host's own log where nobody looks.
+// left in the extension host's own log where nobody looks. Passwords in
+// connection strings (an ATTACH, DuckDB's errors about one) are redacted.
 
 "use strict";
 
 const vscode = require("vscode");
+const { redact } = require("./conninfo");
 
 let channel = null;
 
@@ -27,7 +29,7 @@ function stamp() {
 /** One line, or several: each gets the time and the tag. */
 function line(tag, text) {
   const out = output();
-  for (const l of String(text).replace(/\s+$/, "").split("\n")) out.appendLine(`[${stamp()}] [${tag}] ${l}`);
+  for (const l of redact(String(text)).replace(/\s+$/, "").split("\n")) out.appendLine(`[${stamp()}] [${tag}] ${l}`);
 }
 
 function info(tag, text) {
@@ -55,7 +57,7 @@ function report(tag, text, more = {}) {
 /** The notification half of report(), for an error already logged. */
 function notify(text, more = {}) {
   const actions = [...Object.keys(more), "Show Output"];
-  Promise.resolve(vscode.window.showErrorMessage(`grebe: ${text}`, ...actions)).then((pick) => {
+  Promise.resolve(vscode.window.showErrorMessage(`grebe: ${redact(text)}`, ...actions)).then((pick) => {
     if (pick === "Show Output") output().show(true);
     else if (pick && more[pick]) more[pick]();
   });
