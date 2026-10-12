@@ -163,6 +163,12 @@
         "icon": "$(plug)"
       },
       {
+        "command": "grebe.catalog.attachPostgres",
+        "title": "Attach PostgreSQL Database…",
+        "category": "grebe: Catalog",
+        "icon": "$(server)"
+      },
+      {
         "command": "grebe.catalog.detach",
         "title": "Detach",
         "category": "grebe: Catalog",

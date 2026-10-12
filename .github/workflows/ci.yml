@@ -12,6 +12,17 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # A PostgreSQL server for the extension's attach-by-connection-string test.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: grebe-test
+          POSTGRES_DB: grebe
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -27,6 +38,7 @@ jobs:
       - name: VS Code extension tests
         env:
           DUCKDB_VERSION: "1.5.5"
+          PG_TEST_CONN: "dbname=grebe host=localhost port=5432 user=postgres password=grebe-test"
         run: |
           set -euo pipefail
           cargo build --bin grebe
