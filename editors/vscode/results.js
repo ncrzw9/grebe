@@ -79,8 +79,8 @@ class Channel {
 
   receive(webview, m) {
     if (!m) return undefined;
-    // The page has loaded (first time, or again after a move): bring it up
-    // to date.
+    // The page has loaded (first time, or again after a move), or has
+    // missed part of the run: bring it up to date.
     if (m.type === "ready") {
       for (const msg of this.log) webview.postMessage(msg);
       return undefined;
@@ -99,8 +99,12 @@ class Channel {
     return undefined;
   }
 
+  // Each message of a run carries `seq`, its place in the log, so a page
+  // that misses one (it was hidden or reloading when it went out) sees the
+  // gap and asks for the run again with "ready".
   post(msg) {
     if (msg.type === "begin") this.log = [];
+    msg.seq = this.log.length;
     this.log.push(msg);
     for (const w of this.webviews) w.postMessage(msg);
   }

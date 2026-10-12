@@ -140,6 +140,9 @@
   }
 
   function addResult(entry) {
+    // No `begin` yet: nothing to add to. (Left in, a result here broke this
+    // page for every later run until it reloaded.)
+    if (!messages) return;
     const r = entry.result;
     if (!tabs.includes(messages)) {
       tabs.push(messages);
@@ -370,7 +373,34 @@
   }
 
   // --- messages -----------------------------------------------------------
+  // A run's messages are numbered from its `begin` (seq 0). One out of
+  // order means some went missing -- the page was hidden or reloading when
+  // they were sent -- so drop the rest and ask the host to replay the run,
+  // once until its `begin` arrives. Messages without seq are taken as is.
+  let next = null;
+  let resyncing = false;
+  function inOrder(data) {
+    if (typeof data.seq !== "number") return true;
+    if (data.type === "begin" && data.seq === 0) {
+      next = 1;
+      resyncing = false;
+      return true;
+    }
+    if (data.seq === next) {
+      next++;
+      return true;
+    }
+    // Already shown: a live message that crossed a replay.
+    if (next !== null && data.seq < next) return false;
+    if (!resyncing) {
+      resyncing = true;
+      vscode.postMessage({ type: "ready" });
+    }
+    return false;
+  }
+
   window.addEventListener("message", ({ data }) => {
+    if (!inOrder(data)) return;
     if (!theme) readTheme();
     if (data.type === "begin") {
       reset(data.header);
