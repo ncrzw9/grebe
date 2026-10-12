@@ -884,6 +884,12 @@ live("results: a page that loads late, or reloads after a move, shows the curren
   assert.match(fakeWebview(shown).html + "", /^$/); // (a fresh fake has no page)
   shown.fromPage({ type: "ready" });
   assert.deepEqual(viewPosted.map((m) => m.type), ["begin", "result", "end"]);
+  // Numbered from the run's begin, so a page that misses one can tell.
+  assert.deepEqual(viewPosted.map((m) => m.seq), [0, 1, 2]);
+  // A page that saw a gap asks again with "ready" and gets the whole run.
+  viewPosted.length = 0;
+  shown.fromPage({ type: "ready" });
+  assert.deepEqual(viewPosted.map((m) => [m.type, m.seq]), [["begin", 0], ["result", 1], ["end", 2]]);
 
   // A second run replaces the first: a page that reloads now (the view was
   // dragged to the side bar) sees only the second.
