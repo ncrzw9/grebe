@@ -203,6 +203,7 @@ class Session {
     this.chunks = [];
     this.err = "";
     this.waiting = null; // { marker, resolve, reject }
+    this.collecting = false; // a statement's marker is in, its stderr may not be
     this.queue = Promise.resolve();
     this.closedWith = null;
     this.starting = false;
@@ -240,7 +241,9 @@ class Session {
       this.err += d;
       // While a statement runs, its stderr is its result (the caller has
       // it); anything else -- start-up, or between statements -- is news.
-      if (this.opts.onStderr && (this.starting || !this.waiting)) this.opts.onStderr(plain(d));
+      // A statement's stderr can still arrive after its marker, until its
+      // result is handed back (`collecting`).
+      if (this.opts.onStderr && (this.starting || (!this.waiting && !this.collecting))) this.opts.onStderr(plain(d));
     });
     proc.on("error", (e) => this.close(spawnMessage(this.opts.cli, e)));
     proc.on("exit", (code, signal) => {
@@ -444,6 +447,7 @@ class Session {
     const rest = all.subarray(at + needle.length);
     this.chunks = rest.length ? [rest] : [];
     this.waiting = null;
+    this.collecting = true;
     const cancelled = w.cancelled || null;
     // stderr and stdout are separate pipes. Anything the CLI wrote to
     // stderr for this statement was written before the marker reached
@@ -451,6 +455,7 @@ class Session {
     setImmediate(() => {
       const err = this.err;
       this.err = "";
+      this.collecting = false;
       w.resolve({ out, err, cancelled });
     });
   }
