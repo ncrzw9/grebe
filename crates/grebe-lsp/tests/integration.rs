@@ -127,63 +127,27 @@ fn full_lifecycle_over_stdio_framing() {
         Some("utf-16")
     );
 
-    // 2. publishDiagnostics from didOpen: exactly one MOD001 finding, at
-    // the byte-exact UTF-16 range of the `*`.
-    let diag1 = messages
-        .iter()
-        .find(|m| m.get("method").and_then(Json::as_str) == Some("textDocument/publishDiagnostics"))
-        .expect("a publishDiagnostics notification for didOpen");
-    let params1 = diag1.get("params").unwrap();
-    assert_eq!(params1.get("uri").unwrap().as_str(), Some(URI));
-    let diags1 = params1.get("diagnostics").unwrap().as_array().unwrap();
-    assert_eq!(diags1.len(), 1, "count(*) must fire exactly MOD001");
-    let d = &diags1[0];
-    assert_eq!(d.get("code").unwrap().as_str(), Some("MOD001"));
-    assert_eq!(d.get("source").unwrap().as_str(), Some("grebe"));
-    assert_eq!(d.get("severity").unwrap().as_f64(), Some(3.0)); // MOD001 is Info
-
-    let star = SQL_HIT.find('*').unwrap() as u32;
-    let (want_start_line, want_start_char) =
-        position::byte_to_position(SQL_HIT, star, Encoding::Utf16);
-    let (want_end_line, want_end_char) =
-        position::byte_to_position(SQL_HIT, star + 1, Encoding::Utf16);
-    let range = d.get("range").unwrap();
-    let start = range.get("start").unwrap();
-    let end = range.get("end").unwrap();
-    assert_eq!(
-        start.get("line").unwrap().as_f64(),
-        Some(f64::from(want_start_line))
-    );
-    assert_eq!(
-        start.get("character").unwrap().as_f64(),
-        Some(f64::from(want_start_char))
-    );
-    assert_eq!(
-        end.get("line").unwrap().as_f64(),
-        Some(f64::from(want_end_line))
-    );
-    assert_eq!(
-        end.get("character").unwrap().as_f64(),
-        Some(f64::from(want_end_char))
-    );
-
-    // 3. publishDiagnostics from didChange: SQL that fires nothing clears
-    // the previous diagnostics (an empty array, not a missing message).
-    let diag2 = messages
+    // 2. Diagnostics: the didOpen and didChange may arrive in one batch
+    // and be linted once, so there are one or two publishes -- but the last
+    // is for the newest text (version 2), where nothing fires: an empty
+    // array, not a missing message, clears what didOpen showed.
+    let publishes: Vec<&Json> = messages
         .iter()
         .filter(|m| {
             m.get("method").and_then(Json::as_str) == Some("textDocument/publishDiagnostics")
         })
-        .nth(1)
-        .expect("a second publishDiagnostics notification for didChange");
-    let diags2 = diag2
-        .get("params")
-        .unwrap()
-        .get("diagnostics")
-        .unwrap()
-        .as_array()
-        .unwrap();
-    assert!(diags2.is_empty(), "count() FROM t must fire nothing");
+        .collect();
+    assert!(
+        matches!(publishes.len(), 1 | 2),
+        "{} publishes",
+        publishes.len()
+    );
+    let last = publishes.last().unwrap().get("params").unwrap();
+    assert_eq!(last.get("uri").unwrap().as_str(), Some(URI));
+    assert_eq!(last.get("version").and_then(Json::as_f64), Some(2.0));
+    let diags = last.get("diagnostics").unwrap().as_array().unwrap();
+    assert!(diags.is_empty(), "count() FROM t must fire nothing");
+    assert!(SQL_HIT != SQL_CLEAN);
 
     // 4. shutdown response: id echoed, null result.
     let shutdown_resp = messages
@@ -194,8 +158,78 @@ fn full_lifecycle_over_stdio_framing() {
 }
 
 #[test]
+fn a_diagnostic_has_the_utf16_range_of_its_finding() {
+    const URI: &str = "file:///range.sql";
+    const SQL: &str = "SELECT '😀', count(*) FROM t";
+    let mut input: Vec<u8> = Vec::new();
+    transport::write_message(
+        &mut input,
+        &request(
+            100,
+            "initialize",
+            Json::object(vec![("capabilities".into(), Json::object(vec![]))]),
+        ),
+    )
+    .unwrap();
+    transport::write_message(
+        &mut input,
+        &notification(
+            "textDocument/didOpen",
+            Json::object(vec![(
+                "textDocument".into(),
+                text_document(
+                    URI,
+                    vec![
+                        ("version".to_string(), Json::num(1)),
+                        ("text".to_string(), Json::str(SQL)),
+                    ],
+                ),
+            )]),
+        ),
+    )
+    .unwrap();
+    transport::write_message(&mut input, &request(2, "shutdown", Json::Null)).unwrap();
+    transport::write_message(&mut input, &notification("exit", Json::Null)).unwrap();
+
+    let mut output: Vec<u8> = Vec::new();
+    assert_eq!(server::run(Cursor::new(input), &mut output), 0);
+    let messages = read_all_messages(output);
+    let publish = messages
+        .iter()
+        .find(|m| m.get("method").and_then(Json::as_str) == Some("textDocument/publishDiagnostics"))
+        .expect("a publishDiagnostics notification for didOpen");
+    let params = publish.get("params").unwrap();
+    assert_eq!(params.get("version").and_then(Json::as_f64), Some(1.0));
+    let diags = params.get("diagnostics").unwrap().as_array().unwrap();
+    assert_eq!(diags.len(), 1, "count(*) must fire exactly MOD001");
+    let d = &diags[0];
+    assert_eq!(d.get("code").unwrap().as_str(), Some("MOD001"));
+    assert_eq!(d.get("source").unwrap().as_str(), Some("grebe"));
+    assert_eq!(d.get("severity").unwrap().as_f64(), Some(3.0)); // MOD001 is Info
+
+    // The `*`, in UTF-16 units: the emoji before it is two of them.
+    let star = SQL.find('*').unwrap() as u32;
+    let range = d.get("range").unwrap();
+    for (key, at) in [("start", star), ("end", star + 1)] {
+        let (line, ch) = position::byte_to_position(SQL, at, Encoding::Utf16);
+        let p = range.get(key).unwrap();
+        assert_eq!(p.get("line").unwrap().as_f64(), Some(f64::from(line)));
+        assert_eq!(p.get("character").unwrap().as_f64(), Some(f64::from(ch)));
+    }
+}
+
+#[test]
 fn unknown_method_request_gets_method_not_found() {
     let mut input: Vec<u8> = Vec::new();
+    transport::write_message(
+        &mut input,
+        &request(
+            100,
+            "initialize",
+            Json::object(vec![("capabilities".into(), Json::object(vec![]))]),
+        ),
+    )
+    .unwrap();
     transport::write_message(&mut input, &request(1, "totally/unknown", Json::Null)).unwrap();
     transport::write_message(&mut input, &request(2, "shutdown", Json::Null)).unwrap();
     transport::write_message(&mut input, &notification("exit", Json::Null)).unwrap();
@@ -218,6 +252,15 @@ fn unknown_method_request_gets_method_not_found() {
 #[test]
 fn malformed_json_does_not_kill_the_server() {
     let mut input: Vec<u8> = Vec::new();
+    transport::write_message(
+        &mut input,
+        &request(
+            100,
+            "initialize",
+            Json::object(vec![("capabilities".into(), Json::object(vec![]))]),
+        ),
+    )
+    .unwrap();
     // A syntactically broken body, well-framed at the transport level.
     transport::write_message(&mut input, "{ this is not json").unwrap();
     transport::write_message(&mut input, &request(1, "shutdown", Json::Null)).unwrap();
