@@ -50,18 +50,21 @@ fn child(tree: &Tree, id: NodeId, rule: &str) -> Option<NodeId> {
     found
 }
 
-/// Strip one layer of quoting from an identifier and lowercase it.
-///
-/// Comparison for MOD009 is case-insensitive and quote-insensitive on both
-/// sides, so `"Foo"` and `foo` are the same identifier.
+/// Strip one layer of quoting from an identifier and lowercase it, so
+/// `"Foo"` and `foo` are the same identifier.
 fn ident(raw: &str) -> String {
+    spelling(raw).to_ascii_lowercase()
+}
+
+/// An identifier as written, with one layer of quoting stripped: what a
+/// result column is called when it is the alias. Case matters there.
+fn spelling(raw: &str) -> String {
     let t = raw.trim();
-    let unquoted = if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
         t[1..t.len() - 1].replace("\"\"", "\"")
     } else {
         t.to_string()
-    };
-    unquoted.to_ascii_lowercase()
+    }
 }
 
 /// The `id`'s nearest descendant produced by `rule` whose span exactly
@@ -263,7 +266,11 @@ pub fn self_alias(tree: &Tree, src: &str) -> Vec<Finding> {
         let Some(label) = child(tree, n, "ColLabelOrString") else {
             continue;
         };
-        let alias = ident(text(tree, label, src));
+        // An output column is named by its alias as written, or without
+        // one by the column's catalog spelling: `Foo AS foo` renames, and
+        // so may `foo AS foo` when the column is `Foo`. Only an alias spelled
+        // exactly like the reference is redundant.
+        let alias = spelling(text(tree, label, src));
         if alias.is_empty() {
             continue;
         }
@@ -291,11 +298,11 @@ pub fn self_alias(tree: &Tree, src: &str) -> Vec<Finding> {
             continue;
         }
 
-        // Compare the reference's last dotted component, case- and
-        // quote-insensitively.
+        // Compare the reference's last dotted component, quote-insensitively
+        // but case-sensitively.
         let expr_text = text(tree, expr, src);
         let last = expr_text.trim().rsplit('.').next().unwrap_or("");
-        if !last.is_empty() && ident(last) == alias {
+        if !last.is_empty() && spelling(last) == alias {
             out.push(Finding {
                 code: "MOD009",
                 span: tree.node(n).span,
@@ -686,12 +693,10 @@ mod tests {
         for sql in [
             "SELECT foo AS foo FROM t",
             "SELECT t.foo AS foo FROM t",
-            "SELECT \"Foo\" AS foo FROM t",
-            // Case-insensitive on both sides.
-            "SELECT FOO AS foo FROM t",
+            "SELECT \"Foo\" AS Foo FROM t",
             // Quote-insensitive on both sides -- the alias, not just the
             // expression, may be quoted.
-            "SELECT foo AS \"Foo\" FROM t",
+            "SELECT foo AS \"foo\" FROM t",
             // A comment between the expression and `AS`, or between `AS`
             // and the alias, must not throw off the comparison -- the fix
             // must read the CST's own child spans, not slice source text.
@@ -703,6 +708,13 @@ mod tests {
         for sql in [
             "SELECT foo AS bar FROM t",
             "SELECT 1 AS one FROM t",
+            // A different case is a rename: the result column is called
+            // what the alias says, not what the table says.
+            "SELECT Foo AS foo FROM t",
+            "SELECT FOO AS foo FROM t",
+            "SELECT \"Foo\" AS foo FROM t",
+            "SELECT foo AS \"Foo\" FROM t",
+            "SELECT bar AS BAR FROM t",
             // A computation that merely ENDS in the alias name is not a
             // redundant alias -- the case the bare-reference guard is for.
             "SELECT fib.a + fib.next AS next FROM fib",

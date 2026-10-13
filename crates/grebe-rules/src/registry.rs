@@ -206,8 +206,9 @@ pub static RULES: &[Rule] = &[
         code: "MOD009",
         name: "self-alias",
         category: Category::Mod,
-        // Safe: fires only on a bare column reference whose own name matches
-        // the alias, ignoring case and quotes.
+        // Safe: fires only on a bare column reference spelled exactly like
+        // its alias (quotes aside). A different case is a rename: the result
+        // column takes the alias's spelling, not the table's.
         default_severity: Severity::Info,
         fix_safety: FixSafety::Safe,
         message: "Aliasing a column to its own name is redundant.",
