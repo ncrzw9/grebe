@@ -556,8 +556,9 @@ fn run() -> i32 {
 
             unparsed += grebe_rules::analysis::unparsed_count(&src);
 
+            let lines = line_starts(&src);
             for fnd in findings {
-                let (line, col) = line_col(&src, fnd.span.start as usize);
+                let (line, col) = line_col(&src, &lines, fnd.span.start as usize);
                 let rule = grebe_rules::lookup(fnd.code);
                 let name = rule.map_or("", |r| r.name);
                 // The exit code and the reported severity key on the
@@ -904,15 +905,21 @@ fn print_rules_table() {
     );
 }
 
+/// Byte offset of the start of every line, for [`line_col`].
+fn line_starts(src: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+        .collect()
+}
+
 /// Byte offset -> 1-based line and column, counting columns in characters so
-/// the number matches what an editor shows.
-fn line_col(src: &str, off: usize) -> (usize, usize) {
-    let head = &src[..off.min(src.len())];
-    let line = head.matches('\n').count() + 1;
-    let col = head
-        .rsplit('\n')
-        .next()
-        .map_or(1, |l| l.chars().count() + 1);
+/// the number matches what an editor shows. A search of `lines`
+/// ([`line_starts`]) rather than a scan from the top of the file: one scan
+/// per finding made a file with many findings quadratic.
+fn line_col(src: &str, lines: &[usize], off: usize) -> (usize, usize) {
+    let off = off.min(src.len());
+    let line = lines.partition_point(|&start| start <= off);
+    let col = src[lines[line - 1]..off].chars().count() + 1;
     (line, col)
 }
 
