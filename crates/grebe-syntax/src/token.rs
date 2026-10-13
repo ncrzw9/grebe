@@ -102,7 +102,9 @@ fn is_word_char(c: char) -> bool {
         && c != ':'
 }
 
-fn string_end(bytes: &[u8], mut j: usize, esc: bool) -> usize {
+/// Where a single-quoted string ends, and whether its closing quote was
+/// found. An unclosed one runs to the end of the input.
+fn string_end(bytes: &[u8], mut j: usize, esc: bool) -> (usize, bool) {
     let n = bytes.len();
     while j < n {
         if esc && bytes[j] == b'\\' {
@@ -114,11 +116,19 @@ fn string_end(bytes: &[u8], mut j: usize, esc: bool) -> usize {
                 j += 2;
                 continue;
             }
-            return j + 1;
+            return (j + 1, true);
         }
         j += 1;
     }
-    n
+    (n, false)
+}
+
+/// A string, quoted identifier or block comment missing its closing
+/// delimiter runs to the end of the input as [`TokenKind::Unlexed`], which
+/// no grammar rule accepts: DuckDB rejects it, so the statement must fail to
+/// parse rather than be linted or formatted as if it ended somewhere.
+const fn closed_or_unlexed(kind: TokenKind, closed: bool) -> TokenKind {
+    if closed { kind } else { TokenKind::Unlexed }
 }
 
 fn parse_number(bytes: &[u8], start: usize) -> usize {
@@ -175,9 +185,9 @@ pub fn tokenize(src: &str) -> Vec<Token> {
 
         // String
         if c == '\'' {
-            let end = string_end(bytes, i + 1, false);
+            let (end, closed) = string_end(bytes, i + 1, false);
             tokens.push(Token {
-                kind: TokenKind::String,
+                kind: closed_or_unlexed(TokenKind::String, closed),
                 span: Span::new(start as u32, end as u32),
             });
             i = end;
@@ -199,7 +209,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             }
             let end = if j < n { j + 1 } else { n };
             tokens.push(Token {
-                kind: TokenKind::QuotedIdent,
+                kind: closed_or_unlexed(TokenKind::QuotedIdent, j < n),
                 span: Span::new(start as u32, end as u32),
             });
             i = end;
@@ -244,16 +254,18 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             if j < n && bytes[j] == b'$' && j > i {
                 let marker = &bytes[i..=j];
                 let mut end = n;
+                let mut closed = false;
                 let mut k = j + 1;
                 while k + marker.len() <= n {
                     if &bytes[k..k + marker.len()] == marker {
                         end = k + marker.len();
+                        closed = true;
                         break;
                     }
                     k += 1;
                 }
                 tokens.push(Token {
-                    kind: TokenKind::String,
+                    kind: closed_or_unlexed(TokenKind::String, closed),
                     span: Span::new(start as u32, end as u32),
                 });
                 i = end;
@@ -296,7 +308,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                 }
             }
             tokens.push(Token {
-                kind: TokenKind::BlockComment,
+                kind: closed_or_unlexed(TokenKind::BlockComment, depth == 0),
                 span: Span::new(start as u32, j as u32),
             });
             i = j;
@@ -360,9 +372,9 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             && bytes[i + 1] == b'\''
         {
             let is_escape = c == 'e' || c == 'E';
-            let end = string_end(bytes, i + 2, is_escape);
+            let (end, closed) = string_end(bytes, i + 2, is_escape);
             tokens.push(Token {
-                kind: TokenKind::String,
+                kind: closed_or_unlexed(TokenKind::String, closed),
                 span: Span::new(start as u32, end as u32),
             });
             i = end;
