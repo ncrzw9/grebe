@@ -886,10 +886,12 @@ live("results: a page that loads late, or reloads after a move, shows the curren
   assert.deepEqual(viewPosted.map((m) => m.type), ["begin", "result", "end"]);
   // Numbered from the run's begin, so a page that misses one can tell.
   assert.deepEqual(viewPosted.map((m) => m.seq), [0, 1, 2]);
-  // A page that saw a gap asks again with "ready" and gets the whole run.
+  // A page that saw a gap asks again with "ready" and gets the whole run;
+  // what it missed goes to the log, since why pages miss is not yet known.
   viewPosted.length = 0;
-  shown.fromPage({ type: "ready" });
+  shown.fromPage({ type: "ready", missed: { type: "end", seq: 2, expected: null } });
   assert.deepEqual(viewPosted.map((m) => [m.type, m.seq]), [["begin", 0], ["result", 1], ["end", 2]]);
+  assert.match(shown.log.join(""), /results page missed part of a run \(got end #2, expected #begin; the Results view/);
 
   // A second run replaces the first: a page that reloads now (the view was
   // dragged to the side bar) sees only the second.

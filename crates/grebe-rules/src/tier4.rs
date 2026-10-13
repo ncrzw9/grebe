@@ -240,7 +240,9 @@ fn window_frame_contents(tree: &Tree, over: NodeId) -> Option<NodeId> {
 ///
 /// No fix: grebe has no catalog, so it cannot know whether the subquery's
 /// column is actually nullable -- only that the shape is one `NULL` away
-/// from silently wrong.
+/// from silently wrong. A subquery that already filters its one column with
+/// a top-level `IS NOT NULL` is the advice taken, and stays silent
+/// ([`excludes_nulls`]).
 pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for op in tree.find("BetweenInLikeOp") {
@@ -258,11 +260,11 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
         let Some(in_clause) = child(tree, wrapper, "InClause") else {
             continue;
         };
-        let has_subquery = tree
+        let subquery = tree
             .descendants(in_clause)
             .into_iter()
-            .any(|n| tree.rule_name(n) == "InSelectStatement");
-        if has_subquery {
+            .find(|&n| tree.rule_name(n) == "InSelectStatement");
+        if subquery.is_some_and(|sub| !excludes_nulls(tree, sub, src)) {
             out.push(Finding {
                 code: "MOD028",
                 span: tree.node(op).span,
@@ -271,6 +273,78 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Does `subquery` already do what MOD028 advises -- one plain `SELECT` of
+/// one column whose own top-level `WHERE` requires `<that column> IS NOT
+/// NULL`? Then its result has no `NULL` and `NOT IN` is safe. A `UNION`,
+/// an `OR`, or anything but a bare column keeps the finding.
+fn excludes_nulls(tree: &Tree, subquery: NodeId, src: &str) -> bool {
+    let selects: Vec<NodeId> = tree
+        .descendants(subquery)
+        .into_iter()
+        .filter(|&n| tree.rule_name(n) == "SimpleSelect")
+        .collect();
+    let [select] = selects.as_slice() else {
+        return false;
+    };
+    let Some(targets) = top_level_find(tree, *select, "TargetList")
+        .into_iter()
+        .next()
+    else {
+        return false;
+    };
+    let items: Vec<NodeId> = tree
+        .children(targets)
+        .iter()
+        .copied()
+        .filter(|&c| tree.rule_name(c) == "AliasedExpression")
+        .collect();
+    let [item] = items.as_slice() else {
+        return false;
+    };
+    let column = tree.text(*item, src).trim();
+    let bare = |t: &str| {
+        !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"'))
+    };
+    if !bare(column) {
+        return false;
+    }
+    let name = |t: &str| {
+        t.rsplit('.')
+            .next()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_lowercase()
+    };
+    let Some(where_clause) = top_level_find(tree, *select, "WhereClause")
+        .into_iter()
+        .next()
+    else {
+        return false;
+    };
+    let Some(expr) = child(tree, where_clause, "Expression") else {
+        return false;
+    };
+    let Some(or_expr) = descend_single(tree, expr, "LogicalOrExpression") else {
+        return false;
+    };
+    if tree.children(or_expr).len() > 1 {
+        return false;
+    }
+    and_chain_operands(tree, or_expr)
+        .into_iter()
+        .any(|operand| {
+            let words: Vec<String> = tree
+                .text(operand, src)
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
+            matches!(words.as_slice(), [c, is, not, null]
+            if is == "is" && not == "not" && null == "null" && bare(c) && name(c) == name(column))
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -794,6 +868,27 @@ mod tests {
             "SELECT * FROM a WHERE a.id NOT IN (1, 2, 3)"
         ));
         assert!(!fires("MOD028", "SELECT * FROM a WHERE a.id IN (1, 2, 3)"));
+    }
+
+    #[test]
+    fn mod028_is_silent_when_the_subquery_already_excludes_nulls() {
+        for sql in [
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT id FROM b WHERE id IS NOT NULL)",
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT b.id FROM b WHERE b.x > 1 AND b.id IS NOT NULL)",
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT \"Id\" FROM b WHERE id is not null)",
+        ] {
+            assert!(!fires("MOD028", sql), "should NOT fire: {sql}");
+        }
+        for sql in [
+            // The guard is on another column, or only one side of an OR.
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT id FROM b WHERE x IS NOT NULL)",
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT id FROM b WHERE id IS NOT NULL OR x = 1)",
+            // A computed column, or a UNION whose other arm can be NULL.
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT id + 1 FROM b WHERE id IS NOT NULL)",
+            "SELECT * FROM a WHERE a.id NOT IN (SELECT id FROM b WHERE id IS NOT NULL UNION ALL SELECT id FROM c)",
+        ] {
+            assert!(fires("MOD028", sql), "should fire: {sql}");
+        }
     }
 
     // -- MOD029 filter-defeats-outer-join -----------------------------------

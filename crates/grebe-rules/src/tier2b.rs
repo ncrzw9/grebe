@@ -942,6 +942,13 @@ pub fn unused_cte(tree: &Tree, src: &str) -> Vec<Finding> {
     out
 }
 
+/// Aggregates that take a `NULL` input as a value rather than skipping it,
+/// so `agg(CASE WHEN c THEN x END)` and `agg(x) FILTER (WHERE c)` differ
+/// even without an `ELSE`: `list` keeps the NULLs as elements, `first` can
+/// pick one. Found by comparing the two forms for every aggregate in
+/// `vendor/aggregates.list` against DuckDB 1.5.5; MOD014 skips them.
+const KEEPS_NULLS: &[&str] = &["list", "array_agg", "first", "last", "arbitrary"];
+
 /// MOD014 case-to-filter: `agg(CASE WHEN c THEN x [ELSE k] END)` — an
 /// aggregate over a single-branch CASE — can be `agg(x) FILTER (WHERE c)`.
 ///
@@ -977,7 +984,7 @@ pub fn case_to_filter(tree: &Tree, src: &str) -> Vec<Finding> {
             continue;
         };
         let name = ident(tree.text(func_id, src));
-        if !AGGREGATE_FUNCTIONS.contains(name.as_str()) {
+        if !AGGREGATE_FUNCTIONS.contains(name.as_str()) || KEEPS_NULLS.contains(&name.as_str()) {
             continue;
         }
         if tree.children(func).iter().any(|&c| {
@@ -1318,6 +1325,12 @@ mod tests {
             "SELECT sum(CASE WHEN a THEN x ELSE other_col END) FROM t",
             // wrapping function is not an aggregate
             "SELECT upper(CASE WHEN a THEN 'x' END) FROM t",
+            // aggregates that keep NULL inputs: FILTER would change them
+            "SELECT list(CASE WHEN a THEN x END) FROM t",
+            "SELECT array_agg(CASE WHEN a THEN x END) FROM t",
+            "SELECT first(CASE WHEN a THEN x END) FROM t",
+            "SELECT LAST(CASE WHEN a THEN x END) FROM t",
+            "SELECT arbitrary(CASE WHEN a THEN x END) FROM t",
             // more than one argument to the aggregate
             "SELECT sum(CASE WHEN a THEN x END, 5) FROM t",
             // no CASE at all

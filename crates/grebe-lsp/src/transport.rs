@@ -33,8 +33,12 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
-            // Blank line ends the header block. If we never saw a header
-            // line before it, there is nothing to frame — malformed.
+            // A blank line ends the header block -- but one before any
+            // header is a stray line ending between messages: skip it
+            // rather than end the session over it.
+            if !header_seen {
+                continue;
+            }
             break;
         }
         header_seen = true;
@@ -157,5 +161,11 @@ mod tests {
     fn a_body_shorter_than_its_content_length_is_an_error() {
         let mut cursor = Cursor::new(b"Content-Length: 10\r\n\r\n{}".to_vec());
         assert!(read_message(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn a_stray_blank_line_between_messages_is_skipped() {
+        let mut cursor = Cursor::new(b"\r\n\r\nContent-Length: 1\r\n\r\n1".to_vec());
+        assert_eq!(read_message(&mut cursor).unwrap().unwrap(), b"1");
     }
 }

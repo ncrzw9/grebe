@@ -82,6 +82,15 @@ class Channel {
     // The page has loaded (first time, or again after a move), or has
     // missed part of the run: bring it up to date.
     if (m.type === "ready") {
+      // A page that saw a gap says what it missed. Why pages miss messages
+      // is not yet known, so each one is logged with where the page was.
+      if (m.missed) {
+        log.info(
+          "grid",
+          `results page missed part of a run (got ${m.missed.type} #${m.missed.seq}, ` +
+            `expected #${m.missed.expected ?? "begin"}; ${this.describe(webview)}); replaying it`,
+        );
+      }
       for (const msg of this.log) webview.postMessage(msg);
       return undefined;
     }
@@ -102,6 +111,13 @@ class Channel {
   // Each message of a run carries `seq`, its place in the log, so a page
   // that misses one (it was hidden or reloading when it went out) sees the
   // gap and asks for the run again with "ready".
+  /** Where `webview` is shown, for the log. */
+  describe(webview) {
+    if (view && view.webview === webview) return `the Results view, ${view.visible ? "visible" : "hidden"}`;
+    if (panel && panel.webview === webview) return `the editor tab, ${panel.visible ? "visible" : "hidden"}`;
+    return "a data file's tab";
+  }
+
   post(msg) {
     if (msg.type === "begin") this.log = [];
     msg.seq = this.log.length;

@@ -33,7 +33,9 @@ pub mod transport;
 /// otherwise (premature EOF, `exit` without `shutdown`).
 #[must_use]
 pub fn serve() -> i32 {
-    let stdin = std::io::stdin();
+    // The reader runs on its own thread (see `server::run`), so it gets an
+    // owned reader rather than a lock on stdin.
+    let stdin = std::io::BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
-    server::run(stdin.lock(), stdout.lock())
+    server::run(stdin, stdout.lock())
 }
