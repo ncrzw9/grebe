@@ -151,6 +151,24 @@ pub fn print(doc: &Doc, width_limit: usize, indent_size: usize) -> String {
     while let Some((ind, mode, d)) = stack.pop() {
         match d {
             Doc::Nil | Doc::BreakParent => {}
+            // A deferred line comment must end its line before the next
+            // code, not after it: with no break between them (`WHERE -- c`
+            // then `x`, joined by a plain space), the comment would land
+            // after `x`, and the next run would attach it there -- then lay
+            // the statement out differently. The space is dropped; the code
+            // starts the next line. A `,` or `;` still closes the line it
+            // ends, before the comment: `a, -- c` is where the next run
+            // finds that comment, so it stays put.
+            Doc::Text(s) if pending_break && s.trim().is_empty() => {}
+            Doc::Text(s) if pending_break && !s.is_empty() && s != "," && s != ";" => {
+                newline(&mut out, &mut suffix, ind, indent_size, &mut pos);
+                pending_break = false;
+                out.push_str(s);
+                pos = match s.rfind('\n') {
+                    Some(i) => width(&s[i + 1..]),
+                    None => pos + width(s),
+                };
+            }
             Doc::Text(s) => {
                 out.push_str(s);
                 pos = match s.rfind('\n') {
