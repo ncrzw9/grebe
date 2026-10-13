@@ -46,7 +46,7 @@
 //!
 //! Exit codes: 0 clean (or findings that are all below error), 1 findings at
 //! error severity (or, for `format --check`, a file that would change), 2
-//! usage or config error.
+//! usage or config error, or a file that could not be read or written.
 
 mod setup;
 
@@ -319,14 +319,19 @@ fn run() -> i32 {
         // Formatting is per file and pure, so it runs on every core; writing
         // and reporting stay sequential, in path order.
         let formatted = par_map(&files, |f| {
-            let src = std::fs::read_to_string(f).ok()?;
+            let src = std::fs::read_to_string(f).map_err(|e| e.to_string())?;
             let out = grebe_format::format(&src, &opts);
-            Some((src, out))
+            Ok::<_, String>((src, out))
         });
+        let mut unreadable = 0usize;
         for (f, result) in files.iter().zip(formatted) {
-            let Some((src, out)) = result else {
-                eprintln!("grebe format: could not read {}", f.display());
-                continue;
+            let (src, out) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("grebe format: could not read {}: {e}", f.display());
+                    unreadable += 1;
+                    continue;
+                }
             };
             if out == src {
                 unchanged += 1;
@@ -347,6 +352,9 @@ fn run() -> i32 {
             eprintln!("\n{changed} file(s) would be reformatted, {unchanged} unchanged");
         } else {
             eprintln!("\n{changed} file(s) reformatted, {unchanged} unchanged");
+        }
+        if unreadable > 0 {
+            return 2;
         }
         return i32::from(want_check && changed > 0);
     }
@@ -488,7 +496,7 @@ fn run() -> i32 {
         // core. Writing, counting and printing stay sequential, in path
         // order, so output and failure behaviour do not depend on timing.
         let analysed = par_map(&files, |f| {
-            let src = std::fs::read_to_string(f).ok()?;
+            let src = std::fs::read_to_string(f).map_err(|e| e.to_string())?;
             // One shared pipeline (`grebe_rules::analysis`) -- whole-file
             // parse, per-statement fallback, `--select`/config selection,
             // and suppression comments. The LSP calls the same function, so
@@ -505,12 +513,19 @@ fn run() -> i32 {
                     .map(|out| grebe_rules::analysis::analyze(out, &selection));
                 (done, after)
             });
-            Some((src, findings, fixed))
+            Ok::<_, String>((src, findings, fixed))
         });
+        // A file that cannot be read (missing, or not UTF-8) is not a clean
+        // file: it fails the run, as an I/O error, instead of passing CI.
+        let mut unreadable = 0usize;
         for (f, result) in files.iter().zip(analysed) {
-            let Some((src, findings, fixed)) = result else {
-                eprintln!("grebe check: could not read {}", f.display());
-                continue;
+            let (src, findings, fixed) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("grebe check: could not read {}: {e}", f.display());
+                    unreadable += 1;
+                    continue;
+                }
             };
             let mut src = src;
             let mut findings = findings;
@@ -541,8 +556,9 @@ fn run() -> i32 {
 
             unparsed += grebe_rules::analysis::unparsed_count(&src);
 
+            let lines = line_starts(&src);
             for fnd in findings {
-                let (line, col) = line_col(&src, fnd.span.start as usize);
+                let (line, col) = line_col(&src, &lines, fnd.span.start as usize);
                 let rule = grebe_rules::lookup(fnd.code);
                 let name = rule.map_or("", |r| r.name);
                 // The exit code and the reported severity key on the
@@ -638,6 +654,9 @@ fn run() -> i32 {
         // treating every finding as failure would make `check`
         // useless as a CI gate. A clean parse with only MOD findings must
         // still exit 0 unless a config promoted one to `error`.
+        if unreadable > 0 {
+            return 2;
+        }
         return i32::from(errors > 0);
     }
 
@@ -680,7 +699,8 @@ fn print_top_help() {
     outln!("  0   no findings, or every finding is below error severity");
     outln!("  1   at least one finding at error severity, or format --check");
     outln!("      found a file that would change");
-    outln!("  2   usage or config error");
+    outln!("  2   usage or config error, or a file that could not be read");
+    outln!("      (missing, or not UTF-8) or written");
 }
 
 /// `grebe format --help`.
@@ -885,15 +905,21 @@ fn print_rules_table() {
     );
 }
 
+/// Byte offset of the start of every line, for [`line_col`].
+fn line_starts(src: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+        .collect()
+}
+
 /// Byte offset -> 1-based line and column, counting columns in characters so
-/// the number matches what an editor shows.
-fn line_col(src: &str, off: usize) -> (usize, usize) {
-    let head = &src[..off.min(src.len())];
-    let line = head.matches('\n').count() + 1;
-    let col = head
-        .rsplit('\n')
-        .next()
-        .map_or(1, |l| l.chars().count() + 1);
+/// the number matches what an editor shows. A search of `lines`
+/// ([`line_starts`]) rather than a scan from the top of the file: one scan
+/// per finding made a file with many findings quadratic.
+fn line_col(src: &str, lines: &[usize], off: usize) -> (usize, usize) {
+    let off = off.min(src.len());
+    let line = lines.partition_point(|&start| start <= off);
+    let col = src[lines[line - 1]..off].chars().count() + 1;
     (line, col)
 }
 

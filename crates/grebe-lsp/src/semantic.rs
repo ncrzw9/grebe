@@ -147,11 +147,13 @@ fn refine_with_cst(src: &str, base: &mut [Classified]) {
         let Some(role) = role_of(tree.rule_name(id)) else {
             continue;
         };
+        // `base` is in source order, one entry per token: the token that
+        // starts where the node starts is the only candidate. (A scan of
+        // every token for every node was quadratic in the file.)
         let span = tree.node(id).span;
-        for c in base.iter_mut() {
-            if c.span == span {
-                c.ty = role;
-            }
+        let i = base.partition_point(|c| c.span.start < span.start);
+        if let Some(c) = base.get_mut(i).filter(|c| c.span == span) {
+            c.ty = role;
         }
     }
 }
@@ -164,8 +166,9 @@ fn refine_with_cst(src: &str, base: &mut [Classified]) {
 pub fn encode(src: &str, enc: Encoding) -> Vec<u32> {
     let toks = tokenize(src);
     let mut classified = classify_tokens(src, &toks);
-    refine_with_cst(src, &mut classified);
     classified.sort_by_key(|c| c.span.start);
+    refine_with_cst(src, &mut classified);
+    let lines = position::LineIndex::new(src);
 
     let mut data: Vec<u32> = Vec::new();
     let mut prev_line = 0u32;
@@ -176,7 +179,7 @@ pub fn encode(src: &str, enc: Encoding) -> Vec<u32> {
         // emitted once per line. Always split, never rely on the client's
         // `multilineTokenSupport` — splitting is valid for
         // every client, so there is no capability to negotiate.
-        for (line, start_char, len) in split_lines(src, c.span, enc) {
+        for (line, start_char, len) in split_lines(src, &lines, c.span, enc) {
             if len == 0 {
                 continue;
             }
@@ -196,9 +199,14 @@ pub fn encode(src: &str, enc: Encoding) -> Vec<u32> {
 
 /// Split `span` into `(line, start_char, length)` per line it covers, with
 /// character offsets and lengths in the negotiated encoding's units.
-fn split_lines(src: &str, span: Span, enc: Encoding) -> Vec<(u32, u32, u32)> {
-    let (start_line, start_char) = position::byte_to_position(src, span.start, enc);
-    let (end_line, end_char) = position::byte_to_position(src, span.end, enc);
+fn split_lines(
+    src: &str,
+    lines: &position::LineIndex,
+    span: Span,
+    enc: Encoding,
+) -> Vec<(u32, u32, u32)> {
+    let (start_line, start_char) = lines.position(src, span.start, enc);
+    let (end_line, end_char) = lines.position(src, span.end, enc);
 
     if start_line == end_line {
         return vec![(start_line, start_char, end_char.saturating_sub(start_char))];
@@ -216,14 +224,14 @@ fn split_lines(src: &str, span: Span, enc: Encoding) -> Vec<(u32, u32, u32)> {
         .filter(|(_, b)| **b == b'\n')
     {
         let nl = (lo + off) as u32;
-        let (_, s) = position::byte_to_position(src, seg_start, enc);
-        let (_, e) = position::byte_to_position(src, nl, enc);
+        let (_, s) = lines.position(src, seg_start, enc);
+        let (_, e) = lines.position(src, nl, enc);
         out.push((line, s, e.saturating_sub(s)));
         line += 1;
         seg_start = nl + 1;
     }
     // The final partial line.
-    let (_, s) = position::byte_to_position(src, seg_start, enc);
+    let (_, s) = lines.position(src, seg_start, enc);
     out.push((line, s, end_char.saturating_sub(s)));
     out
 }

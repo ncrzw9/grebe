@@ -93,6 +93,7 @@ impl std::fmt::Display for JsonError {
 pub fn parse(input: &str) -> Result<Json, JsonError> {
     let mut p = Parser {
         chars: input.chars().peekable(),
+        depth: 0,
     };
     p.skip_ws();
     let v = p.value()?;
@@ -103,8 +104,15 @@ pub fn parse(input: &str) -> Result<Json, JsonError> {
     Ok(v)
 }
 
+/// How deeply arrays and objects may nest. The parser recurses once per
+/// level, so without a ceiling a message of a few MB of `[` overflows the
+/// stack, which aborts the server -- not an error it can answer. LSP
+/// messages nest a handful of levels.
+const MAX_DEPTH: u32 = 256;
+
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    depth: u32,
 }
 
 impl Parser<'_> {
@@ -138,8 +146,21 @@ impl Parser<'_> {
         self.skip_ws();
         match self.chars.peek() {
             Some('"') => self.string().map(Json::String),
-            Some('{') => self.object(),
-            Some('[') => self.array(),
+            Some('{' | '[') if self.depth >= MAX_DEPTH => Err(JsonError(format!(
+                "nested more than {MAX_DEPTH} levels deep"
+            ))),
+            Some('{') => {
+                self.depth += 1;
+                let v = self.object();
+                self.depth -= 1;
+                v
+            }
+            Some('[') => {
+                self.depth += 1;
+                let v = self.array();
+                self.depth -= 1;
+                v
+            }
             Some('t') => self.expect_literal("true", Json::Bool(true)),
             Some('f') => self.expect_literal("false", Json::Bool(false)),
             Some('n') => self.expect_literal("null", Json::Null),
@@ -443,5 +464,15 @@ mod tests {
         let v = parse(r#"{"x":1,"y":2}"#).unwrap();
         assert_eq!(v.get("y").unwrap().as_f64(), Some(2.0));
         assert!(v.get("z").is_none());
+    }
+
+    #[test]
+    fn nesting_is_capped_instead_of_overflowing_the_stack() {
+        let deep = format!("{}{}", "[".repeat(2_000_000), "]".repeat(2_000_000));
+        assert!(parse(&deep).is_err());
+        let ok = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert!(parse(&ok).is_ok());
+        let objects = format!("{}1{}", r#"{"a":"#.repeat(300), "}".repeat(300));
+        assert!(parse(&objects).is_err());
     }
 }

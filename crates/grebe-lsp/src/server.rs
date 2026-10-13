@@ -439,12 +439,18 @@ fn handle_did_change<W: Write>(params: &Json, state: &mut State, writer: &mut W)
     else {
         return;
     };
-    // Full sync: the client sends the whole new text as the single element
-    // of `contentChanges` (no `range` field to apply incrementally).
+    // A change to a document that is not open (it arrived after didClose)
+    // must not bring it back and publish diagnostics for a closed file.
+    if !state.documents.contains_key(uri) {
+        return;
+    }
+    // Full sync: each element of `contentChanges` is the whole new text (no
+    // `range` to apply incrementally); they apply in order, so the last one
+    // is the document now.
     let Some(text) = params
         .get("contentChanges")
         .and_then(Json::as_array)
-        .and_then(|arr| arr.first())
+        .and_then(|arr| arr.last())
         .and_then(|c| c.get("text"))
         .and_then(Json::as_str)
     else {
@@ -580,12 +586,13 @@ fn publish<W: Write>(writer: &mut W, uri: &str, text: &str, state: &mut State) {
     let resolved = resolve_selection(state, config.as_ref());
     let selection = resolved.selection();
     let findings = grebe_rules::analysis::analyze(text, &selection);
+    let lines = position::LineIndex::new(text);
     let diagnostics: Vec<Json> = findings
         .iter()
         .filter_map(|f| {
             let rule = grebe_rules::lookup(f.code)?;
-            let (sl, sc) = position::byte_to_position(text, f.span.start, encoding);
-            let (el, ec) = position::byte_to_position(text, f.span.end, encoding);
+            let (sl, sc) = lines.position(text, f.span.start, encoding);
+            let (el, ec) = lines.position(text, f.span.end, encoding);
             Some(Json::object(vec![
                 (
                     "range".into(),
@@ -682,12 +689,13 @@ fn handle_statements(params: &Json, state: &State) -> Json {
         }
         None => crate::statements::all(text),
     };
+    let lines = position::LineIndex::new(text);
     Json::Array(
         spans
             .into_iter()
             .map(|s| {
-                let (sl, sc) = position::byte_to_position(text, s.start, encoding);
-                let (el, ec) = position::byte_to_position(text, s.end, encoding);
+                let (sl, sc) = lines.position(text, s.start, encoding);
+                let (el, ec) = lines.position(text, s.end, encoding);
                 Json::object(vec![
                     (
                         "range".into(),

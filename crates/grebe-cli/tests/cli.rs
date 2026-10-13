@@ -385,3 +385,15 @@ fn select_all_combined_with_another_code_is_unknown() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ALL"), "{stderr}");
 }
+
+#[test]
+fn a_file_that_is_not_utf8_fails_the_run() {
+    let dir = TempDir::new("not-utf8");
+    std::fs::write(dir.path().join("bad.sql"), b"select 1;\n\xff\xfe;\n").expect("write");
+    dir.write("good.sql", "select 1;\n");
+    for args in [&["check", "."][..], &["format", "--check", "."][..]] {
+        let out = grebe(dir.path(), args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains("bad.sql"), "{}", stderr(&out));
+    }
+}
