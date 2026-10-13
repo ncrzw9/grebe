@@ -5,7 +5,7 @@
 //! can be driven by an in-memory buffer in tests, with the real
 //! `stdin`/`stdout` wired in only by [`crate::serve`].
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Read one message's body from `reader`.
 ///
@@ -50,10 +50,28 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
             "missing or unparsable Content-Length header",
         ));
     };
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
+    // A client cannot make the server allocate whatever it claims: past
+    // the ceiling the message is refused, and below it the buffer grows with
+    // what actually arrives instead of being allocated up front.
+    if len > MAX_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Content-Length {len} is over the {MAX_BODY}-byte limit"),
+        ));
+    }
+    let mut body = Vec::with_capacity(len.min(1 << 20));
+    reader.by_ref().take(len as u64).read_to_end(&mut body)?;
+    if body.len() < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "stream ended mid-body",
+        ));
+    }
     Ok(Some(body))
 }
+
+/// The largest message body accepted: far beyond any real document.
+const MAX_BODY: usize = 256 << 20;
 
 /// Write one message: the `Content-Length` header, a blank line, then the
 /// body verbatim (byte length, not char length — the body may contain
@@ -126,6 +144,18 @@ mod tests {
     #[test]
     fn truncated_body_is_an_error() {
         let mut cursor = Cursor::new(b"Content-Length: 10\r\n\r\nshort".to_vec());
+        assert!(read_message(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn a_huge_content_length_is_refused_not_allocated() {
+        let mut cursor = Cursor::new(b"Content-Length: 99999999999999\r\n\r\n{}".to_vec());
+        assert!(read_message(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_content_length_is_an_error() {
+        let mut cursor = Cursor::new(b"Content-Length: 10\r\n\r\n{}".to_vec());
         assert!(read_message(&mut cursor).is_err());
     }
 }
