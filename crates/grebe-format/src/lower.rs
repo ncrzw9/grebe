@@ -517,6 +517,14 @@ impl<'a> Lowerer<'a> {
             }
             _ => {}
         }
+        if r == "("
+            && matches!(
+                self.owner_rule(li),
+                "MinusPrefixOperator" | "PlusPrefixOperator" | "TildePrefixOperator"
+            )
+        {
+            return Doc::Nil; // `-(a + b)`, like `-x`
+        }
         if r == "(" {
             // `WITH r(n) AS (...)` hugs; `INSERT INTO t (a, b)` does not.
             let cte_columns = self.owner_rule(ri) == "InsertColumnList"

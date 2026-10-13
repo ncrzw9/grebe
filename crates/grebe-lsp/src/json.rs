@@ -237,19 +237,21 @@ impl Parser<'_> {
                         'u' => {
                             let hi = self.hex4()?;
                             if (0xD800..=0xDBFF).contains(&hi) {
-                                // High surrogate: must be followed by a low
-                                // surrogate to form one astral code point.
-                                if self.bump()? != '\\' || self.bump()? != 'u' {
-                                    return Err(JsonError("unpaired UTF-16 surrogate".into()));
+                                // High surrogate: with a low surrogate after
+                                // it, one astral code point. Without one, it
+                                // is U+FFFD, as JavaScript's own encoders
+                                // write a lone surrogate -- an editor can
+                                // hold one mid-edit, and refusing the whole
+                                // message would leave the document stale.
+                                match self.low_surrogate() {
+                                    Some(lo) => {
+                                        let cp = 0x10000
+                                            + (u32::from(hi) - 0xD800) * 0x400
+                                            + (u32::from(lo) - 0xDC00);
+                                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                    }
+                                    None => out.push('\u{FFFD}'),
                                 }
-                                let lo = self.hex4()?;
-                                if !(0xDC00..=0xDFFF).contains(&lo) {
-                                    return Err(JsonError("invalid low surrogate".into()));
-                                }
-                                let cp = 0x10000
-                                    + (u32::from(hi) - 0xD800) * 0x400
-                                    + (u32::from(lo) - 0xDC00);
-                                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                             } else {
                                 out.push(char::from_u32(u32::from(hi)).unwrap_or('\u{FFFD}'));
                             }
@@ -263,6 +265,24 @@ impl Parser<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// A `\uDC00`-`\uDFFF` escape next, consumed if so; otherwise nothing
+    /// is consumed.
+    fn low_surrogate(&mut self) -> Option<u16> {
+        let mut ahead = Parser {
+            chars: self.chars.clone(),
+            depth: self.depth,
+        };
+        if ahead.bump().ok()? != '\\' || ahead.bump().ok()? != 'u' {
+            return None;
+        }
+        let lo = ahead
+            .hex4()
+            .ok()
+            .filter(|lo| (0xDC00..=0xDFFF).contains(lo))?;
+        self.chars = ahead.chars;
+        Some(lo)
     }
 
     fn hex4(&mut self) -> Result<u16, JsonError> {
@@ -474,5 +494,22 @@ mod tests {
         assert!(parse(&ok).is_ok());
         let objects = format!("{}1{}", r#"{"a":"#.repeat(300), "}".repeat(300));
         assert!(parse(&objects).is_err());
+    }
+
+    #[test]
+    fn a_lone_surrogate_is_a_replacement_character_not_an_error() {
+        assert_eq!(
+            parse(r#""a\ud83db""#).unwrap(),
+            Json::String("a\u{FFFD}b".into())
+        );
+        assert_eq!(
+            parse(r#""\ud83dA""#).unwrap(),
+            Json::String("\u{FFFD}A".into())
+        );
+        assert_eq!(
+            parse(r#""\ude00""#).unwrap(),
+            Json::String("\u{FFFD}".into())
+        );
+        assert_eq!(parse(r#""😀""#).unwrap(), Json::String("😀".into()));
     }
 }

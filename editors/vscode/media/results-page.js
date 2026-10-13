@@ -394,7 +394,9 @@
     if (next !== null && data.seq < next) return false;
     if (!resyncing) {
       resyncing = true;
-      vscode.postMessage({ type: "ready" });
+      // `missed` says what was missing, for the extension's log: the cause
+      // of a gap is still unknown, and this is how it gets found.
+      vscode.postMessage({ type: "ready", missed: { type: data.type, seq: data.seq, expected: next } });
     }
     return false;
   }

@@ -39,78 +39,201 @@ use crate::transport;
 /// only if the client completed the clean `shutdown` request then `exit`
 /// notification sequence; `1` for any other way the connection ended
 /// (premature EOF, `exit` without a prior `shutdown`).
-pub fn run<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> i32 {
+///
+/// Messages are read on their own thread and handled in batches: whatever
+/// has arrived by the time the previous batch is done. A document's
+/// diagnostics are published once per batch, after its last change in it,
+/// so typing faster than the server can lint never queues a lint per
+/// keystroke -- each pass lints only the newest text. Requests are answered
+/// as they come, before that publishing, and a request whose
+/// `$/cancelRequest` is in the same batch is answered as cancelled without
+/// being run.
+pub fn run<R: BufRead + Send + 'static, W: Write>(mut reader: R, mut writer: W) -> i32 {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+    std::thread::spawn(move || {
+        loop {
+            match transport::read_message(&mut reader) {
+                Ok(Some(body)) => {
+                    if tx.send(Some(body)).is_err() {
+                        return;
+                    }
+                }
+                // Clean EOF, or framing that broke: nothing left to read.
+                Ok(None) | Err(_) => {
+                    let _ = tx.send(None);
+                    return;
+                }
+            }
+        }
+    });
+
     let mut state = State::default();
     loop {
-        let body = match transport::read_message(&mut reader) {
-            Ok(Some(b)) => b,
-            Ok(None) => return exit_code(&state), // clean EOF
-            Err(_) => return exit_code(&state),   // framing broke; nothing left to recover
+        let Ok(Some(first)) = rx.recv() else {
+            return exit_code(&state);
         };
-        let Ok(text) = std::str::from_utf8(&body) else {
-            continue; // not UTF-8 -- malformed, drop it, keep serving
-        };
-        let Ok(msg) = json::parse(text) else {
-            continue; // malformed JSON -- drop it, keep serving
-        };
-        if msg.as_object().is_none() {
-            continue; // not a JSON-RPC object -- drop it
+        let mut batch = vec![first];
+        let mut ended = false;
+        while let Ok(next) = rx.try_recv() {
+            match next {
+                Some(body) => batch.push(body),
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
         }
-        let method = msg.get("method").and_then(Json::as_str);
-        let has_id = msg.get("id").is_some();
-        let id = msg.get("id").cloned().unwrap_or(Json::Null);
-        let params = msg.get("params").cloned().unwrap_or(Json::Null);
+        if let Some(code) = process_batch(&batch, &mut state, &mut writer) {
+            return code;
+        }
+        if ended {
+            return exit_code(&state);
+        }
+    }
+}
 
-        match method {
-            Some("initialize") => {
-                let result = handle_initialize(&params, &mut state, &mut writer);
-                respond(&mut writer, id, result);
+/// Handle one batch of message bodies, then publish what it changed.
+/// `Some(code)` when it ends the session (`exit`).
+fn process_batch<W: Write>(batch: &[Vec<u8>], state: &mut State, writer: &mut W) -> Option<i32> {
+    let messages: Vec<Option<Json>> = batch
+        .iter()
+        .map(|body| {
+            std::str::from_utf8(body)
+                .ok()
+                .and_then(|t| json::parse(t).ok())
+        })
+        .collect();
+    let cancelled: HashSet<String> = messages
+        .iter()
+        .flatten()
+        .filter(|m| m.get("method").and_then(Json::as_str) == Some("$/cancelRequest"))
+        .filter_map(|m| m.get("params")?.get("id").map(json::to_string))
+        .collect();
+    for msg in messages {
+        if let Some(code) = handle_message(msg, &cancelled, state, writer) {
+            publish_dirty(state, writer);
+            return Some(code);
+        }
+    }
+    publish_dirty(state, writer);
+    None
+}
+
+/// Handle one message. `Some(code)` when it ends the session (`exit`).
+fn handle_message<W: Write>(
+    msg: Option<Json>,
+    cancelled: &HashSet<String>,
+    state: &mut State,
+    writer: &mut W,
+) -> Option<i32> {
+    let Some(msg) = msg else {
+        // Not UTF-8 or not JSON: JSON-RPC's parse error, with a null id
+        // since the request's own could not be read.
+        respond_error(writer, Json::Null, -32700, "parse error");
+        return None;
+    };
+    if msg.as_object().is_none() {
+        respond_error(writer, Json::Null, -32600, "invalid request");
+        return None;
+    }
+    let method = msg.get("method").and_then(Json::as_str);
+    let has_id = msg.get("id").is_some();
+    let id = msg.get("id").cloned().unwrap_or(Json::Null);
+    let params = msg.get("params").cloned().unwrap_or(Json::Null);
+
+    if method == Some("exit") {
+        return Some(exit_code(state));
+    }
+    // The lifecycle: nothing but `initialize` before it, once; nothing
+    // but `exit` after `shutdown`.
+    match (method, state.initialized, state.shutdown) {
+        (Some("initialize"), true, _) => {
+            respond_error(writer, id, -32600, "already initialized");
+            return None;
+        }
+        (Some("initialize"), false, _) => {}
+        (_, false, _) => {
+            if has_id {
+                respond_error(writer, id, -32002, "server not initialized");
             }
-            Some("initialized") => {} // notification, nothing to do
-            Some("shutdown") => {
-                state.shutdown = true;
-                respond(&mut writer, id, Json::Null);
+            return None;
+        }
+        (_, _, true) => {
+            if has_id {
+                respond_error(writer, id, -32600, "server is shutting down");
             }
-            Some("exit") => return exit_code(&state),
-            Some("textDocument/didOpen") => handle_did_open(&params, &mut state, &mut writer),
-            Some("textDocument/didChange") => {
-                handle_did_change(&params, &mut state, &mut writer);
+            return None;
+        }
+        _ => {}
+    }
+    if has_id && cancelled.contains(&json::to_string(&id)) {
+        respond_error(writer, id, -32800, "request cancelled");
+        return None;
+    }
+
+    match method {
+        Some("initialize") => {
+            let result = handle_initialize(&params, state, writer);
+            state.initialized = true;
+            respond(writer, id, result);
+        }
+        Some("initialized" | "$/cancelRequest") => {}
+        Some("shutdown") => {
+            state.shutdown = true;
+            respond(writer, id, Json::Null);
+        }
+        Some("textDocument/didOpen") => handle_did_open(&params, state),
+        Some("textDocument/didChange") => handle_did_change(&params, state),
+        Some("textDocument/didSave") => handle_did_save(&params, state),
+        Some("textDocument/didClose") => handle_did_close(&params, state, writer),
+        Some("textDocument/semanticTokens/full") => {
+            let result = handle_semantic_tokens(&params, state);
+            respond(writer, id, result);
+        }
+        Some("textDocument/codeAction") => {
+            let result = handle_code_action(&params, state, writer);
+            respond(writer, id, result);
+        }
+        Some("textDocument/formatting") => {
+            let result = handle_formatting(&params, state, writer);
+            respond(writer, id, result);
+        }
+        Some("grebe/statements") => {
+            let result = handle_statements(&params, state);
+            respond(writer, id, result);
+        }
+        Some("workspace/didChangeConfiguration") => {
+            handle_did_change_configuration(&params, state, writer);
+        }
+        Some(_) => {
+            if has_id {
+                respond_error(writer, id, -32601, "method not found");
             }
-            Some("textDocument/didSave") => handle_did_save(&params, &mut state, &mut writer),
-            Some("textDocument/didClose") => {
-                handle_did_close(&params, &mut state, &mut writer);
-            }
-            Some("textDocument/semanticTokens/full") => {
-                let result = handle_semantic_tokens(&params, &state);
-                respond(&mut writer, id, result);
-            }
-            Some("textDocument/codeAction") => {
-                let result = handle_code_action(&params, &mut state, &mut writer);
-                respond(&mut writer, id, result);
-            }
-            Some("textDocument/formatting") => {
-                let result = handle_formatting(&params, &mut state, &mut writer);
-                respond(&mut writer, id, result);
-            }
-            Some("grebe/statements") => {
-                let result = handle_statements(&params, &state);
-                respond(&mut writer, id, result);
-            }
-            Some("workspace/didChangeConfiguration") => {
-                handle_did_change_configuration(&params, &mut state, &mut writer);
-            }
-            Some(_) => {
-                if has_id {
-                    respond_error(&mut writer, id, -32601, "method not found");
-                }
-                // else: unknown notification, ignore silently.
-            }
-            None => {
-                if has_id {
-                    respond_error(&mut writer, id, -32600, "invalid request");
-                }
+            // else: unknown notification, ignore silently.
+        }
+        None => {
+            if has_id {
+                respond_error(writer, id, -32600, "invalid request");
             }
         }
+    }
+    None
+}
+
+/// Lint and publish every document changed since the last publish, once
+/// each, in the order they were first changed.
+fn publish_dirty<W: Write>(state: &mut State, writer: &mut W) {
+    for uri in std::mem::take(&mut state.dirty) {
+        if let Some(text) = state.documents.get(&uri).cloned() {
+            publish(writer, &uri, &text, state);
+        }
+    }
+}
+
+/// Mark `uri` for [`publish_dirty`].
+fn mark_dirty(state: &mut State, uri: &str) {
+    if !state.dirty.iter().any(|u| u == uri) {
+        state.dirty.push(uri.to_string());
     }
 }
 
@@ -122,7 +245,14 @@ fn exit_code(state: &State) -> i32 {
 #[derive(Default)]
 struct State {
     documents: HashMap<String, String>,
+    /// Each open document's latest version, from didOpen / didChange:
+    /// a change with an older version is stale and ignored, and diagnostics
+    /// say which version they are for.
+    versions: HashMap<String, f64>,
+    /// Documents changed since their diagnostics were last published.
+    dirty: Vec<String>,
     encoding: Encoding,
+    initialized: bool,
     shutdown: bool,
     /// `grebe.select`, normalised (trimmed, uppercased, unknown codes
     /// dropped). `None` means no selection is active -- the registry's
@@ -130,11 +260,12 @@ struct State {
     /// `Some(_)` -- including `Some(vec![])` -- means only the listed codes
     /// fire, on or off by default alike, exactly `--select`'s semantics.
     select: Option<Vec<String>>,
-    /// Distinct `grebe.toml` error messages already reported via
-    /// `window/showMessage`, so a config error that keeps re-triggering (a
-    /// document re-analysed on every keystroke) surfaces once, not on every
-    /// request.
-    reported_config_errors: HashSet<String>,
+    /// The `grebe.toml` error last reported via `window/showMessage`, per
+    /// config file, so an error that keeps re-triggering (a document
+    /// re-analysed on every keystroke) surfaces once, not on every request.
+    /// Forgotten when that file next loads cleanly: fixing it and breaking
+    /// it again is news again.
+    reported_config_errors: HashMap<PathBuf, String>,
 }
 
 fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Json {
@@ -258,20 +389,40 @@ fn notify_unknown_select<W: Write>(writer: &mut W, unknown: &[String]) {
 
 /// Decode a `file://` URI to a filesystem path.
 ///
-/// Handles the macOS/Linux `file:///abs/path` form (authority-less, so the
-/// path starts right after the double slash of the scheme) and percent
-/// escapes therein. A non-`file` URI, or a URI whose percent-escapes don't
-/// decode to valid UTF-8, falls back to the current directory: `discover`
-/// still runs, just rooted wherever the server process happens to be, which
-/// is a saner failure than refusing to serve the request at all.
+/// A non-`file` URI, or a URI whose percent-escapes don't decode to valid
+/// UTF-8, falls back to the current directory: `discover` still runs, just
+/// rooted wherever the server process happens to be, which is a saner
+/// failure than refusing to serve the request at all.
 fn uri_to_path(uri: &str) -> PathBuf {
-    let Some(rest) = uri.strip_prefix("file://") else {
-        return std::env::current_dir().unwrap_or_default();
-    };
-    percent_decode(rest).map_or_else(
+    file_uri_path(uri, cfg!(windows)).map_or_else(
         || std::env::current_dir().unwrap_or_default(),
         PathBuf::from,
     )
+}
+
+/// The path a `file://` URI names, on Windows or elsewhere.
+///
+/// - `file:///abs/path` (no authority): `/abs/path`, percent escapes
+///   decoded.
+/// - On Windows, `file:///c%3A/x.sql` or `file:///C:/x.sql`: `C:/x.sql`.
+///   Left as `/c:/x.sql` it is no path at all, and `grebe.toml` was never
+///   found.
+/// - On Windows, `file://server/share/x.sql`: the UNC path
+///   `\\server/share/x.sql`.
+fn file_uri_path(uri: &str, windows: bool) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = percent_decode(rest)?;
+    if !windows {
+        return Some(path);
+    }
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        return Some(path[1..].to_string());
+    }
+    if !path.is_empty() && !path.starts_with('/') {
+        return Some(format!("\\\\{path}"));
+    }
+    Some(path)
 }
 
 /// Minimal `%XX` percent-decoding. Clients escape at least spaces (`%20`)
@@ -303,11 +454,19 @@ fn percent_decode(s: &str) -> Option<String> {
 /// deduplicated on the message text so a config error that keeps re-firing
 /// (the document is re-analysed on every keystroke) surfaces once rather
 /// than spamming the client.
-fn report_config_error<W: Write>(message: &str, state: &mut State, writer: &mut W) {
-    if state.reported_config_errors.insert(message.to_string()) {
+fn report_config_error<W: Write>(
+    e: &grebe_rules::config::ConfigError,
+    state: &mut State,
+    writer: &mut W,
+) {
+    let message = e.to_string();
+    if state.reported_config_errors.get(&e.path) != Some(&message) {
+        state
+            .reported_config_errors
+            .insert(e.path.clone(), message.clone());
         let params = Json::object(vec![
             ("type".into(), Json::num(1)),
-            ("message".into(), Json::str(message)),
+            ("message".into(), Json::str(&message)),
         ]);
         notify(writer, "window/showMessage", params);
     }
@@ -323,9 +482,14 @@ fn report_config_error<W: Write>(message: &str, state: &mut State, writer: &mut 
 fn config_for_uri<W: Write>(uri: &str, state: &mut State, writer: &mut W) -> Option<Config> {
     let path = uri_to_path(uri);
     match grebe_rules::config::discover(&path) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => {
+            if let Some(c) = &cfg {
+                state.reported_config_errors.remove(&c.path);
+            }
+            cfg
+        }
         Err(e) => {
-            report_config_error(&e.to_string(), state, writer);
+            report_config_error(&e, state, writer);
             None
         }
     }
@@ -417,7 +581,7 @@ fn handle_did_change_configuration<W: Write>(params: &Json, state: &mut State, w
     }
 }
 
-fn handle_did_open<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
+fn handle_did_open(params: &Json, state: &mut State) {
     let Some(doc) = params.get("textDocument") else {
         return;
     };
@@ -428,17 +592,26 @@ fn handle_did_open<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
         return;
     };
     state.documents.insert(uri.to_string(), text.to_string());
-    publish(writer, uri, text, state);
+    match doc.get("version").and_then(Json::as_f64) {
+        Some(v) => state.versions.insert(uri.to_string(), v),
+        None => state.versions.remove(uri),
+    };
+    mark_dirty(state, uri);
 }
 
-fn handle_did_change<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
-    let Some(uri) = params
-        .get("textDocument")
-        .and_then(|d| d.get("uri"))
-        .and_then(Json::as_str)
-    else {
+fn handle_did_change(params: &Json, state: &mut State) {
+    let doc = params.get("textDocument");
+    let Some(uri) = doc.and_then(|d| d.get("uri")).and_then(Json::as_str) else {
         return;
     };
+    // An older version than the one we have arrived late: applying it
+    // would replace newer text with older.
+    let version = doc.and_then(|d| d.get("version")).and_then(Json::as_f64);
+    if let (Some(v), Some(&have)) = (version, state.versions.get(uri)) {
+        if v <= have {
+            return;
+        }
+    }
     // A change to a document that is not open (it arrived after didClose)
     // must not bring it back and publish diagnostics for a closed file.
     if !state.documents.contains_key(uri) {
@@ -457,10 +630,13 @@ fn handle_did_change<W: Write>(params: &Json, state: &mut State, writer: &mut W)
         return;
     };
     state.documents.insert(uri.to_string(), text.to_string());
-    publish(writer, uri, text, state);
+    if let Some(v) = version {
+        state.versions.insert(uri.to_string(), v);
+    }
+    mark_dirty(state, uri);
 }
 
-fn handle_did_save<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
+fn handle_did_save(params: &Json, state: &mut State) {
     let Some(uri) = params
         .get("textDocument")
         .and_then(|d| d.get("uri"))
@@ -473,10 +649,9 @@ fn handle_did_save<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
     if let Some(text) = params.get("text").and_then(Json::as_str) {
         state.documents.insert(uri.to_string(), text.to_string());
     }
-    let Some(text) = state.documents.get(uri).cloned() else {
-        return;
-    };
-    publish(writer, uri, &text, state);
+    if state.documents.contains_key(uri) {
+        mark_dirty(state, uri);
+    }
 }
 
 fn handle_did_close<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
@@ -488,8 +663,10 @@ fn handle_did_close<W: Write>(params: &Json, state: &mut State, writer: &mut W) 
         return;
     };
     state.documents.remove(uri);
+    state.versions.remove(uri);
+    state.dirty.retain(|u| u != uri);
     // Publish an empty set so a closed document's squiggles don't linger.
-    publish_diagnostics(writer, uri, &[]);
+    publish_diagnostics(writer, uri, &[], None);
 }
 
 /// A `select`-only view of `grebe_rules::analysis::analyze_source`, for the
@@ -611,7 +788,8 @@ fn publish<W: Write>(writer: &mut W, uri: &str, text: &str, state: &mut State) {
             ]))
         })
         .collect();
-    publish_diagnostics(writer, uri, &diagnostics);
+    let version = state.versions.get(uri).copied();
+    publish_diagnostics(writer, uri, &diagnostics, version);
 }
 
 /// `textDocument/formatting`.
@@ -727,11 +905,20 @@ fn pos(line: u32, character: u32) -> Json {
     ])
 }
 
-fn publish_diagnostics<W: Write>(writer: &mut W, uri: &str, diagnostics: &[Json]) {
-    let params = Json::object(vec![
+fn publish_diagnostics<W: Write>(
+    writer: &mut W,
+    uri: &str,
+    diagnostics: &[Json],
+    version: Option<f64>,
+) {
+    let mut fields = vec![
         ("uri".into(), Json::str(uri)),
         ("diagnostics".into(), Json::Array(diagnostics.to_vec())),
-    ]);
+    ];
+    if let Some(v) = version {
+        fields.push(("version".into(), Json::num(v)));
+    }
+    let params = Json::object(fields);
     notify(writer, "textDocument/publishDiagnostics", params);
 }
 
@@ -923,5 +1110,228 @@ mod tests {
             out.is_empty(),
             "ALL is a real expansion, not an unknown code"
         );
+    }
+
+    #[test]
+    fn file_uris_become_paths_on_windows_and_elsewhere() {
+        assert_eq!(
+            file_uri_path("file:///home/a%20b/x.sql", false).as_deref(),
+            Some("/home/a b/x.sql")
+        );
+        assert_eq!(
+            file_uri_path("file:///c%3A/Users/x.sql", true).as_deref(),
+            Some("c:/Users/x.sql")
+        );
+        assert_eq!(
+            file_uri_path("file:///C:/x.sql", true).as_deref(),
+            Some("C:/x.sql")
+        );
+        assert_eq!(
+            file_uri_path("file://server/share/x.sql", true).as_deref(),
+            Some("\\\\server/share/x.sql")
+        );
+        assert_eq!(file_uri_path("untitled:Untitled-1", true), None);
+    }
+
+    // -- batching, cancellation, versions, lifecycle -------------------------
+
+    fn body(v: &str) -> Vec<u8> {
+        v.as_bytes().to_vec()
+    }
+
+    fn init() -> Vec<u8> {
+        body(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}"#)
+    }
+
+    fn open(uri: &str, version: u32, text: &str) -> Vec<u8> {
+        body(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","version":{version},"text":"{text}"}}}}}}"#
+        ))
+    }
+
+    fn change(uri: &str, version: u32, texts: &[&str]) -> Vec<u8> {
+        let changes: Vec<String> = texts
+            .iter()
+            .map(|t| format!(r#"{{"text":"{t}"}}"#))
+            .collect();
+        body(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":{version}}},"contentChanges":[{}]}}}}"#,
+            changes.join(",")
+        ))
+    }
+
+    /// Run `batches` in order on one session; every message written.
+    fn session(batches: &[Vec<Vec<u8>>]) -> Vec<Json> {
+        let mut state = State::default();
+        let mut out: Vec<u8> = Vec::new();
+        for b in batches {
+            process_batch(b, &mut state, &mut out);
+        }
+        let mut cursor = std::io::Cursor::new(out);
+        let mut msgs = Vec::new();
+        while let Some(m) = transport::read_message(&mut cursor).unwrap() {
+            msgs.push(json::parse(std::str::from_utf8(&m).unwrap()).unwrap());
+        }
+        msgs
+    }
+
+    fn publishes(msgs: &[Json]) -> Vec<&Json> {
+        msgs.iter()
+            .filter(|m| {
+                m.get("method").and_then(Json::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .map(|m| m.get("params").unwrap())
+            .collect()
+    }
+
+    fn error_code(msgs: &[Json], id: f64) -> Option<f64> {
+        msgs.iter()
+            .find(|m| m.get("id").and_then(Json::as_f64) == Some(id))?
+            .get("error")?
+            .get("code")?
+            .as_f64()
+    }
+
+    #[test]
+    fn changes_in_one_batch_are_linted_once_for_the_newest_text() {
+        let u = "file:///a.sql";
+        let mut batch = vec![init(), open(u, 1, "SELECT count(*) FROM t")];
+        for v in 2..50 {
+            batch.push(change(u, v, &["SELECT count(*) FROM t"]));
+        }
+        batch.push(change(u, 50, &["SELECT 1"]));
+        let msgs = session(&[batch]);
+        let p = publishes(&msgs);
+        assert_eq!(p.len(), 1, "one lint for 50 changes");
+        assert_eq!(p[0].get("version").and_then(Json::as_f64), Some(50.0));
+        assert!(
+            p[0].get("diagnostics")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_request_cancelled_in_its_batch_is_not_run() {
+        let msgs = session(&[vec![
+            init(),
+            open("file:///a.sql", 1, "select 1"),
+            body(
+                r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///a.sql"}}}"#,
+            ),
+            body(r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":7}}"#),
+            body(
+                r#"{"jsonrpc":"2.0","id":8,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///a.sql"}}}"#,
+            ),
+        ]]);
+        assert_eq!(error_code(&msgs, 7.0), Some(-32800.0));
+        assert_eq!(
+            error_code(&msgs, 8.0),
+            None,
+            "an uncancelled request still runs"
+        );
+    }
+
+    #[test]
+    fn a_stale_version_and_a_change_after_close_are_ignored() {
+        let u = "file:///a.sql";
+        let msgs = session(&[
+            vec![init(), open(u, 5, "SELECT 1")],
+            vec![change(u, 4, &["SELECT count(*) FROM t"])],
+            vec![body(&format!(
+                r#"{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{u}"}}}}}}"#
+            ))],
+            vec![change(u, 9, &["SELECT count(*) FROM t"])],
+        ]);
+        let p = publishes(&msgs);
+        // didOpen's, then didClose's empty one; nothing for the stale change
+        // or the change after close.
+        assert_eq!(p.len(), 2);
+        assert!(
+            p.iter()
+                .all(|p| p.get("diagnostics").unwrap().as_array().unwrap().is_empty())
+        );
+    }
+
+    #[test]
+    fn the_last_of_several_content_changes_is_the_document() {
+        let u = "file:///a.sql";
+        let msgs = session(&[vec![
+            init(),
+            open(u, 1, "SELECT 1"),
+            change(u, 2, &["SELECT 1", "SELECT count(*) FROM t"]),
+        ]]);
+        let p = publishes(&msgs);
+        let codes: Vec<_> = p[0]
+            .get("diagnostics")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Json::as_str))
+            .collect();
+        assert_eq!(codes, ["MOD001"]);
+    }
+
+    #[test]
+    fn the_lifecycle_is_enforced() {
+        let req = |id: u32, method: &str| {
+            body(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#
+            ))
+        };
+        let msgs = session(&[
+            vec![
+                req(1, "textDocument/formatting"),
+                init(),
+                req(2, "initialize"),
+            ],
+            vec![req(3, "shutdown"), req(4, "textDocument/formatting")],
+            vec![body("{ not json")],
+        ]);
+        assert_eq!(error_code(&msgs, 1.0), Some(-32002.0), "before initialize");
+        assert_eq!(error_code(&msgs, 2.0), Some(-32600.0), "initialize twice");
+        assert_eq!(error_code(&msgs, 3.0), None, "shutdown itself succeeds");
+        assert_eq!(error_code(&msgs, 4.0), Some(-32600.0), "after shutdown");
+        assert!(msgs.iter().any(|m| {
+            m.get("id") == Some(&Json::Null)
+                && m.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(Json::as_f64)
+                    == Some(-32700.0)
+        }));
+    }
+
+    #[test]
+    fn a_config_error_is_shown_again_after_the_file_was_fixed() {
+        let dir = std::env::temp_dir().join(format!("grebe-lsp-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = dir.join("grebe.toml");
+        let uri = format!("file://{}", dir.join("q.sql").display());
+        let shown = |msgs: &[Json]| {
+            msgs.iter()
+                .filter(|m| m.get("method").and_then(Json::as_str) == Some("window/showMessage"))
+                .count()
+        };
+        let mut state = State::default();
+        let mut out: Vec<u8> = Vec::new();
+        let mut step = |toml_text: &str, msg: Vec<u8>| {
+            std::fs::write(&toml, toml_text).unwrap();
+            process_batch(&[msg], &mut state, &mut out);
+        };
+        step("", init());
+        step("[severity\n", open(&uri, 1, "select 1"));
+        step("[severity\n", change(&uri, 2, &["select 2"])); // same error: not again
+        step("", change(&uri, 3, &["select 3"])); // fixed
+        step("[severity\n", change(&uri, 4, &["select 4"])); // broken again: shown
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cursor = std::io::Cursor::new(out);
+        let mut msgs = Vec::new();
+        while let Some(m) = transport::read_message(&mut cursor).unwrap() {
+            msgs.push(json::parse(std::str::from_utf8(&m).unwrap()).unwrap());
+        }
+        assert_eq!(shown(&msgs), 2);
     }
 }
