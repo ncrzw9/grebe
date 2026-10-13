@@ -536,4 +536,30 @@ mod tests {
             "select (;\n\nSELECT 1;\n\nSELECT 2;\n"
         );
     }
+
+    /// A line comment never moves between runs: formatting the output again
+    /// changes nothing.
+    #[test]
+    fn line_comments_stay_put_from_one_run_to_the_next() {
+        for (src, want) in [
+            ("select a from t -- c1", "SELECT a FROM t; -- c1\n"),
+            ("select 1 -- eof", "SELECT 1; -- eof\n"),
+            (
+                "select a, b from t where -- c\n x = 1",
+                "SELECT a, b\nFROM t\nWHERE -- c\nx = 1;\n",
+            ),
+            (
+                "select\n  a -- why a\n  , b\nfrom t",
+                "SELECT\n    a, -- why a\n    b\nFROM t;\n",
+            ),
+            (
+                "select list_transform([1,2,3] -- c\n, x -> x + 1) from t",
+                "SELECT\n    list_transform(\n        [1, 2, 3], -- c\n        x -> x + 1\n    )\nFROM t;\n",
+            ),
+        ] {
+            let once = f(src);
+            assert_eq!(once, want, "{src:?}");
+            assert_eq!(f(&once), once, "second run moved something: {src:?}");
+        }
+    }
 }
