@@ -514,7 +514,10 @@ mod tests {
         );
         assert_eq!(f("select [- -1], (- -a)"), "SELECT [- -1], (- -a);\n");
         // A single prefix operator still hugs its operand.
-        assert_eq!(f("select - 1, ~ a"), "SELECT -1, ~a;\n");
+        assert_eq!(
+            f("select - 1, ~ a, - (b + 1), -(-c)"),
+            "SELECT -1, ~a, -(b + 1), -(-c);\n"
+        );
         assert_eq!(
             f(&f("select - -1; select 2")),
             "SELECT - -1;\n\nSELECT 2;\n"
