@@ -16,6 +16,11 @@ try {
 } catch {
   // not installed: the tests below are skipped
 }
+// CI sets GREBE_BROWSER_TESTS=required, so a missing Playwright fails
+// there instead of passing as skipped.
+if (!chromium && process.env.GREBE_BROWSER_TESTS === "required") {
+  throw new Error("GREBE_BROWSER_TESTS=required, but Playwright is not installed (NODE_PATH?)");
+}
 const browserTest = chromium ? test : test.skip;
 
 const PAGE = fs.readFileSync(path.join(__dirname, "..", "media", "results-page.js"), "utf8");
@@ -395,4 +400,43 @@ browserTest("a running statement shows its clock and a Cancel button", async (t)
     "Timed out (grebe.duckdb.queryTimeout) after 30.0 s.",
     "Cancelled after 3,100 ms. DuckDB did not stop within 3 s, so the session was ended: TEMP tables and in-memory data are gone.",
   ]);
+});
+
+browserTest("a page that missed part of a run asks for it again, and then shows it", async (t) => {
+  const browser = await chromium.launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.setContent(html());
+  const run = (title) => [
+    { type: "begin", header: { title, detail: "" }, seq: 0 },
+    { type: "result", seq: 1, entry: { id: 1, uri: "file:///q.sql", line: 0, preview: "FROM accounts", result: rowsResult(50) } },
+    { type: "end", summary: "1 statement succeeded.", seq: 2 },
+  ];
+  const send = (msgs) => page.evaluate((m) => m.forEach((x) => window.postMessage(x, "*")), msgs);
+  const readies = () => page.evaluate(() => window.sent.filter((m) => m.type === "ready").length);
+
+  // Hidden or reloading when begin and the result went out: only end
+  // arrives. The page asks once, and does not throw on later runs.
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await send([run("q.sql")[2]]);
+  await page.waitForFunction(() => window.sent.filter((m) => m.type === "ready").length === 2);
+  assert.equal(await page.textContent("#title"), "No results yet.");
+
+  // The host replays the run: it shows in full.
+  await send(run("q.sql"));
+  await page.waitForSelector("canvas");
+  assert.equal(await page.textContent("#title"), "q.sql");
+  assert.deepEqual(await page.locator("#tablist .tab").allTextContents(), ["L1 · 50 rows", "Messages"]);
+
+  // A live message that crossed the replay is a duplicate, not a gap.
+  await send([run("q.sql")[2]]);
+  await page.waitForTimeout(50);
+  assert.equal(await readies(), 2);
+
+  // The next run, in order, needs nothing more.
+  await send(run("next.sql"));
+  await page.waitForFunction(() => document.getElementById("title").textContent === "next.sql");
+  assert.equal(await readies(), 2);
+  assert.deepEqual(errors, []);
 });

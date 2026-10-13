@@ -24,19 +24,26 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: target
           key: ci-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The results page's tests drive it in headless Chromium.
+      - name: Playwright for the results page tests
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/pw" --no-save --no-audit --no-fund playwright@1.56.1
+          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps --only-shell chromium
       # Against the grebe just built and a real DuckDB CLI, so running SQL,
       # the catalog and data files are tested end to end.
       - name: VS Code extension tests
         env:
+          GREBE_BROWSER_TESTS: required
           DUCKDB_VERSION: "1.5.5"
           PG_TEST_CONN: "dbname=grebe host=localhost port=5432 user=postgres password=grebe-test"
         run: |
@@ -45,6 +52,7 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
             "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/duckdb_cli-linux-amd64.zip"
           unzip -q "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          NODE_PATH="$RUNNER_TEMP/pw/node_modules" \
           GREBE_BIN="$PWD/target/debug/grebe" DUCKDB_CLI="$RUNNER_TEMP/duckdb/duckdb" \
             node --test editors/vscode/test/*.test.js
       # Verification builds sibling crates as registry dependencies, and cargo
