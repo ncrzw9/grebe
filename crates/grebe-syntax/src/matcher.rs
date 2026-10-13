@@ -732,4 +732,29 @@ mod tests {
         let tree = parse(&src).expect("parses");
         assert_eq!(tree.find("SelectStatement").len(), 2_000);
     }
+
+    /// DuckDB rejects a string, quoted identifier, dollar-quote or block
+    /// comment with no closing delimiter, so the statement must not parse:
+    /// otherwise it is linted and formatted as if it ended somewhere.
+    #[test]
+    fn unclosed_strings_and_comments_do_not_parse() {
+        for src in [
+            "SELECT 'abc",
+            "SELECT e'abc\\'",
+            "SELECT \"abc",
+            "SELECT $$abc",
+            "SELECT $t$abc$$",
+            "SELECT 1 /* never closed",
+            "SELECT 1 /* a /* b */ still open",
+            "SELECT count(*) FROM t WHERE x = 'oops;\nSELECT 2;",
+        ] {
+            assert!(parse(src).is_none(), "parsed: {src:?}");
+        }
+        for src in [
+            "SELECT 'it''s', e'a\\'b', \"a\"\"b\", $$x$$, $t$a$$b$t$",
+            "SELECT /* a /* b */ c */ 1",
+        ] {
+            assert!(parse(src).is_some(), "did not parse: {src:?}");
+        }
+    }
 }
