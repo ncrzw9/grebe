@@ -120,6 +120,11 @@ impl Default for Options {
 /// layout, and never gets "fixed" into something else.
 #[must_use]
 pub fn format(src: &str, opts: &Options) -> String {
+    // A byte order mark stays where it is: it says how the file is encoded,
+    // not anything about the SQL.
+    if let Some(rest) = src.strip_prefix('\u{feff}') {
+        return format!("\u{feff}{}", format(rest, opts));
+    }
     if let Some(tree) = grebe_syntax::matcher::parse(src) {
         return finish(format_tree(&tree, src, opts));
     }
@@ -513,6 +518,22 @@ mod tests {
         assert_eq!(
             f(&f("select - -1; select 2")),
             "SELECT - -1;\n\nSELECT 2;\n"
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_kept_and_the_sql_after_it_formatted() {
+        assert_eq!(
+            f("\u{feff}select   1;\nselect   2"),
+            "\u{feff}SELECT 1;\n\nSELECT 2;\n"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_paren_costs_only_its_own_statement() {
+        assert_eq!(
+            f("select (;\nselect   1;\nselect 2"),
+            "select (;\n\nSELECT 1;\n\nSELECT 2;\n"
         );
     }
 }

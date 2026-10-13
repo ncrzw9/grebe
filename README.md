@@ -52,7 +52,8 @@ grebe lsp                language server on stdio
 ```
 
 Exit codes: `0` clean, `1` an error-severity finding (or `format --check`
-found work), `2` usage or config error.
+found work), `2` usage or config error, or a file that could not be read
+(missing, or not UTF-8) or written.
 
 ## Configuration
 

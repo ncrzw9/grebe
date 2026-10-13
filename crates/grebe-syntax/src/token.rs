@@ -179,6 +179,15 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut i = 0;
     let n = bytes.len();
+    // A UTF-8 byte order mark, as some Windows editors write, is not part
+    // of the first word: DuckDB skips it, so it is leading whitespace.
+    if src.starts_with('\u{feff}') {
+        tokens.push(Token {
+            kind: TokenKind::Whitespace,
+            span: Span::new(0, 3),
+        });
+        i = 3;
+    }
     while i < n {
         let start = i;
         let c = bytes[i] as char;
@@ -524,35 +533,31 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     merged
 }
 
-/// Byte ranges of top-level statements, split on `;` outside parens.
+/// Byte ranges of top-level statements, split on every `;` outside
+/// strings and comments.
 ///
 /// A linter must not lose a whole file because one statement in it does not
 /// parse — SQL files in the wild often contain the odd unparseable statement,
-/// and dropping the file would discard every finding in it.
+/// and dropping the file would discard every finding in it. That includes a
+/// statement with an unclosed `(`: no DuckDB statement has a `;` inside
+/// brackets, so counting brackets across a `;` would only carry the rest
+/// of the file into one broken statement.
 /// Splitting uses the tokenizer, so semicolons inside strings, comments and
 /// dollar-quoted bodies are never split points.
 #[must_use]
 pub fn split_statements(src: &str) -> Vec<crate::Span> {
     let toks = tokenize(src);
     let mut out = Vec::new();
-    let mut depth: i32 = 0;
     let mut start: Option<u32> = None;
     for t in &toks {
         if t.kind.is_trivia() {
             continue;
         }
         let raw = t.span.slice(src.as_bytes());
-        match raw {
-            b"(" | b"[" => depth += 1,
-            b")" | b"]" => depth -= 1,
-            _ => {}
-        }
         if start.is_none() {
             start = Some(t.span.start);
         }
-        // `<= 0` rather than `== 0`: a stray closer must not stop every later
-        // statement from splitting.
-        if raw == b";" && depth <= 0 {
+        if raw == b";" {
             if let Some(s) = start.take() {
                 if t.span.end > s {
                     out.push(crate::Span::new(s, t.span.end));
