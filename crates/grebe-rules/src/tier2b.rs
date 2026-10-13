@@ -19,6 +19,7 @@ use std::sync::LazyLock;
 
 use grebe_syntax::Span;
 use grebe_syntax::cst::{NodeId, Tree};
+use grebe_syntax::token::TokenKind;
 
 use crate::detect::{Finding, Fix};
 
@@ -841,9 +842,10 @@ pub fn case_to_switch(tree: &Tree, src: &str) -> Vec<Finding> {
 /// A name counts as referenced if it matches, case- and quote-insensitively
 /// (`ident`), any `TableName` text anywhere in that walk, *or* — a
 /// required guard, not a defensive one — any
-/// `StringLiteral` text (`string_literal_value`), since a table-producing
-/// macro like `stack('cities', ...)` references a CTE by
-/// name as a string argument, not as a `TableRef`.
+/// `StringLiteral` text (`string_literal_value`), or any identifier inside
+/// one, since a table-producing macro like `stack('cities', ...)` references
+/// a CTE by name as a string argument, and `query('SELECT * FROM a')` takes
+/// a whole query as a string -- neither is a `TableRef`.
 pub fn unused_cte(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for with_clause in tree.find("WithClause") {
@@ -857,11 +859,23 @@ pub fn unused_cte(tree: &Tree, src: &str) -> Vec<Finding> {
             .filter(|&n| tree.rule_name(n) == "TableName")
             .map(|n| ident(tree.text(n, src)))
             .collect();
+        // Every identifier inside every string, not just a string that is
+        // exactly a name: `query('SELECT * FROM a')` and friends take SQL
+        // as a string, and deleting `a` there breaks the query.
         let string_refs: HashSet<String> = scope
             .iter()
             .copied()
             .filter(|&n| tree.rule_name(n) == "StringLiteral")
-            .map(|n| string_literal_value(tree.text(n, src)))
+            .flat_map(|n| {
+                let value = string_literal_value(tree.text(n, src));
+                let mut names = vec![value.clone()];
+                for t in grebe_syntax::token::tokenize(&value) {
+                    if matches!(t.kind, TokenKind::Word | TokenKind::QuotedIdent) {
+                        names.push(ident(&value[t.span.start as usize..t.span.end as usize]));
+                    }
+                }
+                names
+            })
             .collect();
 
         let entries: Vec<NodeId> = tree
@@ -1457,6 +1471,9 @@ mod tests {
             // argument to a table-producing function
             "WITH cities AS (SELECT 1 AS x) SELECT * FROM stack('cities', 1)",
             "WITH cities AS (SELECT 1 AS x) SELECT * FROM query_table('cities')",
+            // a whole query as a string: deleting `a` would break it
+            "WITH a AS (SELECT 42 AS x) SELECT * FROM query('SELECT * FROM a')",
+            "WITH \"A\" AS (SELECT 42 AS x) SELECT * FROM query('select x from \"a\" where x > 0')",
             // RECURSIVE self-reference inside its own body counts as used
             "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT * FROM r",
         ] {
