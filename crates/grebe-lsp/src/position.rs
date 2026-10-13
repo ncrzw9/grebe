@@ -54,32 +54,56 @@ pub fn negotiate(offered: &[&str]) -> Encoding {
 /// `\r\n` is treated as a single line terminator: an offset that lands on
 /// the `\r` of a `\r\n` pair (or exactly between the two, i.e. right after
 /// the `\r`) never counts that `\r` toward `character`.
+///
+/// One conversion scans `src` for line starts; converting many offsets in
+/// one document goes through a [`LineIndex`] instead.
 #[must_use]
 pub fn byte_to_position(src: &str, byte_offset: u32, enc: Encoding) -> (u32, u32) {
-    let bytes = src.as_bytes();
-    let offset = (byte_offset as usize).min(bytes.len());
+    LineIndex::new(src).position(src, byte_offset, enc)
+}
 
-    let mut line = 0u32;
-    let mut line_start = 0usize;
-    for (i, &b) in bytes[..offset].iter().enumerate() {
-        if b == b'\n' {
-            line += 1;
-            line_start = i + 1;
+/// Where each line of a document starts, so converting an offset is a
+/// binary search rather than a scan from the top. Converting every token or
+/// every diagnostic of a large file one scan at a time was quadratic.
+pub struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    #[must_use]
+    pub fn new(src: &str) -> Self {
+        let starts = std::iter::once(0)
+            .chain(
+                src.bytes()
+                    .enumerate()
+                    .filter(|&(_, b)| b == b'\n')
+                    .map(|(i, _)| i + 1),
+            )
+            .collect();
+        LineIndex { starts }
+    }
+
+    /// [`byte_to_position`] for `src`, the text this index was built from.
+    #[must_use]
+    pub fn position(&self, src: &str, byte_offset: u32, enc: Encoding) -> (u32, u32) {
+        let bytes = src.as_bytes();
+        let offset = (byte_offset as usize).min(bytes.len());
+        let line = self.starts.partition_point(|&start| start <= offset) - 1;
+        let line_start = self.starts[line];
+
+        let mut line_bytes = &src[line_start..offset];
+        // The offset points exactly at the '\n' of a CRLF pair (i.e. right
+        // after the lone '\r') -- don't let that trailing '\r' count.
+        if line_bytes.ends_with('\r') && bytes.get(offset) == Some(&b'\n') {
+            line_bytes = &line_bytes[..line_bytes.len() - 1];
         }
-    }
 
-    let mut line_bytes = &src[line_start..offset];
-    // The offset points exactly at the '\n' of a CRLF pair (i.e. right
-    // after the lone '\r') -- don't let that trailing '\r' count.
-    if line_bytes.ends_with('\r') && bytes.get(offset) == Some(&b'\n') {
-        line_bytes = &line_bytes[..line_bytes.len() - 1];
+        let character = match enc {
+            Encoding::Utf8 => line_bytes.len() as u32,
+            Encoding::Utf16 => line_bytes.chars().map(|c| c.len_utf16() as u32).sum(),
+        };
+        (line as u32, character)
     }
-
-    let character = match enc {
-        Encoding::Utf8 => line_bytes.len() as u32,
-        Encoding::Utf16 => line_bytes.chars().map(|c| c.len_utf16() as u32).sum(),
-    };
-    (line, character)
 }
 
 /// The inverse of [`byte_to_position`]: an LSP position back to a byte offset.
