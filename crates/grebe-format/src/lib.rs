@@ -496,4 +496,23 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn stacked_prefix_operators_keep_their_space() {
+        // `--1` would start a comment; `~-1`, `-~1` and `~~1` are other
+        // operators (`~~` is LIKE).
+        assert_eq!(f("select - -1 as x"), "SELECT - -1 AS x;\n");
+        assert_eq!(f("select 2 * - -1"), "SELECT 2 * - -1;\n");
+        assert_eq!(
+            f("select ~ -1, - ~1, ~ ~1, + -1"),
+            "SELECT ~ -1, - ~1, ~ ~1, + -1;\n"
+        );
+        assert_eq!(f("select [- -1], (- -a)"), "SELECT [- -1], (- -a);\n");
+        // A single prefix operator still hugs its operand.
+        assert_eq!(f("select - 1, ~ a"), "SELECT -1, ~a;\n");
+        assert_eq!(
+            f(&f("select - -1; select 2")),
+            "SELECT - -1;\n\nSELECT 2;\n"
+        );
+    }
 }

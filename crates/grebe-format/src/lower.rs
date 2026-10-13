@@ -517,7 +517,14 @@ impl<'a> Lowerer<'a> {
             self.owner_rule(li),
             "MinusPrefixOperator" | "PlusPrefixOperator" | "TildePrefixOperator"
         ) {
-            return Doc::Nil;
+            // `-x` hugs, but `- -1` must not: `--1` starts a comment and
+            // `~-1` is a different operator. DuckDB reads any run of these
+            // characters as one operator token.
+            return if r.starts_with(|c: char| "+-*/<>=~!@%^&|`#".contains(c)) {
+                Doc::text(" ")
+            } else {
+                Doc::Nil
+            };
         }
         if r == "!" && self.owner_rule(ri) == "PostfixOperator" {
             return Doc::Nil;
