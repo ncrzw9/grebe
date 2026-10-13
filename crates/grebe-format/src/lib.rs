@@ -120,6 +120,11 @@ impl Default for Options {
 /// layout, and never gets "fixed" into something else.
 #[must_use]
 pub fn format(src: &str, opts: &Options) -> String {
+    // A byte order mark stays where it is: it says how the file is encoded,
+    // not anything about the SQL.
+    if let Some(rest) = src.strip_prefix('\u{feff}') {
+        return format!("\u{feff}{}", format(rest, opts));
+    }
     if let Some(tree) = grebe_syntax::matcher::parse(src) {
         return finish(format_tree(&tree, src, opts));
     }
@@ -494,6 +499,67 @@ mod tests {
                 let twice = narrow(&once, w);
                 assert_eq!(once, twice, "not idempotent at width {w}:\n{once}");
             }
+        }
+    }
+
+    #[test]
+    fn stacked_prefix_operators_keep_their_space() {
+        // `--1` would start a comment; `~-1`, `-~1` and `~~1` are other
+        // operators (`~~` is LIKE).
+        assert_eq!(f("select - -1 as x"), "SELECT - -1 AS x;\n");
+        assert_eq!(f("select 2 * - -1"), "SELECT 2 * - -1;\n");
+        assert_eq!(
+            f("select ~ -1, - ~1, ~ ~1, + -1"),
+            "SELECT ~ -1, - ~1, ~ ~1, + -1;\n"
+        );
+        assert_eq!(f("select [- -1], (- -a)"), "SELECT [- -1], (- -a);\n");
+        // A single prefix operator still hugs its operand.
+        assert_eq!(f("select - 1, ~ a"), "SELECT -1, ~a;\n");
+        assert_eq!(
+            f(&f("select - -1; select 2")),
+            "SELECT - -1;\n\nSELECT 2;\n"
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_kept_and_the_sql_after_it_formatted() {
+        assert_eq!(
+            f("\u{feff}select   1;\nselect   2"),
+            "\u{feff}SELECT 1;\n\nSELECT 2;\n"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_paren_costs_only_its_own_statement() {
+        assert_eq!(
+            f("select (;\nselect   1;\nselect 2"),
+            "select (;\n\nSELECT 1;\n\nSELECT 2;\n"
+        );
+    }
+
+    /// A line comment never moves between runs: formatting the output again
+    /// changes nothing.
+    #[test]
+    fn line_comments_stay_put_from_one_run_to_the_next() {
+        for (src, want) in [
+            ("select a from t -- c1", "SELECT a FROM t; -- c1\n"),
+            ("select 1 -- eof", "SELECT 1; -- eof\n"),
+            (
+                "select a, b from t where -- c\n x = 1",
+                "SELECT a, b\nFROM t\nWHERE -- c\nx = 1;\n",
+            ),
+            (
+                "select\n  a -- why a\n  , b\nfrom t",
+                "SELECT\n    a, -- why a\n    b\nFROM t;\n",
+            ),
+            (
+                "select list_transform([1,2,3] -- c\n, x -> x + 1) from t",
+                "SELECT\n    list_transform(\n        [1, 2, 3], -- c\n        x -> x + 1\n    )\nFROM t;\n",
+            ),
+        ] {
+            let once = f(src);
+            assert_eq!(once, want, "{src:?}");
+            assert_eq!(f(&once), once, "second run moved something: {src:?}");
         }
     }
 }

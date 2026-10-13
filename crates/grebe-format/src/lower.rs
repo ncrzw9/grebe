@@ -279,6 +279,23 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 _ => {
+                    // `x -- c` then `, y`: the comma ends x's line, and the
+                    // comment goes after it -- where the next run will find
+                    // it. Left trailing `x`, its line break would split up
+                    // whatever `x` closes (`[1, 2, 3]`, a CASE) on this run
+                    // and not on the next.
+                    if self.text(t) == "," {
+                        if let Some(k) = last_code {
+                            if let Some(cs) = self.trailing.get_mut(&k) {
+                                let (line, block): (Vec<_>, Vec<_>) =
+                                    std::mem::take(cs).into_iter().partition(|c| c.line);
+                                *cs = block;
+                                if !line.is_empty() {
+                                    self.trailing.entry(i).or_default().extend(line);
+                                }
+                            }
+                        }
+                    }
                     if !pending.is_empty() {
                         self.leading.insert(i, std::mem::take(&mut pending));
                     }
@@ -428,7 +445,13 @@ impl<'a> Lowerer<'a> {
     fn comments_trailing(&self, i: usize, parts: &mut Vec<Doc>) {
         if let Some(cs) = self.trailing.get(&i) {
             for c in cs {
-                if c.line {
+                if c.line && self.stmt_end.get() == Some(i) {
+                    // After the statement's last token: it goes after the
+                    // `;`, which is where the next run finds it, so it must
+                    // not break the statement's layout either -- the next
+                    // run would see a comment trailing `;` and keep it flat.
+                    parts.push(Doc::LineSuffix(format!(" {}", c.text)));
+                } else if c.line {
                     parts.push(Doc::LineSuffix(format!(" {}", c.text)));
                     parts.push(Doc::BreakParent);
                 } else {
@@ -517,7 +540,14 @@ impl<'a> Lowerer<'a> {
             self.owner_rule(li),
             "MinusPrefixOperator" | "PlusPrefixOperator" | "TildePrefixOperator"
         ) {
-            return Doc::Nil;
+            // `-x` hugs, but `- -1` must not: `--1` starts a comment and
+            // `~-1` is a different operator. DuckDB reads any run of these
+            // characters as one operator token.
+            return if r.starts_with(|c: char| "+-*/<>=~!@%^&|`#".contains(c)) {
+                Doc::text(" ")
+            } else {
+                Doc::Nil
+            };
         }
         if r == "!" && self.owner_rule(ri) == "PostfixOperator" {
             return Doc::Nil;

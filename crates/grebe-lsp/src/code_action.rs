@@ -60,6 +60,11 @@ fn overlaps(a: Span, b: Span) -> bool {
 
 fn action_for(uri: &str, src: &str, f: &Finding, enc: Encoding) -> Option<Json> {
     let fix = f.fix.as_ref()?;
+    // Never offer an edit that would drop a comment or break a statement
+    // that parses -- the same check `grebe check --fix` applies.
+    if !grebe_rules::fix::is_sound(src, fix) {
+        return None;
+    }
     let rule = grebe_rules::lookup(f.code)?;
     let safety = rule.fix_safety;
     if safety == FixSafety::None {

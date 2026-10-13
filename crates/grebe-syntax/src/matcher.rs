@@ -5,6 +5,8 @@
 //! that shape, not of a generic PEG library. It matches over non-trivia tokens
 //! only; trivia is reattached to the tree afterwards so the CST stays lossless.
 
+use std::collections::HashMap;
+
 use crate::Span;
 use crate::cst::{Node, NodeId, Tree};
 use crate::grammar::{
@@ -26,14 +28,29 @@ pub struct Matcher<'a> {
     /// Each match token's keyword categories, computed once: identifier and
     /// keyword rules ask about the same token many times during backtracking.
     keywords: Vec<Keyword>,
-    /// Packrat state for every `(rule, token position)`, at
-    /// `rule * positions + token`: [`UNSEEN`], [`ACTIVE`] (being matched;
-    /// re-entering means left recursion), [`FAILED`], or `HIT_BASE + i` for
-    /// `hits[i]`. One flat table replaces a hash map: a rule entry is an
-    /// array read, and the table is allocated zeroed, which the allocator
-    /// serves lazily for large inputs.
+    /// Packrat state for every `(rule, token position)` in the window
+    /// `base..base + width`, at `rule * width + (token - base)`: [`UNSEEN`],
+    /// [`ACTIVE`] (being matched; re-entering means left recursion),
+    /// [`FAILED`], or `HIT_BASE + i` for `hits[i]`. A flat table, so a rule
+    /// entry is an array read.
+    ///
+    /// The window is one top-level statement: `Program <- TopLevelStatement*`
+    /// never backtracks into a statement it has matched, so when the next
+    /// one starts, everything memoised so far is dead and the window, `hits`
+    /// and `pool` start again (see [`Matcher::start_statement`]). Memory
+    /// follows the largest statement, not the file: a table over the whole
+    /// file took ~4 KB per token (1,000+ rules) and its subtree pool as much
+    /// again, ~120 KB per line of typical SQL.
     memo: Vec<u32>,
+    base: usize,
+    width: usize,
+    /// Entries outside the window (lookahead past a statement's `;`),
+    /// keyed by `rule * positions + token`. Rare, and keeps the window an
+    /// optimisation only: no position goes unmemoised.
+    overflow: HashMap<usize, u32>,
     positions: usize,
+    /// The `TopLevelStatement*` loop of `Program`, where windows begin.
+    statements: Option<ExprId>,
     /// Successful matches: where each ended, and its subtree as a range of
     /// `pool`.
     ///
@@ -63,6 +80,12 @@ pub struct Matcher<'a> {
 /// level it still admits a few hundred levels of nesting; the tests pin 200
 /// as parsing and 1,000 as rejected.
 const MAX_DEPTH: u32 = 10_000;
+
+#[derive(Clone, Copy)]
+enum Slot {
+    Window(usize),
+    Overflow(usize),
+}
 
 const UNSEEN: u32 = 0;
 const ACTIVE: u32 = 1;
@@ -108,8 +131,15 @@ impl<'a> Matcher<'a> {
             src: src.as_bytes(),
             match_tokens,
             keywords,
-            memo: vec![UNSEEN; RULES.len() * (match_tokens_len + 1)],
+            memo: Vec::new(),
+            base: 0,
+            width: 0,
+            overflow: HashMap::new(),
             positions: match_tokens_len + 1,
+            statements: match EXPRESSIONS[RULES[RULE_PROGRAM.0 as usize].expr.0 as usize] {
+                Expr::ZeroOrMore(_) => Some(RULES[RULE_PROGRAM.0 as usize].expr),
+                _ => None,
+            },
             hits: Vec::new(),
             pool: Vec::new(),
             far: 0,
@@ -119,13 +149,58 @@ impl<'a> Matcher<'a> {
         }
     }
 
+    /// Forget everything memoised and open a window for the top-level
+    /// statement at `at`: its tokens through the first `;` after it, plus
+    /// the position past that.
+    fn start_statement(&mut self, at: usize) {
+        let end = self.match_tokens[at..]
+            .iter()
+            .position(|(t, _)| t.span.slice(self.src) == b";")
+            .map_or(self.match_tokens.len(), |i| at + i + 1);
+        self.base = at;
+        self.width = end - at + 1;
+        // A fresh zeroed table, not a cleared one: the allocator hands out
+        // zeroed pages lazily, so only the slots this statement touches
+        // cost anything. Clearing and resizing would write every byte -- a
+        // file with no `;` is one window over the whole file.
+        self.memo = vec![UNSEEN; RULES.len() * self.width];
+        self.overflow.clear();
+        self.hits.clear();
+        self.pool.clear();
+    }
+
+    fn slot(&self, rule_id: RuleId, token_idx: usize) -> Slot {
+        let off = token_idx.wrapping_sub(self.base);
+        if off < self.width {
+            Slot::Window(rule_id.0 as usize * self.width + off)
+        } else {
+            Slot::Overflow(rule_id.0 as usize * self.positions + token_idx)
+        }
+    }
+
+    fn memo_get(&self, slot: Slot) -> u32 {
+        match slot {
+            Slot::Window(i) => self.memo[i],
+            Slot::Overflow(k) => self.overflow.get(&k).copied().unwrap_or(UNSEEN),
+        }
+    }
+
+    fn memo_set(&mut self, slot: Slot, v: u32) {
+        match slot {
+            Slot::Window(i) => self.memo[i] = v,
+            Slot::Overflow(k) => {
+                self.overflow.insert(k, v);
+            }
+        }
+    }
+
     fn evaluate_rule(&mut self, rule_id: RuleId, token_idx: usize) -> Option<usize> {
-        let slot = rule_id.0 as usize * self.positions + token_idx;
+        let slot = self.slot(rule_id, token_idx);
 
         // Return ANY cached result, success included. Returning only on a
         // cached failure would re-evaluate every successful rule from scratch,
         // defeating packrat entirely.
-        match self.memo[slot] {
+        match self.memo_get(slot) {
             UNSEEN => {}
             ACTIVE | FAILED => return None, // ACTIVE: guard left recursion
             hit => {
@@ -142,7 +217,7 @@ impl<'a> Matcher<'a> {
         if self.depth >= MAX_DEPTH {
             return None;
         }
-        self.memo[slot] = ACTIVE;
+        self.memo_set(slot, ACTIVE);
         self.depth += 1;
 
         let mut body_start = self.nodes.len();
@@ -286,6 +361,12 @@ impl<'a> Matcher<'a> {
                 span: Span::new(start_byte, end_byte),
                 size,
             });
+            // Program is matched once and never replayed: copying the
+            // whole tree into the pool would only double it.
+            if rule_id == RULE_PROGRAM {
+                self.record_hit(slot, end_idx, 0, 0);
+                return res;
+            }
             // Memoise the whole subtree this rule produced so a later hit at
             // the same position replays it instead of re-matching.
             let offset = self.pool.len();
@@ -293,14 +374,14 @@ impl<'a> Matcher<'a> {
             let len = self.pool.len() - offset;
             self.record_hit(slot, end_idx, offset, len);
         } else {
-            self.memo[slot] = FAILED;
+            self.memo_set(slot, FAILED);
         }
 
         res
     }
 
-    fn record_hit(&mut self, slot: usize, end: usize, offset: usize, len: usize) {
-        self.memo[slot] = HIT_BASE + self.hits.len() as u32;
+    fn record_hit(&mut self, slot: Slot, end: usize, offset: usize, len: usize) {
+        self.memo_set(slot, HIT_BASE + self.hits.len() as u32);
         self.hits.push((end, offset as u32, len as u32));
     }
 
@@ -385,8 +466,12 @@ impl<'a> Matcher<'a> {
                 }
             }
             Expr::ZeroOrMore(item) => {
+                let top = self.statements == Some(expr_id);
                 let mut curr = token_idx;
                 while curr < self.match_tokens.len() {
+                    if top {
+                        self.start_statement(curr);
+                    }
                     let start_nodes = self.nodes.len();
                     if let Some(next) = self.evaluate(*item, curr) {
                         if next == curr {
@@ -623,6 +708,56 @@ mod tests {
                 "token {k} at {:?}",
                 t.span
             );
+        }
+    }
+
+    /// Memo, subtree pool and hits are per top-level statement: after a
+    /// file of many statements they hold one statement's worth, not the
+    /// file's. (A table over the whole file took ~120 KB per line.)
+    #[test]
+    fn memo_is_sized_to_a_statement_not_the_file() {
+        let one =
+            "SELECT a, sum(b) FILTER (WHERE c > 1) AS s FROM t WHERE d IN (1, 2) GROUP BY a;\n";
+        let src = one.repeat(2_000);
+        let tokens = tokenize(&src);
+        let mut m = Matcher::new(&src, &tokens, true);
+        let end = m.evaluate_rule(RULE_PROGRAM, 0).expect("parses");
+        assert_eq!(end, m.match_tokens.len());
+        let per_statement = m.match_tokens.len() / 2_000;
+        assert!(m.width <= per_statement + 1, "window {} tokens", m.width);
+        assert_eq!(m.memo.len(), RULES.len() * m.width);
+        assert!(
+            m.pool.len() < 20 * per_statement * 30,
+            "pool {} nodes",
+            m.pool.len()
+        );
+        // And the tree is the whole file's.
+        let tree = parse(&src).expect("parses");
+        assert_eq!(tree.find("SelectStatement").len(), 2_000);
+    }
+
+    /// DuckDB rejects a string, quoted identifier, dollar-quote or block
+    /// comment with no closing delimiter, so the statement must not parse:
+    /// otherwise it is linted and formatted as if it ended somewhere.
+    #[test]
+    fn unclosed_strings_and_comments_do_not_parse() {
+        for src in [
+            "SELECT 'abc",
+            "SELECT e'abc\\'",
+            "SELECT \"abc",
+            "SELECT $$abc",
+            "SELECT $t$abc$$",
+            "SELECT 1 /* never closed",
+            "SELECT 1 /* a /* b */ still open",
+            "SELECT count(*) FROM t WHERE x = 'oops;\nSELECT 2;",
+        ] {
+            assert!(parse(src).is_none(), "parsed: {src:?}");
+        }
+        for src in [
+            "SELECT 'it''s', e'a\\'b', \"a\"\"b\", $$x$$, $t$a$$b$t$",
+            "SELECT /* a /* b */ c */ 1",
+        ] {
+            assert!(parse(src).is_some(), "did not parse: {src:?}");
         }
     }
 }

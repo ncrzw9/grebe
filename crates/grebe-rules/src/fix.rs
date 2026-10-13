@@ -13,6 +13,14 @@
 //!   disagree about what those bytes should say, and there is no principled way
 //!   to pick. The earlier edit wins, the later one is dropped and counted, and
 //!   a second `--fix` run picks it up against the new text.
+//! - **An edit must leave the SQL no worse.** Each edit is checked on its own
+//!   before it is applied ([`is_sound`]): it may not drop a comment from the
+//!   text it replaces, and the statement it lands in must still parse if it
+//!   parsed before. A rule that gets an unusual shape wrong then leaves that
+//!   statement alone instead of breaking it.
+
+use grebe_syntax::Span;
+use grebe_syntax::token::{TokenKind, split_statements, tokenize};
 
 use crate::detect::{Finding, Fix};
 use crate::registry::FixSafety;
@@ -25,6 +33,95 @@ pub struct Applied {
     pub applied: usize,
     /// How many were dropped because they overlapped an earlier edit.
     pub skipped_overlapping: usize,
+    /// How many were dropped because applying them would have lost a
+    /// comment or broken a statement that parsed ([`is_sound`]).
+    pub skipped_unsound: usize,
+}
+
+/// Would applying `fix` to `src` leave it no worse? It must keep every
+/// comment in the text it replaces (in order), and every statement it
+/// touches must still parse if it parsed before.
+#[must_use]
+pub fn is_sound(src: &str, fix: &Fix) -> bool {
+    let statements = split_statements(src);
+    keeps_comments(src, fix)
+        && region(&statements, fix).is_none_or(|r| still_parses(src, r, &[fix]))
+}
+
+/// The span is a valid slice of `src`, and each comment in the text it
+/// replaces appears in the replacement, in the same order.
+fn keeps_comments(src: &str, fix: &Fix) -> bool {
+    let (s, e) = (fix.span.start as usize, fix.span.end as usize);
+    if e < s || e > src.len() || !src.is_char_boundary(s) || !src.is_char_boundary(e) {
+        return false;
+    }
+    let replaced = &src[s..e];
+    let mut rest = fix.replacement.as_str();
+    for t in tokenize(replaced) {
+        if matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment) {
+            let text = replaced[t.span.start as usize..t.span.end as usize].trim_end();
+            match rest.find(text) {
+                Some(i) => rest = &rest[i + text.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// A byte range of the source: the statements an edit touches.
+type Region = (usize, usize);
+
+/// The bytes of the statements `fix` touches (`statements` in source
+/// order), widened to cover the fix. `None` when it touches only the
+/// whitespace and comments between statements.
+fn region(statements: &[Span], fix: &Fix) -> Option<Region> {
+    let (s, e) = (fix.span.start, fix.span.end);
+    let lo = statements.partition_point(|st| st.end < s);
+    let hi = statements.partition_point(|st| st.start <= e);
+    (lo < hi).then(|| {
+        (
+            statements[lo].start.min(s) as usize,
+            statements[hi - 1].end.max(e) as usize,
+        )
+    })
+}
+
+/// Does `src[rs..re]` still parse with `edits` (in order, inside it)
+/// applied -- or did it not parse to begin with?
+fn still_parses(src: &str, (rs, re): Region, edits: &[&Fix]) -> bool {
+    if !grebe_syntax::matcher::parse_check(&src[rs..re]).0 {
+        return true; // already broken: nothing for these edits to make worse
+    }
+    let mut after = String::with_capacity(re - rs);
+    let mut cursor = rs;
+    for e in edits {
+        after.push_str(&src[cursor..e.span.start as usize]);
+        after.push_str(&e.replacement);
+        cursor = e.span.end as usize;
+    }
+    after.push_str(&src[cursor..re]);
+    grebe_syntax::matcher::parse_check(&after).0
+}
+
+/// Of `edits` (in order, all inside `region`), the ones that keep it
+/// parsing. Usually all of them, checked with one parse; otherwise each on
+/// its own, then together, one at a time.
+fn parsing_subset<'f>(src: &str, region: Region, edits: &[&'f Fix]) -> Vec<&'f Fix> {
+    if still_parses(src, region, edits) {
+        return edits.to_vec();
+    }
+    let mut kept: Vec<&Fix> = Vec::new();
+    for &e in edits {
+        if !still_parses(src, region, &[e]) {
+            continue;
+        }
+        kept.push(e);
+        if !still_parses(src, region, &kept) {
+            kept.pop();
+        }
+    }
+    kept
 }
 
 /// Which fixes a run is allowed to apply.
@@ -68,11 +165,11 @@ pub fn apply(src: &str, findings: &[Finding], safety: Safety) -> Applied {
     // earlier edit wins" a rule rather than a coin flip.
     edits.sort_by_key(|e| (e.span.start, e.span.end));
 
-    let mut out = String::with_capacity(src.len());
+    // Bounds, overlaps and comments, per edit.
+    let mut candidates: Vec<&Fix> = Vec::with_capacity(edits.len());
     let mut cursor: u32 = 0;
-    let mut applied = 0usize;
     let mut skipped_overlapping = 0usize;
-
+    let mut skipped_unsound = 0usize;
     for e in edits {
         // A reversed or out-of-bounds span is a rule bug; refuse it (counted
         // with the overlaps) rather than panic on the slice. A zero-width
@@ -85,24 +182,68 @@ pub fn apply(src: &str, findings: &[Finding], safety: Safety) -> Applied {
             skipped_overlapping += 1;
             continue;
         }
-        out.push_str(&src[cursor as usize..e.span.start as usize]);
-        out.push_str(&e.replacement);
+        if !keeps_comments(src, e) {
+            skipped_unsound += 1;
+            continue;
+        }
+        candidates.push(e);
         cursor = e.span.end;
-        applied += 1;
     }
+
+    // Parsing, per statement: each statement's edits together, so a
+    // statement is parsed twice however many edits it has (one 20,000-column
+    // statement had thousands). Edits whose statements overlap -- one edit
+    // spanning two -- are checked as one group.
+    let statements = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        split_statements(src)
+    };
+    let mut groups: Vec<(Option<Region>, Vec<&Fix>)> = Vec::new();
+    for e in candidates {
+        let r = region(&statements, e);
+        if let (Some((Some((_, ge)), group)), Some((s, end))) = (groups.last_mut(), r) {
+            if s < *ge {
+                *ge = (*ge).max(end);
+                group.push(e);
+                continue;
+            }
+        }
+        groups.push((r, vec![e]));
+    }
+    let mut accepted: Vec<&Fix> = Vec::with_capacity(groups.len());
+    for (region, group) in &groups {
+        let kept = match region {
+            Some(r) => parsing_subset(src, *r, group),
+            None => group.clone(),
+        };
+        skipped_unsound += group.len() - kept.len();
+        accepted.extend(kept);
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0usize;
+    for e in &accepted {
+        out.push_str(&src[cursor..e.span.start as usize]);
+        out.push_str(&e.replacement);
+        cursor = e.span.end as usize;
+    }
+    let applied = accepted.len();
 
     if applied == 0 {
         return Applied {
             output: None,
             applied: 0,
             skipped_overlapping,
+            skipped_unsound,
         };
     }
-    out.push_str(&src[cursor as usize..]);
+    out.push_str(&src[cursor..]);
     Applied {
         output: Some(out),
         applied,
         skipped_overlapping,
+        skipped_unsound,
     }
 }
 
@@ -312,5 +453,62 @@ mod tests {
             grebe_syntax::matcher::parse(&out).is_some(),
             "fix produced unparseable SQL: {out}"
         );
+    }
+
+    fn fix_all(src: &str) -> String {
+        let all = crate::registry::expand_select(vec![crate::registry::SELECT_ALL.to_string()]);
+        apply_until_stable(src, Some(&all), Safety::IncludeUnsafe)
+            .output
+            .unwrap_or_else(|| src.to_string())
+    }
+
+    #[test]
+    fn a_fix_that_would_drop_a_comment_is_not_applied() {
+        for src in [
+            "SELECT /* keep me */ * FROM t;\n", // MOD022
+            "SELECT 2 /* two */ AS y;\n",       // MOD023
+            "SELECT a, b, count() FROM t GROUP BY a, -- region\n b;\n", // MOD003
+            "SELECT * FROM t WHERE NULL /* c */ = x;\n", // MOD002
+        ] {
+            let out = fix_all(src);
+            for c in ["/* keep me */", "/* two */", "-- region", "/* c */"] {
+                assert_eq!(src.contains(c), out.contains(c), "{src:?} -> {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fix_that_would_break_a_statement_that_parses_is_not_applied() {
+        for src in [
+            "SELECT 1 AS 'x';\n",                        // MOD023 -> SELECT 'x': 1
+            "SELECT * FROM t WHERE NULL <> a || 'x';\n", // MOD002 chain
+            "SELECT * FROM t WHERE NULL = a = b;\n",
+        ] {
+            let out = fix_all(src);
+            assert!(
+                grebe_syntax::matcher::parse(&out).is_some(),
+                "{src:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sound_fixes_still_apply() {
+        assert_eq!(fix_all("SELECT 2 AS y;\n"), "SELECT y: 2;\n");
+        assert_eq!(
+            fix_all("SELECT a FROM t WHERE x = NULL;\n"),
+            "SELECT a FROM t WHERE x IS NULL;\n"
+        );
+        let src = "SELECT 1 AS 'x';\nSELECT 2 AS y;\n";
+        let applied = apply(
+            src,
+            &analyze_source(src, Some(&["MOD023".to_string()])),
+            Safety::SafeOnly,
+        );
+        assert_eq!(
+            applied.output.as_deref(),
+            Some("SELECT 1 AS 'x';\nSELECT y: 2;\n")
+        );
+        assert_eq!((applied.applied, applied.skipped_unsound), (1, 1));
     }
 }

@@ -595,6 +595,27 @@ pub fn order_by_all(tree: &Tree, src: &str) -> Vec<Finding> {
             if !reduces_to(tree, expr, "ColumnReference") {
                 break; // computed select item anywhere disqualifies the whole statement
             }
+            // An alias named like an ORDER BY item disqualifies: `ORDER BY
+            // a` binds to an output alias `a` before a column `a`, so
+            // `SELECT a AS b, b AS a ... ORDER BY a, b` sorts by the second
+            // column first and is not ALL. (`a AS x`, `a x` and `x: a`
+            // alike: the alias is what the item has outside its expression.)
+            let (espan, ispan) = (tree.node(expr).span, tree.node(*item).span);
+            let from = tree.tokens.partition_point(|t| t.span.start < ispan.start);
+            let shadows = tree.tokens[from..]
+                .iter()
+                .take_while(|t| t.span.end <= ispan.end)
+                .filter(|t| !t.kind.is_trivia())
+                .filter(|t| t.span.end <= espan.start || t.span.start >= espan.end)
+                .map(|t| {
+                    src[t.span.start as usize..t.span.end as usize]
+                        .trim_matches('"')
+                        .to_lowercase()
+                })
+                .any(|word| word != "as" && word != ":" && onames.contains(&word));
+            if shadows {
+                break;
+            }
             snames.push(text(tree, expr, src).to_lowercase());
         }
         if snames.len() != select_items.len() {
@@ -927,6 +948,15 @@ mod tests {
         // select-list item doesn't change which underlying column is
         // compared.
         assert!(fires("MOD013", "SELECT A, b AS bee FROM t ORDER BY a, B"));
+        // ...unless the alias is an ORDER BY name: it binds to the alias.
+        for sql in [
+            "SELECT a AS b, b AS a FROM t ORDER BY a, b",
+            "SELECT a b, b a FROM t ORDER BY a, b",
+            "SELECT b: a, a: b FROM t ORDER BY a, b",
+            "SELECT a, b AS \"A\" FROM t ORDER BY a, b",
+        ] {
+            assert!(!fires("MOD013", sql), "should NOT fire: {sql}");
+        }
     }
 
     #[test]
