@@ -43,18 +43,18 @@ pub struct Applied {
 /// touches must still parse if it parsed before.
 #[must_use]
 pub fn is_sound(src: &str, fix: &Fix) -> bool {
-    is_sound_in(src, &split_statements(src), fix)
+    let statements = split_statements(src);
+    keeps_comments(src, fix)
+        && region(&statements, fix).is_none_or(|r| still_parses(src, r, &[fix]))
 }
 
-/// [`is_sound`] with the statements of `src` already split.
-fn is_sound_in(src: &str, statements: &[Span], fix: &Fix) -> bool {
+/// The span is a valid slice of `src`, and each comment in the text it
+/// replaces appears in the replacement, in the same order.
+fn keeps_comments(src: &str, fix: &Fix) -> bool {
     let (s, e) = (fix.span.start as usize, fix.span.end as usize);
     if e < s || e > src.len() || !src.is_char_boundary(s) || !src.is_char_boundary(e) {
         return false;
     }
-
-    // Comments: each one in the replaced text must appear in the
-    // replacement, in the same order.
     let replaced = &src[s..e];
     let mut rest = fix.replacement.as_str();
     for t in tokenize(replaced) {
@@ -66,23 +66,62 @@ fn is_sound_in(src: &str, statements: &[Span], fix: &Fix) -> bool {
             }
         }
     }
+    true
+}
 
-    // Parsing: the statements the edit touches, before and after.
-    let touched: Vec<&Span> = statements
-        .iter()
-        .filter(|st| (st.start as usize) <= e && s <= st.end as usize)
-        .collect();
-    let (Some(first), Some(last)) = (touched.first(), touched.last()) else {
-        return true; // only whitespace or comments between statements
-    };
-    let (rs, re) = (first.start as usize, last.end as usize);
-    let (rs, re) = (rs.min(s), re.max(e));
-    let before = &src[rs..re];
-    if !grebe_syntax::matcher::parse_check(before).0 {
-        return true; // already broken: nothing for this edit to make worse
+/// A byte range of the source: the statements an edit touches.
+type Region = (usize, usize);
+
+/// The bytes of the statements `fix` touches (`statements` in source
+/// order), widened to cover the fix. `None` when it touches only the
+/// whitespace and comments between statements.
+fn region(statements: &[Span], fix: &Fix) -> Option<Region> {
+    let (s, e) = (fix.span.start, fix.span.end);
+    let lo = statements.partition_point(|st| st.end < s);
+    let hi = statements.partition_point(|st| st.start <= e);
+    (lo < hi).then(|| {
+        (
+            statements[lo].start.min(s) as usize,
+            statements[hi - 1].end.max(e) as usize,
+        )
+    })
+}
+
+/// Does `src[rs..re]` still parse with `edits` (in order, inside it)
+/// applied -- or did it not parse to begin with?
+fn still_parses(src: &str, (rs, re): Region, edits: &[&Fix]) -> bool {
+    if !grebe_syntax::matcher::parse_check(&src[rs..re]).0 {
+        return true; // already broken: nothing for these edits to make worse
     }
-    let after = format!("{}{}{}", &src[rs..s], fix.replacement, &src[e..re]);
+    let mut after = String::with_capacity(re - rs);
+    let mut cursor = rs;
+    for e in edits {
+        after.push_str(&src[cursor..e.span.start as usize]);
+        after.push_str(&e.replacement);
+        cursor = e.span.end as usize;
+    }
+    after.push_str(&src[cursor..re]);
     grebe_syntax::matcher::parse_check(&after).0
+}
+
+/// Of `edits` (in order, all inside `region`), the ones that keep it
+/// parsing. Usually all of them, checked with one parse; otherwise each on
+/// its own, then together, one at a time.
+fn parsing_subset<'f>(src: &str, region: Region, edits: &[&'f Fix]) -> Vec<&'f Fix> {
+    if still_parses(src, region, edits) {
+        return edits.to_vec();
+    }
+    let mut kept: Vec<&Fix> = Vec::new();
+    for &e in edits {
+        if !still_parses(src, region, &[e]) {
+            continue;
+        }
+        kept.push(e);
+        if !still_parses(src, region, &kept) {
+            kept.pop();
+        }
+    }
+    kept
 }
 
 /// Which fixes a run is allowed to apply.
@@ -126,17 +165,11 @@ pub fn apply(src: &str, findings: &[Finding], safety: Safety) -> Applied {
     // earlier edit wins" a rule rather than a coin flip.
     edits.sort_by_key(|e| (e.span.start, e.span.end));
 
-    let statements = if edits.is_empty() {
-        Vec::new()
-    } else {
-        split_statements(src)
-    };
-    let mut out = String::with_capacity(src.len());
+    // Bounds, overlaps and comments, per edit.
+    let mut candidates: Vec<&Fix> = Vec::with_capacity(edits.len());
     let mut cursor: u32 = 0;
-    let mut applied = 0usize;
     let mut skipped_overlapping = 0usize;
     let mut skipped_unsound = 0usize;
-
     for e in edits {
         // A reversed or out-of-bounds span is a rule bug; refuse it (counted
         // with the overlaps) rather than panic on the slice. A zero-width
@@ -149,15 +182,53 @@ pub fn apply(src: &str, findings: &[Finding], safety: Safety) -> Applied {
             skipped_overlapping += 1;
             continue;
         }
-        if !is_sound_in(src, &statements, e) {
+        if !keeps_comments(src, e) {
             skipped_unsound += 1;
             continue;
         }
-        out.push_str(&src[cursor as usize..e.span.start as usize]);
-        out.push_str(&e.replacement);
+        candidates.push(e);
         cursor = e.span.end;
-        applied += 1;
     }
+
+    // Parsing, per statement: each statement's edits together, so a
+    // statement is parsed twice however many edits it has (one 20,000-column
+    // statement had thousands). Edits whose statements overlap -- one edit
+    // spanning two -- are checked as one group.
+    let statements = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        split_statements(src)
+    };
+    let mut groups: Vec<(Option<Region>, Vec<&Fix>)> = Vec::new();
+    for e in candidates {
+        let r = region(&statements, e);
+        if let (Some((Some((_, ge)), group)), Some((s, end))) = (groups.last_mut(), r) {
+            if s < *ge {
+                *ge = (*ge).max(end);
+                group.push(e);
+                continue;
+            }
+        }
+        groups.push((r, vec![e]));
+    }
+    let mut accepted: Vec<&Fix> = Vec::with_capacity(groups.len());
+    for (region, group) in &groups {
+        let kept = match region {
+            Some(r) => parsing_subset(src, *r, group),
+            None => group.clone(),
+        };
+        skipped_unsound += group.len() - kept.len();
+        accepted.extend(kept);
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0usize;
+    for e in &accepted {
+        out.push_str(&src[cursor..e.span.start as usize]);
+        out.push_str(&e.replacement);
+        cursor = e.span.end as usize;
+    }
+    let applied = accepted.len();
 
     if applied == 0 {
         return Applied {
@@ -167,7 +238,7 @@ pub fn apply(src: &str, findings: &[Finding], safety: Safety) -> Applied {
             skipped_unsound,
         };
     }
-    out.push_str(&src[cursor as usize..]);
+    out.push_str(&src[cursor..]);
     Applied {
         output: Some(out),
         applied,
