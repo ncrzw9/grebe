@@ -159,8 +159,11 @@ impl<'a> Matcher<'a> {
             .map_or(self.match_tokens.len(), |i| at + i + 1);
         self.base = at;
         self.width = end - at + 1;
-        self.memo.clear();
-        self.memo.resize(RULES.len() * self.width, UNSEEN);
+        // A fresh zeroed table, not a cleared one: the allocator hands out
+        // zeroed pages lazily, so only the slots this statement touches
+        // cost anything. Clearing and resizing would write every byte -- a
+        // file with no `;` is one window over the whole file.
+        self.memo = vec![UNSEEN; RULES.len() * self.width];
         self.overflow.clear();
         self.hits.clear();
         self.pool.clear();
