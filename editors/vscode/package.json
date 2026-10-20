@@ -83,7 +83,8 @@
       {
         "command": "grebe.duckdb.restart",
         "title": "Restart DuckDB Session",
-        "category": "grebe"
+        "category": "grebe",
+        "icon": "$(debug-restart)"
       },
       {
         "command": "grebe.duckdb.runRange",
@@ -415,6 +416,11 @@
           "group": "navigation@2"
         },
         {
+          "command": "grebe.duckdb.restart",
+          "when": "view == grebe.catalog",
+          "group": "navigation@3"
+        },
+        {
           "command": "grebe.results.openInEditor",
           "when": "view == grebe.results",
           "group": "navigation@1"
@@ -454,6 +460,11 @@
         {
           "command": "grebe.catalog.closeFile",
           "when": "view == grebe.catalog && viewItem == grebe.fileRoot",
+          "group": "inline"
+        },
+        {
+          "command": "grebe.duckdb.restart",
+          "when": "view == grebe.catalog && viewItem == grebe.sessionRoot",
           "group": "inline"
         },
         {
