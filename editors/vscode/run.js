@@ -561,6 +561,23 @@ function restart() {
   vscode.window.setStatusBarMessage("grebe: DuckDB session restarted", 3000);
 }
 
+/** The Restart DuckDB Session command, from the palette or the Catalog: ends
+ *  the duckdb process, which hands back all the memory it held. A running
+ *  session loses what lives only in it, so that asks first. */
+async function restartSession() {
+  const db = settings().database;
+  if (liveSession()) {
+    const detail =
+      db === ":memory:"
+        ? "The in-memory database and every table in it are discarded."
+        : `Temporary tables, attached databases, settings and secrets are discarded. ${path.basename(db)} is kept.`;
+    const pick = await vscode.window.showWarningMessage("Restart the DuckDB session?", { modal: true, detail }, "Restart");
+    if (pick !== "Restart") return;
+  }
+  restart();
+  for (const l of runListeners) l();
+}
+
 /**
  * A "▶ Run" CodeLens above every statement. The statements are the server's
  * (`grebe/statements`), the same split a run uses, so a lens can never sit
@@ -659,7 +676,7 @@ function activate(context, clientReady) {
     log.command("grebe.duckdb.runRange", runRange),
     vscode.languages.registerCodeLensProvider({ language: "sql" }, lenses),
     lenses,
-    log.command("grebe.duckdb.restart", restart),
+    log.command("grebe.duckdb.restart", restartSession),
     log.command("grebe.duckdb.cancel", cancel),
     log.command("grebe.duckdb.chooseDatabase", chooseDatabase),
     // A runtime error describes the text it ran; once that text changes, it
