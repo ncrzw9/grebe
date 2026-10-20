@@ -85,11 +85,13 @@ const vscode = {
 // What runs SQL and shows results has its own tests (run-e2e.test.js);
 // here it only has to be activated, and told when the server changes.
 let clientChanges = 0;
+let failInspect = false;
+let catalogs = 0;
 const quiet = {
   "./results": { init() {}, register() {}, setCancelHandler() {} },
   "./run": { activate() {}, clientChanged: () => clientChanges++, cancel() {}, isRunning: () => false, currentSession() {}, liveSession() {}, onDidRun() {}, settings: () => ({}) },
-  "./inspect": { activate() {} },
-  "./catalog": { activate: () => ({ refresh() {} }) },
+  "./inspect": { activate() { if (failInspect) throw new Error("inspect broke"); } },
+  "./catalog": { activate: () => { catalogs++; return { refresh() {} }; } },
   "./dataEditor": { activate() {} },
 };
 const realLoad = Module._load;
@@ -165,4 +167,19 @@ test("changing grebe.path restarts the server", { skip: !process.env.GREBE_BIN }
   assert.equal(spawned.length, 2);
   assert.match(statusItem.text, /^\$\(check\) grebe/);
   await extension.deactivate();
+});
+
+test("a feature that fails to set up is reported; the Catalog and the server still come up", async () => {
+  failInspect = true;
+  catalogs = 0;
+  try {
+    settings = { path: "/nonexistent/grebe" };
+    await extension.activate(context());
+    assert.equal(catalogs, 1, "the Catalog was set up");
+    assert.ok(shown.some((m) => /could not set up data file inspection: inspect broke/.test(m)), shown.join("\n"));
+    assert.ok(shown.some((m) => /grebe\.path/.test(m)), "the server start still ran");
+  } finally {
+    failInspect = false;
+    await extension.deactivate();
+  }
 });

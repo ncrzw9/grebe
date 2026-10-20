@@ -86,6 +86,8 @@ class Explorer {
     this.onDidChangeTreeData = this.changed.event;
     this.files = new Map(); // alias -> { file, error }
     this.fileSession = null;
+    this.mem = null; // the session's last memory figures: { used, limit }
+    this.memAsking = null;
   }
 
   refresh() {
@@ -114,10 +116,14 @@ class Explorer {
   async roots() {
     const s = this.deps.settings();
     const label = s.database === ":memory:" ? ":memory:" : path.basename(s.database);
-    // How much memory the session holds, when it is running. Asked here,
-    // not with the children: the root's own line is drawn before them.
+    // How much memory the session holds, when it is running. Not awaited:
+    // the question waits behind whatever the session is running, and the
+    // tree must not stay empty until a long query ends. The last figure is
+    // drawn now; a different one redraws the tree when it arrives.
     const live = this.deps.liveSession();
-    const mem = live ? (objects(await live.run(MEMORY).catch(() => ({ kind: "error" }))) || [])[0] : null;
+    if (!live) this.mem = null;
+    else this.askMemory(live);
+    const mem = live ? this.mem : null;
     const roots = [
       node("root", `Session · ${label}`, vscode.TreeItemCollapsibleState.Expanded, {
         source: "session",
@@ -140,6 +146,26 @@ class Explorer {
       );
     }
     return roots;
+  }
+
+  /** Ask `live` for its memory figures, one question at a time; redraw if
+   *  they changed. An unchanged answer redraws nothing, so a redraw never
+   *  asks again forever. */
+  askMemory(live) {
+    if (this.memAsking) return;
+    this.memAsking = live
+      .run(MEMORY)
+      .then((r) => {
+        const m = (objects(r) || [])[0];
+        if (!m || live !== this.deps.liveSession()) return;
+        const changed = !this.mem || this.mem.used !== m.used || this.mem.limit !== m.limit;
+        this.mem = m;
+        if (changed) this.refresh();
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.memAsking = null;
+      });
   }
 
   async sessionFor(source) {
