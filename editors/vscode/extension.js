@@ -50,30 +50,37 @@ exports.activate = function activate(context) {
       if (e.affectsConfiguration("grebe.path")) restart(context);
     }),
   );
-  results.init(context.extensionUri);
-  results.register(context);
-  // The shared results' Cancel button stops whatever is filling them: a run,
-  // an export, a catalog preview or a file inspection.
-  results.setCancelHandler(() => {
-    if (runner.isRunning()) runner.cancel();
-    else Session.cancelAll();
+  // Each feature is set up on its own: one that throws is logged and
+  // shown, and the rest still come up. The Catalog goes first, so its view
+  // never stays empty because something set up before it failed.
+  const catalogView = setUp("the Catalog", () =>
+    catalog.activate(context, {
+      currentSession: runner.currentSession,
+      liveSession: runner.liveSession,
+      onDidRun: runner.onDidRun,
+      settings: runner.settings,
+      cli: () => runner.settings().cli,
+    }),
+  );
+  setUp("the results view", () => {
+    results.init(context.extensionUri);
+    results.register(context);
+    // The shared results' Cancel button stops whatever is filling them: a
+    // run, an export, a catalog preview or a file inspection.
+    results.setCancelHandler(() => {
+      if (runner.isRunning()) runner.cancel();
+      else Session.cancelAll();
+    });
   });
-  runner.activate(context, () => ready);
-  inspect.activate(context);
-  dataEditor.activate(context);
-  const catalogView = catalog.activate(context, {
-    currentSession: runner.currentSession,
-    liveSession: runner.liveSession,
-    onDidRun: runner.onDidRun,
-    settings: runner.settings,
-    cli: () => runner.settings().cli,
-  });
+  setUp("running SQL", () => runner.activate(context, () => ready));
+  setUp("data file inspection", () => inspect.activate(context));
+  setUp("the data grid editor", () => dataEditor.activate(context));
   // Trust granted: the folder's own grebe.path now applies, and DuckDB may
   // run.
   context.subscriptions.push(
     workspace.onDidGrantWorkspaceTrust(() => {
       restart(context);
-      catalogView.refresh();
+      if (catalogView) catalogView.refresh();
     }),
   );
   return start(context);
@@ -84,6 +91,18 @@ exports.deactivate = function deactivate() {
   Session.disposeAll();
   return stopClient();
 };
+
+/** Run one feature's setup; if it throws, say so and carry on. */
+function setUp(what, fn) {
+  try {
+    return fn();
+  } catch (err) {
+    const text = `could not set up ${what}: ${err.message ?? err}`;
+    logger.error("activate", text, err);
+    logger.notify(text);
+    return undefined;
+  }
+}
 
 async function restart(context) {
   await stopClient();
