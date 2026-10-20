@@ -196,7 +196,28 @@
     const results = tabs.filter((t) => t.kind === "result");
     const quiet = errors === 0 && !messages.view.querySelector(".cancelled");
     el("tablist").hidden = quiet && results.length === 1 && typeof results[0].entry.line !== "number";
+    fitTabs();
   }
+
+  /** When the tabs do not fit the strip, a list of every one of them beside
+   *  it, each with its statement, so a result off the edge is one pick away. */
+  function fitTabs() {
+    const pick = el("tabpick");
+    const list = el("tablist");
+    const over = !el("tabs").hidden && !list.hidden && list.scrollWidth > list.clientWidth + 1;
+    pick.hidden = !over;
+    if (!over) return;
+    pick.replaceChildren(
+      ...tabs.map((t, i) => {
+        const o = $("option", null, t.kind === "result" ? `${t.button.textContent} — ${t.entry.preview}` : t.button.textContent);
+        o.value = String(i);
+        return o;
+      }),
+    );
+    pick.value = String(active);
+  }
+  el("tabpick").addEventListener("change", () => show(Number(el("tabpick").value)));
+  window.addEventListener("resize", fitTabs);
 
   function show(i) {
     if (i < 0 || !tabs[i]) return;
@@ -204,6 +225,7 @@
     active = i;
     const t = tabs[i];
     t.button.classList.add("active");
+    t.button.scrollIntoView({ block: "nearest", inline: "nearest" });
     if (t.kind === "result" && !t.view) {
       const r = t.entry.result;
       if (r.kind === "rows" && r.columns.length) {
