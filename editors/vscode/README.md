@@ -72,7 +72,7 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
 | ▶ in the editor title bar | the same as the keys, with the mouse |
 | **grebe: Choose DuckDB Database** | `:memory:` or a `.duckdb` file |
 | **grebe: Cancel Running Query** | stop the statement running now; the session carries on |
-| **grebe: Restart DuckDB Session** | start fresh |
+| **grebe: Restart DuckDB Session** | start fresh, and hand back all the memory the session held (also the ↻ on the Catalog) |
 
 - **One session stays open**, like a terminal: `TEMP` tables, `SET` options
   and in-memory data survive from one run to the next.
@@ -123,7 +123,9 @@ panel. One run fills it:
 - a **tab for each result set** (`L2 · 37 rows`), and a **Messages** tab:
   every statement echoed with its outcome and time, and an error in full,
   with the line and a caret under the spot DuckDB reported. A run that
-  fails opens on Messages; otherwise on its newest result;
+  fails opens on Messages; otherwise on its newest result. When the tabs
+  do not fit, a list beside them names every result with its line, row
+  count and statement, one pick away;
 - the **grid**, filling the rest, with a **filter** above it: type to keep
   the rows that match, *contains* by default (or *equals*, *starts with*,
   *regex*), in all columns or one, not case-sensitive. `Cmd/Ctrl+F` jumps
@@ -172,7 +174,11 @@ your session holds, refreshed after every run. Like any view, it can be
 dragged to another side bar or the panel.
 
 - **The session line** shows how much memory DuckDB is using, of its
-  limit.
+  limit. Its **↻** (also in the Catalog's title bar) restarts the session,
+  which frees all of it without reloading the window. It asks first when
+  the session is running: an in-memory database goes with it, while a
+  database file is kept. The Catalog stays usable during a long query; the
+  memory figure catches up when DuckDB is free.
 - **Databases**: the session's own (`:memory:` or a file) first, then every
   attached one, described in a few words: `attached · warehouse.duckdb ·
   read-only`, `attached · in-memory`, or its type when it is not DuckDB
