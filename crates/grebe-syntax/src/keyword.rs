@@ -1,8 +1,10 @@
 //! Keyword categories and the identifier rule-override layer.
 //!
-//! The five keyword lists are vendored alongside the grammar and compiled into
-//! static tables by `build.rs`. Counts at snapshot `ce512b8`:
-//! reserved 75, unreserved 339, column-name 55, func-name 30, type-name 32.
+//! The keyword lists are vendored alongside the grammar and compiled into
+//! static tables by `build.rs`. Counts at v2.0.0 (`d54cbbe`): reserved 75,
+//! unreserved 342, column-name 55, func-name 30, type-name 32; and 358
+//! bare-label words, a property some of those keywords have rather than a
+//! sixth category.
 //!
 //! # The override surface (`matcher_factory.cpp` `AddRuleOverride`)
 //!
@@ -33,6 +35,11 @@ pub enum Category {
     TypeFunc,
     /// Reserved\* rule variants: any word matches, keyword or not.
     Any,
+    /// A select-list alias written without `AS` (`BareColLabel`): a word that
+    /// is no keyword, or a keyword on the bare-label list. Unlike every
+    /// other identifier rule, being unreserved is not enough -- `SELECT 1
+    /// day` and `SELECT count(*) filter` are syntax errors.
+    BareLabel,
 }
 
 /// How a word is classified against the vendored keyword lists.
@@ -55,6 +62,9 @@ impl Keyword {
     pub const TYPE_NAME: Self = Self(1 << 3);
     /// Never a bare identifier.
     pub const RESERVED: Self = Self(1 << 4);
+    /// May alias a select-list item without `AS` (`SELECT 1 name`). Not a
+    /// category: every bare-label word also carries one of the bits above.
+    pub const BARE_LABEL: Self = Self(1 << 5);
 
     #[must_use]
     pub const fn has(self, flag: Self) -> bool {
@@ -75,6 +85,9 @@ impl Keyword {
         if matches!(category, Category::Any) {
             return true;
         }
+        if matches!(category, Category::BareLabel) {
+            return self.is_none() || self.has(Self::BARE_LABEL);
+        }
         if self.is_none() || self.has(Self::UNRESERVED) {
             return true;
         }
@@ -82,7 +95,7 @@ impl Keyword {
             Category::ColumnName => self.has(Self::COLUMN_NAME),
             Category::TypeName => self.has(Self::TYPE_NAME),
             Category::TypeFunc => self.has(Self::TYPE_NAME) || self.has(Self::FUNC_NAME),
-            Category::Any => true,
+            Category::Any | Category::BareLabel => true,
         }
     }
 }

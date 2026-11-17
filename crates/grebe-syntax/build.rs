@@ -13,6 +13,7 @@ enum Category {
     TypeName,
     TypeFunc,
     Any,
+    BareLabel,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -487,6 +488,7 @@ impl Compiler {
                     Category::TypeName => "Category::TypeName",
                     Category::TypeFunc => "Category::TypeFunc",
                     Category::Any => "Category::Any",
+                    Category::BareLabel => "Category::BareLabel",
                 };
                 format!("Expr::Identifier(crate::keyword::{})", cat_str)
             }
@@ -548,68 +550,43 @@ fn apply_structural_overrides(rules: &mut HashMap<String, PegExpr>) {
     // tokens, which a PEG shape cannot express; every literal is still matched
     // by the real `StringLiteral` rule, so the CST keeps `StringLiteral` nodes
     // for rules that read them.
-    alts[sidx] = PegExpr::Seq(vec![
-        PegExpr::Ref("StringLiteral".to_string()),
-        PegExpr::ZeroOrMore(Box::new(PegExpr::Seq(vec![
-            PegExpr::Ref("NewlineBefore".to_string()),
-            PegExpr::Ref("StringLiteral".to_string()),
-        ]))),
-    ]);
+    alts[sidx] = continued_string();
 
-    // `CopyFileName <- CopyFileNameExpression / CopyFileNameStringLiteral /
-    //                   CopyFileNameIdentifier / CopyFileNameIdentifierColId`
-    // (statements/copy.gram:11), where
-    //   CopyFileNameIdentifier      <- Identifier
-    //   CopyFileNameIdentifierColId <- Identifier '.' ColId
-    //
-    // The alternatives are in the wrong order for a PEG. `COPY t TO out.csv`
-    // tries `CopyFileNameIdentifier` first, it succeeds on `out` alone, and
-    // ordered choice does not re-enter the alternation when the enclosing
-    // sequence then fails on the leftover `.csv` -- so the dotted form is
-    // unreachable and every unquoted filename with an extension would be a
-    // false `PRS001` on SQL DuckDB parses happily. Upstream never feels it: the
-    // shipping parser is the PG/bison one, and the PEG grammar is not what
-    // runs. Longest alternative first is the fix.
-    //
-    // Left as written, this is an engine-only accept -- the direction the
-    // differential test holds at zero.
-    let copy = rules
-        .get_mut("CopyFileName")
-        .expect("vendored grammar has no `CopyFileName` rule");
-    let PegExpr::Choice(alts) = copy else {
-        panic!("`CopyFileName` is no longer a choice; this override is stale");
-    };
-    let pos = |name: &str, alts: &[PegExpr]| {
-        alts.iter()
-            .position(|a| matches!(a, PegExpr::Ref(n) if n == name))
-    };
-    let short = pos("CopyFileNameIdentifier", alts)
-        .expect("`CopyFileName` no longer offers `CopyFileNameIdentifier`");
-    let long = pos("CopyFileNameIdentifierColId", alts)
-        .expect("`CopyFileName` no longer offers `CopyFileNameIdentifierColId`");
+    // The engine does the same wherever a string literal is matched, not
+    // only in an expression: its string matcher consumes the continuation
+    // lines itself, so `DATE '2020-'\n'01-01'` and a continued COPY path are
+    // one literal too. Every other reference gets the same shape. `TableName`
+    // is left alone: there the engine matches a string token as an
+    // identifier, with no continuation.
+    let mut widened = 0;
+    for (name, expr) in rules.iter_mut() {
+        if name == "LiteralExpression" || name == "TableName" {
+            continue;
+        }
+        widened += widen_string_literals(expr);
+    }
     assert!(
-        short < long,
-        "`CopyFileName` alternatives are already longest-first upstream; \
-         this override is stale and should be removed"
+        widened > 0,
+        "no rule references `StringLiteral` any more; this override is stale"
     );
-    let moved = alts.remove(long);
-    alts.insert(short, moved);
+
+    // (`CopyFileName` used to be reordered here, longest alternative first,
+    // so that `COPY t TO out.csv` could reach the dotted form. The v2.0.0
+    // grammar lists `CopyFileNameIdentifierColId` before
+    // `CopyFileNameIdentifier` itself, so the override is gone; the
+    // differential corpus has the statements that needed it.)
 
     // `SelectClause <- 'SELECT' DistinctClause? TargetList?`
     // (statements/select.gram). The grammar makes the selection list
     // optional; both shipping engines raise "SELECT clause without selection
     // list". Drop the `?`.
     //
-    // Checked against 1.5.5 AND the 2.0 preview (1.6.0.dev358): both reject
-    // it, so it is a grammar bug, and following the engines costs us nothing
-    // on either gate.
+    // Checked against 1.5.5 and 2.0.0: both reject it, so it is a grammar
+    // bug, and following the engines costs us nothing on either gate.
     //
-    // NOTE: `Statement <- ... / ExpressionStatement` is the other half of this
-    // class and is deliberately NOT touched here -- 1.5.5 rejects a bare
-    // expression statement but the 2.0 preview accepts it, so removing the
-    // alternative would create engine-only accepts against 2.0, the one thing
-    // the differential forbids. It belongs in a lint rule instead,
-    // which is version-aware in a way a grammar edit cannot be.
+    // (The other member of this class was `Statement <- ... /
+    // ExpressionStatement`, a bare expression as a statement. The v2.0.0
+    // grammar dropped the alternative itself.)
     let sel = rules
         .get_mut("SelectClause")
         .expect("vendored grammar has no `SelectClause` rule");
@@ -631,6 +608,78 @@ fn apply_structural_overrides(rules: &mut HashMap<String, PegExpr>) {
         "`SelectClause` no longer has exactly one optional `TargetList`; \
          this override is stale"
     );
+
+    // `ComparisonExpression <- BetweenInLikeExpression ComparisonExpressionTail*`
+    // and `IsDistinctFromExpression <- ComparisonExpression IsDistinctFromTail*`
+    // (statements/expression.gram). The grammar text takes any number of
+    // tails; the engine's transformer then refuses more than one of either
+    // with "Chained comparisons are not supported" (transform_expression.cpp),
+    // and 1.5.5 refuses the same statements as plain syntax errors. So
+    // `WHERE 1 < x < 10` does not run on any supported engine, and a linter
+    // that parses it has nothing to say about a classic mistake. At most one
+    // tail: `*` becomes `?`.
+    for (rule, tail) in [
+        ("ComparisonExpression", "ComparisonExpressionTail"),
+        ("IsDistinctFromExpression", "IsDistinctFromTail"),
+    ] {
+        let expr = rules
+            .get_mut(rule)
+            .unwrap_or_else(|| panic!("vendored grammar has no `{rule}` rule"));
+        let PegExpr::Seq(items) = expr else {
+            panic!("`{rule}` is no longer a sequence; this override is stale");
+        };
+        let mut narrowed = 0;
+        for item in items.iter_mut() {
+            let PegExpr::ZeroOrMore(inner) = item else {
+                continue;
+            };
+            if matches!(&**inner, PegExpr::Ref(n) if n == tail) {
+                *item = PegExpr::Optional(Box::new(PegExpr::Ref(tail.to_string())));
+                narrowed += 1;
+            }
+        }
+        assert_eq!(
+            narrowed, 1,
+            "`{rule}` no longer has exactly one `{tail}*`; this override is stale"
+        );
+    }
+}
+
+/// `StringLiteral (NewlineBefore StringLiteral)*`: a string literal and the
+/// continuation lines that concatenate onto it.
+fn continued_string() -> PegExpr {
+    PegExpr::Seq(vec![
+        PegExpr::Ref("StringLiteral".to_string()),
+        PegExpr::ZeroOrMore(Box::new(PegExpr::Seq(vec![
+            PegExpr::Ref("NewlineBefore".to_string()),
+            PegExpr::Ref("StringLiteral".to_string()),
+        ]))),
+    ])
+}
+
+/// Replace every `StringLiteral` reference in `expr` with
+/// [`continued_string`]; returns how many were replaced.
+fn widen_string_literals(expr: &mut PegExpr) -> usize {
+    match expr {
+        PegExpr::Ref(name) if name == "StringLiteral" => {
+            *expr = continued_string();
+            1
+        }
+        PegExpr::Call(_, arg) => widen_string_literals(arg),
+        PegExpr::Seq(items) | PegExpr::Choice(items) => {
+            items.iter_mut().map(widen_string_literals).sum()
+        }
+        PegExpr::Optional(item)
+        | PegExpr::ZeroOrMore(item)
+        | PegExpr::OneOrMore(item)
+        | PegExpr::Not(item)
+        | PegExpr::And(item) => widen_string_literals(item),
+        PegExpr::Ref(_)
+        | PegExpr::Literal(_)
+        | PegExpr::Identifier(_)
+        | PegExpr::EndOfInput
+        | PegExpr::Dummy => 0,
+    }
 }
 
 fn main() {
@@ -655,6 +704,9 @@ fn main() {
         ("column_name", "column_name_keyword.list"),
         ("func_name", "func_name_keyword.list"),
         ("type_name", "type_name_keyword.list"),
+        // New in the v2.0.0 grammar: the words that may alias a select-list
+        // item without `AS` (`BareColLabel <- BareLabelKeyword / Identifier`).
+        ("bare_label", "bare_label_keyword.list"),
     ];
 
     for (cat_name, file_name) in files {
@@ -681,10 +733,21 @@ fn main() {
         ("column_name", "Keyword::COLUMN_NAME"),
         ("type_name", "Keyword::TYPE_NAME"),
         ("func_name", "Keyword::FUNC_NAME"),
+        ("bare_label", "Keyword::BARE_LABEL"),
     ] {
         for kw in keyword_lists.get(cat).unwrap() {
             kw_flags.entry(kw.clone()).or_default().push(flag);
         }
+    }
+    // Bare-label is a property of a keyword, not a category of its own:
+    // `Keyword::matches` treats a word with no category bit as an ordinary
+    // identifier, so a bare-label word that is in no other list would
+    // silently stop being a keyword.
+    for (kw, flags) in &kw_flags {
+        assert!(
+            flags.iter().any(|f| *f != "Keyword::BARE_LABEL"),
+            "`{kw}` is in bare_label_keyword.list but in no keyword category list"
+        );
     }
     let mut kw_source = String::new();
     kw_source.push_str("use crate::keyword::Keyword;\n\n");
@@ -751,6 +814,10 @@ fn main() {
         ("FunctionName", PegExpr::Identifier(Category::TypeFunc)),
         ("TableFunctionName", PegExpr::Identifier(Category::TypeFunc)),
         ("TypeName", PegExpr::Identifier(Category::TypeName)),
+        // `BareColLabel <- BareLabelKeyword / Identifier` in the text; the
+        // engine replaces it with an identifier matcher whose only keyword
+        // category is bare-label.
+        ("BareColLabel", PegExpr::Identifier(Category::BareLabel)),
         ("ReservedIdentifier", PegExpr::Identifier(Category::Any)),
         ("ReservedSchemaName", PegExpr::Identifier(Category::Any)),
         ("ReservedTableName", PegExpr::Identifier(Category::Any)),
@@ -766,11 +833,13 @@ fn main() {
         ("NewlineBefore", PegExpr::Dummy),
         ("NumberLiteral", PegExpr::Dummy),
         ("OperatorLiteral", PegExpr::Dummy),
+        ("AnyOperatorLiteral", PegExpr::Dummy),
         ("ReservedKeyword", PegExpr::Dummy),
         ("UnreservedKeyword", PegExpr::Dummy),
         ("ColumnNameKeyword", PegExpr::Dummy),
         ("FuncNameKeyword", PegExpr::Dummy),
         ("TypeNameKeyword", PegExpr::Dummy),
+        ("BareLabelKeyword", PegExpr::Dummy),
     ];
 
     let mut rules_map = HashMap::new();

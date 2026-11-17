@@ -281,6 +281,16 @@ mod tests {
     }
 
     #[test]
+    fn the_comma_of_a_one_element_tuple_is_kept() {
+        // `(42,)` is a tuple, `(42)` is the number: dropping the comma
+        // would change what the query returns.
+        assert_eq!(
+            f("select (42,), typeof((42,)), (1, 2,), f(1,)"),
+            "SELECT (42,), typeof((42,)), (1, 2), f(1);\n"
+        );
+    }
+
+    #[test]
     fn a_trailing_comma_is_dropped_when_the_list_collapses() {
         assert_eq!(f("select a, b, from t"), "SELECT a, b FROM t;\n");
     }

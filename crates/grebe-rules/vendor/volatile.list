@@ -8,9 +8,11 @@ gen_random_uuid
 nextval
 random
 setseed
+setval
 sleep_ms
 stats
 uuid
 uuidv4
 uuidv7
+vector_type
 write_log

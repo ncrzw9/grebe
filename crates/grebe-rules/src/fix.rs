@@ -482,7 +482,9 @@ mod tests {
         for src in [
             "SELECT 1 AS 'x';\n",                        // MOD023 -> SELECT 'x': 1
             "SELECT * FROM t WHERE NULL <> a || 'x';\n", // MOD002 chain
-            "SELECT * FROM t WHERE NULL = a = b;\n",
+            // (`NULL = a = b` was here: a chained comparison no longer
+            // parses, as it does not on either engine.)
+            "SELECT * FROM t WHERE NULL = a IS NULL = b;\n",
         ] {
             let out = fix_all(src);
             assert!(

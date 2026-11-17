@@ -27,5 +27,5 @@ fn recorded_divergences_hold() {
             }
         }
     }
-    assert_eq!(checked, 2, "expected 2 recorded divergences, saw {checked}");
+    assert_eq!(checked, 6, "expected 6 recorded divergences, saw {checked}");
 }

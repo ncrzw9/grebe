@@ -6,11 +6,21 @@
 #   SELECT DISTINCT lower(function_name) FROM duckdb_functions()
 #   WHERE function_type = 'aggregate' ORDER BY 1
 #
-# Regenerate by running the query above against the engine version below.
+# Regenerate by running the query above against each engine version below
+# and taking the union: grebe lints SQL for both, and a name that is an
+# aggregate on either must be treated as one.
+#
+#   v1.5.5: 88 names. v2.0.0: 79 names.
+#   Only on 1.5.5 (13): the window functions -- cume_dist, dense_rank, fill,
+#     first_value, lag, last_value, lead, nth_value, ntile, percent_rank,
+#     rank, rank_dense, row_number -- which 2.0 lists under function_type
+#     'window' instead. They stay: no name changed meaning.
+#   Only on 2.0.0 (4): combine_aggr, decimal_average, lttb,
+#     variant_group_object.
 source  = duckdb_functions(), function_type='aggregate'
-engine  = v1.5.5
-count   = 88
-vendored = 2026-08-29
+engine  = v1.5.5 + v2.0.0 (union)
+count   = 92
+vendored = 2026-11-17
 
 # Volatile function names, for MOD033 (having-without-aggregate): a volatile
 # call is evaluated once per group under HAVING but once per row under WHERE,
@@ -19,7 +29,10 @@ vendored = 2026-08-29
 # DERIVED DATA, regenerable -- not hand-maintained:
 #   SELECT DISTINCT lower(function_name) FROM duckdb_functions()
 #   WHERE stability = 'VOLATILE' ORDER BY 1
+#
+#   v1.5.5: 16 names. v2.0.0: 18 names, the same 16 plus setval and
+#   vector_type.
 source  = duckdb_functions(), stability='VOLATILE'
-engine  = v1.5.5
-count   = 16
-vendored = 2026-10-04
+engine  = v1.5.5 + v2.0.0 (union)
+count   = 18
+vendored = 2026-11-17

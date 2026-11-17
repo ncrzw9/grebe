@@ -4,11 +4,18 @@ A DuckDB SQL formatter and linter. One static binary with no runtime
 dependencies: no database engine, no catalog, no network.
 
 The parser is generated from DuckDB's own PEG grammar, vendored verbatim, so
-grebe parses the dialect DuckDB parses instead of approximating it. Measured
-against DuckDB 1.5.5 on 17,880 statements (TPC-H and TPC-DS queries,
-examples from DuckDB's documentation, and hand-written edge cases), grebe agrees with the engine's
-parser on 99.2% of statements and accepts every statement the engine
-accepts.
+grebe parses the dialect DuckDB parses instead of approximating it. The
+grammar is DuckDB 2.0.0's. Measured on 62,253 distinct statements (every
+statement in DuckDB's own SQL test suite at v2.0.0, valid and deliberately
+invalid alike, plus the TPC-H and TPC-DS queries):
+
+- **DuckDB 2.0.0:** grebe agrees with the engine's parser on 99.5% of
+  statements and accepts every statement the engine accepts. The rest are
+  statements the engine refuses in a check that runs after its grammar has
+  matched.
+- **DuckDB 1.5.5:** 97.3%. Of the 1,651 statements grebe accepts and 1.5.5
+  does not, 1,373 are syntax that is new in 2.0; two statements 1.5.5
+  accepts are rejected, both recorded with the reasoning.
 
 ## Performance
 

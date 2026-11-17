@@ -10,17 +10,63 @@ use std::collections::HashMap;
 use crate::Span;
 use crate::cst::{Node, NodeId, Tree};
 use crate::grammar::{
-    EXPRESSIONS, Expr, ExprId, RULE_COLUMN_NAME_KEYWORD, RULE_END_OF_INPUT, RULE_FUNC_NAME_KEYWORD,
-    RULE_NEWLINE_BEFORE, RULE_NUMBER_LITERAL, RULE_OPERATOR_LITERAL, RULE_PROGRAM,
-    RULE_RESERVED_KEYWORD, RULE_STRING_LITERAL, RULE_TYPE_NAME_KEYWORD, RULE_UNRESERVED_KEYWORD,
-    RULES, RuleId, classify_keyword,
+    EXPRESSIONS, Expr, ExprId, RULE_ANY_OPERATOR_LITERAL, RULE_BARE_LABEL_KEYWORD,
+    RULE_COLUMN_NAME_KEYWORD, RULE_END_OF_INPUT, RULE_FUNC_NAME_KEYWORD, RULE_NEWLINE_BEFORE,
+    RULE_NUMBER_LITERAL, RULE_OPERATOR_LITERAL, RULE_PROGRAM, RULE_RESERVED_KEYWORD,
+    RULE_STRING_LITERAL, RULE_TYPE_NAME_KEYWORD, RULE_UNRESERVED_KEYWORD, RULES, RuleId,
+    classify_keyword,
 };
 use crate::keyword::Keyword;
 use crate::token::{Token, TokenKind, tokenize};
 
 const OPRUN: &[char] = &[
-    '+', '*', '/', '<', '>', '=', '~', '!', '@', '%', '^', '&', '|', '`',
+    '+', '-', '*', '/', '%', '^', '<', '>', '=', '~', '!', '@', '&', '|',
 ];
+
+/// `NumberLiteralMatcher` in DuckDB 2.0: the tokenizer takes any run of
+/// digits and dots, and the matcher then refuses a second dot or a dot in
+/// the exponent, so `1.2.3` and `1..2` are syntax errors.
+fn well_formed_number(text: &[u8]) -> bool {
+    let mut has_dot = false;
+    let mut exponent = false;
+    // `0x1F` and `0b101`: digits only, and `e` there is a hex digit.
+    if text.len() > 1 && text[0] == b'0' && matches!(text[1], b'x' | b'X' | b'b' | b'B') {
+        return true;
+    }
+    for &b in text {
+        match b {
+            b'.' if has_dot || exponent => return false,
+            b'.' => has_dot = true,
+            b'e' | b'E' => exponent = true,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `OperatorMatcher::HasSpecialPrecedence` in DuckDB 2.0.
+fn has_special_precedence(op: &[u8]) -> bool {
+    matches!(
+        op,
+        b"=" | b"<"
+            | b">"
+            | b"~"
+            | b"->"
+            | b"<="
+            | b">="
+            | b"!="
+            | b"=="
+            | b"<>"
+            | b"~~"
+            | b"~*"
+            | b"!~"
+            | b"~~*"
+            | b"~~~"
+            | b"!~~"
+            | b"!~*"
+            | b"!~~*"
+    )
+}
 
 pub struct Matcher<'a> {
     src: &'a [u8],
@@ -237,7 +283,7 @@ impl<'a> Matcher<'a> {
             RULE_NUMBER_LITERAL => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
-                    if t.kind == TokenKind::Number {
+                    if t.kind == TokenKind::Number && well_formed_number(t.span.slice(self.src)) {
                         Some(token_idx + 1)
                     } else {
                         None
@@ -266,23 +312,35 @@ impl<'a> Matcher<'a> {
                 if token_idx == 0 || token_idx >= self.match_tokens.len() {
                     None
                 } else {
-                    let prev_end = self.match_tokens[token_idx - 1].0.span.end as usize;
+                    let prev = self.match_tokens[token_idx - 1].0.span;
                     let next_start = self.match_tokens[token_idx].0.span.start as usize;
-                    if self.src[prev_end..next_start].contains(&b'\n') {
+                    let gap = &self.src[prev.end as usize..next_start];
+                    // A continuation line is a plain single-quoted string
+                    // (no `E`/`X`/`B` prefix) after a newline, with no block
+                    // comment in between, and a dollar-quoted string is
+                    // never continued.
+                    if gap.contains(&b'\n')
+                        && !gap.windows(2).any(|w| w == b"/*")
+                        && self.src[next_start] == b'\''
+                        && self.src[prev.end as usize - 1] == b'\''
+                    {
                         Some(token_idx) // zero-width
                     } else {
                         None
                     }
                 }
             }
-            RULE_OPERATOR_LITERAL => {
+            // `OperatorMatcher` in DuckDB: any operator token. The generic
+            // form leaves out the operators that have a precedence level of
+            // their own in the grammar (comparisons, `->`, the LIKE family),
+            // so `a = b` is a comparison and never a custom operator.
+            RULE_OPERATOR_LITERAL | RULE_ANY_OPERATOR_LITERAL => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
+                    let text = t.span.slice(self.src);
                     if t.kind == TokenKind::Operator
-                        && t.span
-                            .slice(self.src)
-                            .iter()
-                            .all(|&b| OPRUN.contains(&(b as char)))
+                        && text.iter().all(|&b| OPRUN.contains(&(b as char)))
+                        && (rule_id == RULE_ANY_OPERATOR_LITERAL || !has_special_precedence(text))
                     {
                         Some(token_idx + 1)
                     } else {
@@ -303,6 +361,7 @@ impl<'a> Matcher<'a> {
             | RULE_UNRESERVED_KEYWORD
             | RULE_COLUMN_NAME_KEYWORD
             | RULE_FUNC_NAME_KEYWORD
+            | RULE_BARE_LABEL_KEYWORD
             | RULE_TYPE_NAME_KEYWORD => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
@@ -313,6 +372,7 @@ impl<'a> Matcher<'a> {
                             RULE_UNRESERVED_KEYWORD => kw.has(Keyword::UNRESERVED),
                             RULE_COLUMN_NAME_KEYWORD => kw.has(Keyword::COLUMN_NAME),
                             RULE_FUNC_NAME_KEYWORD => kw.has(Keyword::FUNC_NAME),
+                            RULE_BARE_LABEL_KEYWORD => kw.has(Keyword::BARE_LABEL),
                             _ => kw.has(Keyword::TYPE_NAME),
                         };
                         if is_match { Some(token_idx + 1) } else { None }
@@ -416,7 +476,8 @@ impl<'a> Matcher<'a> {
             Expr::Identifier(category) => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
-                    if t.kind == TokenKind::QuotedIdent {
+                    // `""` is a zero-length delimited identifier: an error.
+                    if t.kind == TokenKind::QuotedIdent && t.span.end - t.span.start > 2 {
                         let next = token_idx + 1;
                         if next > self.far {
                             self.far = next;

@@ -46,6 +46,11 @@
 //! - A `...` prose placeholder is rejected here although a DuckDB build may
 //!   accept it; it is not SQL, and bending the tokenizer to admit it would make
 //!   it wrong about real SQL.
+//! - Chained comparisons (`1 < x < 10`): the grammar text accepts them, both
+//!   engines refuse them. This crate follows the engines, the same way.
+//! - Checks the engine's transformer makes after the grammar has matched
+//!   (contradictory sequence bounds, an option given twice) are not
+//!   reproduced: such a statement parses here and fails when it is run.
 
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
