@@ -209,10 +209,6 @@ class Session {
     this.starting = false;
   }
 
-  get key() {
-    return JSON.stringify([this.opts.cli, this.opts.database, this.opts.cwd]);
-  }
-
   get alive() {
     return this.proc !== null && this.closedWith === null;
   }

@@ -176,19 +176,34 @@ function sessionEnded(which, reason) {
   for (const l of runListeners) l();
 }
 
+/** The session a run of `uri` uses. One session serves the whole window:
+ *  it is kept for as long as the CLI and the database are the same, whatever
+ *  folder the file is in, so in-memory tables, TEMP tables, SET options and
+ *  ATTACHed databases carry from one file to the next. Its working directory
+ *  is the one it started in. */
 async function sessionFor(uri) {
   const s = settings();
   const cwd = cwdFor(uri);
+  const database = resolveDatabase(s.database, cwd);
+  if (session && session.alive && session.opts.cli === s.cli && session.opts.database === database) {
+    if (session.opts.cwd !== cwd && !session.otherFolders.has(cwd)) {
+      // Said once per folder: relative paths in this file's SQL resolve
+      // from where the session started, not from the file's own folder.
+      session.otherFolders.add(cwd);
+      output.appendLine(`sharing the session started in ${session.opts.cwd} with ${cwd}; relative paths in SQL resolve from ${session.opts.cwd}`);
+    }
+    return session;
+  }
   const wanted = new Session({
     cli: s.cli,
-    database: resolveDatabase(s.database, cwd),
+    database,
     cwd,
     // What DuckDB says outside a statement (the rc file, warnings) goes to
     // the log as it arrives.
     onStderr: (text) => output.append(text),
     onExit: (reason) => sessionEnded(wanted, reason),
   });
-  if (session && session.alive && session.key === wanted.key) return session;
+  wanted.otherFolders = new Set();
   if (session) session.dispose();
   session = wanted;
   output.appendLine(`starting ${s.cli} ${wanted.opts.database} (cwd ${cwd})`);
@@ -669,9 +684,9 @@ function activate(context, clientReady) {
       if (e.affectsConfiguration("grebe.duckdb.codeLens")) lenses.refresh();
       if (e.affectsConfiguration("grebe.duckdb.path") || e.affectsConfiguration("grebe.duckdb.database")) {
         applySettings();
-      } else if (e.affectsConfiguration("grebe.duckdb.maxRows")) {
-        restart();
       }
+      // grebe.duckdb.maxRows is read at each run: changing it keeps the
+      // session, and what it holds in memory.
     }),
     { dispose: () => session && session.dispose() },
   );
