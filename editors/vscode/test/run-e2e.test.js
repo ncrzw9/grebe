@@ -146,8 +146,10 @@ function makeVscode(config) {
       showErrorMessage: async (m) => {
         shown.errors.push(m);
       },
-      showWarningMessage: async (m) => {
+      showWarningMessage: async (m, ...rest) => {
         shown.warnings.push(m);
+        // The one question asked with a modal: restarting a running session.
+        return rest.includes("Restart") && shown.declineRestart !== true ? "Restart" : undefined;
       },
       showSaveDialog: async () => shown.saveTo,
       setStatusBarMessage: () => disposable,
@@ -1424,7 +1426,13 @@ live("a file can ask for a session of its own", async (t) => {
   // The file in front decides which session the Catalog and status bar show.
   shown.editorChanged({ document: own });
   assert.equal(runner.currentSessionName(), "scratch");
-  // Restart ends that one only.
+  // Restart asks first, naming the session; declined, nothing ends.
+  shown.declineRestart = true;
+  await shown.commands.get("grebe.duckdb.restart")();
+  assert.match(shown.warnings.at(-1), /Restart the DuckDB session "scratch"\?/);
+  assert.deepEqual(runner.liveSessions().map((x) => x.name).sort(), ["default", "scratch"]);
+  // Accepted, it ends that one only.
+  shown.declineRestart = false;
   await shown.commands.get("grebe.duckdb.restart")();
   assert.deepEqual(runner.liveSessions().map((x) => x.name), ["default"]);
 });
