@@ -41,6 +41,9 @@ pub struct Selection<'a> {
     pub severity: &'a [(String, Severity)],
     /// Extra foreign-dialect heads for `SRC003`, uppercase, space-separated.
     pub foreign_heads: &'a [String],
+    /// A catalog snapshot. `None` (the default) means the `CAT` rules do
+    /// not run at all: grebe needs no catalog, it only uses one it is given.
+    pub catalog: Option<&'a crate::catalog::Catalog>,
 }
 
 impl Selection<'_> {
@@ -89,10 +92,23 @@ pub fn analyze(src: &str, selection: &Selection<'_>) -> Vec<Finding> {
     let keep = |code: &str, at: u32| selection.enabled(code) && !sup.is_suppressed(code, at);
 
     let mut findings: Vec<Finding> = Vec::new();
+    // The CAT rules, when a catalog was handed in. What the file defines for
+    // itself is read off the whole file once, so a statement on the fallback
+    // path still knows about a table created three statements earlier.
+    let catalog = selection
+        .catalog
+        .map(|c| (c, crate::catalog::FileContext::scan(src)));
+    let cat = |tree: &grebe_syntax::cst::Tree, text: &str| match &catalog {
+        Some((c, file)) => crate::catalog::check(tree, text, c, file),
+        None => Vec::new(),
+    };
 
     // Whole-file parse is the fast path.
     if let Some(tree) = grebe_syntax::matcher::parse(src) {
-        for f in crate::detect::analyze(&tree, src) {
+        for f in crate::detect::analyze(&tree, src)
+            .into_iter()
+            .chain(cat(&tree, src))
+        {
             if keep(f.code, f.span.start) {
                 findings.push(f);
             }
@@ -103,7 +119,10 @@ pub fn analyze(src: &str, selection: &Selection<'_>) -> Vec<Finding> {
             let stmt = &src[sp.start as usize..sp.end as usize];
             match grebe_syntax::matcher::parse(stmt) {
                 Some(tree) => {
-                    for f in crate::detect::analyze(&tree, stmt) {
+                    for f in crate::detect::analyze(&tree, stmt)
+                        .into_iter()
+                        .chain(cat(&tree, stmt))
+                    {
                         let at = sp.start + f.span.start;
                         if !keep(f.code, at) {
                             continue;
@@ -140,7 +159,7 @@ pub fn analyze(src: &str, selection: &Selection<'_>) -> Vec<Finding> {
         }
     }
 
-    findings.sort_by_key(|f| f.span.start);
+    findings.sort_by_key(|f| (f.span.start, f.code));
     findings
 }
 
@@ -247,6 +266,7 @@ mod tests {
             select: Some(&codes),
             severity: &off,
             foreign_heads: &[],
+            catalog: None,
         };
         assert!(
             analyze("SELECT count(*) FROM t;", &sel)
