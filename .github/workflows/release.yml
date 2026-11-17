@@ -18,8 +18,8 @@ permissions:
   contents: write
 
 env:
+  # Keep in step with build-binaries.yml, which builds the binaries.
   RUST_VERSION: "1.98.0"
-  BIN_NAME: grebe
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -131,96 +131,14 @@ jobs:
           git tag -a "$TAG" -m "grebe ${TAG#v}" "$GITHUB_SHA"
           git push origin "$TAG"
 
+  # The platform binaries: the same workflow that also runs every week and
+  # whenever a workflow or a Cargo manifest changes, so a retired runner image
+  # or a toolchain that stopped building is found then, not during a release.
   build:
-    name: build (${{ matrix.target }})
     needs: verify
-    timeout-minutes: 20
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-          - target: x86_64-apple-darwin
-            os: macos-14
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            musl: true
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            aarch64_gnu: true
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust ${{ env.RUST_VERSION }} (target ${{ matrix.target }})
-        shell: bash
-        run: |
-          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
-          rustup default ${{ env.RUST_VERSION }}
-          rustup target add ${{ matrix.target }}
-
-      - name: Install musl cross tools
-        if: matrix.musl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install aarch64-linux-gnu cross tools
-        if: matrix.aarch64_gnu
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu; then
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-              exit 0
-            fi
-            echo "::warning::apt attempt $attempt failed; retrying"
-            sleep $((attempt * 10))
-          done
-          echo "::error::could not install gcc-aarch64-linux-gnu after 3 attempts" >&2
-          exit 1
-
-      - uses: actions/cache@v5
-        with:
-          path: target
-          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --workspace --release --target ${{ matrix.target }}
-
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          dir="${{ env.BIN_NAME }}-${{ matrix.target }}"
-          mkdir "$dir"
-          cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$dir/"
-          cp LICENSE README.md "$dir/"
-          tar czf "$dir.tar.gz" "$dir"
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dir = "${{ env.BIN_NAME }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $dir | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}.exe" "$dir/"
-          Copy-Item LICENSE "$dir/"
-          Copy-Item README.md "$dir/"
-          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
-          path: |
-            ${{ env.BIN_NAME }}-${{ matrix.target }}.tar.gz
-            ${{ env.BIN_NAME }}-${{ matrix.target }}.zip
-          if-no-files-found: ignore
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      release: true
 
   release:
     name: publish GitHub Release

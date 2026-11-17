@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "grebe"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "grebe-format",
  "grebe-lsp",
@@ -14,14 +14,14 @@ dependencies = [
 
 [[package]]
 name = "grebe-format"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "grebe-syntax",
 ]
 
 [[package]]
 name = "grebe-lsp"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "grebe-format",
  "grebe-rules",
@@ -30,11 +30,11 @@ dependencies = [
 
 [[package]]
 name = "grebe-rules"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "grebe-syntax",
 ]
 
 [[package]]
 name = "grebe-syntax"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"

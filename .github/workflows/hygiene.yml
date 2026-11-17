@@ -1,0 +1,67 @@
+name: Hygiene
+
+# What a pull request publishes under the owner's name: its commits, its
+# title and its description. The rules are in the rules file at the root of
+# the repository; this is the check that does not rely on anyone remembering
+# them. It runs again when the description is edited, so a footer added by a
+# tool after the text was written turns the check red until it is removed.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Commits are the owner's, with nothing private and no tool attribution
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          owner='24656957+ncrzw9@users.noreply.github.com'
+          # An assistant's or a tool's name, a co-author trailer, a session
+          # id, a path on the machine the work was done on.
+          banned='claude|anthropic|co-authored-by:|session_[0-9A-Za-z]{8,}|/tmp/|/home/[a-z]'
+          bad=0
+          for c in $(git rev-list "$BASE..$HEAD"); do
+            author=$(git log -1 --format='%ae' "$c")
+            committer=$(git log -1 --format='%ce' "$c")
+            if [ "$author" != "$owner" ]; then
+              echo "::error::$c is authored by <$author>, not the owner"
+              bad=1
+            fi
+            # GitHub itself commits a merge made on the site.
+            if [ "$committer" != "$owner" ] && [ "$committer" != "noreply@github.com" ]; then
+              echo "::error::$c is committed by <$committer>, not the owner"
+              bad=1
+            fi
+            if git log -1 --format='%an%n%cn%n%B' "$c" | grep -inE "$banned"; then
+              echo "::error::the lines above, in the message or names of $c, are not to be published"
+              bad=1
+            fi
+          done
+          echo "checked $(git rev-list --count "$BASE..$HEAD") commit(s)"
+          exit "$bad"
+
+      - name: The title and description say nothing private and credit no tool
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          banned='claude|anthropic|co-authored-by:|session_[0-9A-Za-z]{8,}|/tmp/|/home/[a-z]|generated (with|by) \['
+          if printf '%s\n%s\n' "$TITLE" "$BODY" | grep -inE "$banned"; then
+            echo "::error::the lines above are in this pull request's title or description; edit them out"
+            exit 1
+          fi
+          echo "title and description are clean"
