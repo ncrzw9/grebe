@@ -64,6 +64,12 @@ exports.activate = function activate(context) {
   const catalogView = catalog.activate(context, {
     currentSession: runner.currentSession,
     liveSession: runner.liveSession,
+    liveSessions: runner.liveSessions,
+    sessionName: runner.currentSessionName,
+    remember: runner.rememberAttachments,
+    remembered: runner.rememberedAttachments,
+    forget: runner.forgetAttachment,
+    state: context.workspaceState,
     onDidRun: runner.onDidRun,
     settings: runner.settings,
     cli: () => runner.settings().cli,

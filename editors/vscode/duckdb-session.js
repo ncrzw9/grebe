@@ -219,6 +219,7 @@ class Session {
     this.queue = Promise.resolve();
     this.closedWith = null;
     this.starting = false;
+    this.dir = opts.cwd; // the working directory now (see chdir)
   }
 
   get alive() {
@@ -318,6 +319,29 @@ class Session {
     });
     this.queue = job.catch(() => {});
     return job;
+  }
+
+  /**
+   * Make `dir` the working directory, so relative paths in the SQL that
+   * follows resolve from it. The CLI's `.cd`, in line with the statements:
+   * it takes effect after whatever is running. Measured on 1.5.5 and 2.0.0:
+   * a double-quoted argument with backslash escapes carries spaces, quotes
+   * and backslashes; an unquoted or single-quoted one does not. A directory
+   * that is not there leaves the session where it was.
+   */
+  chdir(dir) {
+    if (!dir || dir === this.dir) return Promise.resolve(true);
+    const job = this.queue.then(async () => {
+      if (dir === this.dir) return true;
+      // Forward slashes work on Windows too, and need no escaping.
+      const arg = (process.platform === "win32" ? dir.replace(/\\/g, "/") : dir).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const { out, err } = await this.send(`.cd "${arg}"`);
+      if ((err + out).trim() !== "") return false;
+      this.dir = dir;
+      return true;
+    });
+    this.queue = job.catch(() => {});
+    return job.catch(() => false);
   }
 
   /** A statement is running (not start-up, not idle). */
