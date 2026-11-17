@@ -91,7 +91,10 @@ const quiet = {
   "./inspect": { activate() {} },
   "./catalog": { activate: () => ({ refresh() {} }) },
   "./dataEditor": { activate() {} },
+  // The feed of the session's catalog to the server has its own test too.
+  "./catalogSync": { activate: () => ({ schedule() {}, reset: () => catalogResets++ }) },
 };
+let catalogResets = 0;
 const realLoad = Module._load;
 Module._load = function (request, ...rest) {
   if (request === "vscode") return vscode;
