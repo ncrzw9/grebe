@@ -11,6 +11,10 @@
 //! - **opt-in (`off` until `[severity]` enables them):** MOD010, MOD017-020,
 //!   MOD022-023, MOD025, MOD031, MOD033-034
 //!
+//! And two rules that need something the source does not hold, a catalog
+//! snapshot, and run only when a caller supplies one (see [`catalog`]):
+//! CAT001 unknown-table and CAT002 unknown-column.
+//!
 //! A rule is opt-in when its premise is real but it is noisy on idiomatic
 //! DuckDB code, its payoff is unproven, or it is house style by nature. A CST
 //! does not by itself license an unproven detector; each candidate rule needs
@@ -32,7 +36,8 @@
 //! `PRS`/`SRC` finding explaining why it was not linted and nothing else, so
 //! opinions never pile onto a statement that is already broken or deliberately
 //! skipped (see [`analysis`]). Every detector is a pure function of the source
-//! bytes and its CST, so the same input always yields the same findings.
+//! bytes and its CST (the `CAT` pair: and of the catalog handed in), so the
+//! same input always yields the same findings.
 //!
 //! # Fix safety
 //!
@@ -57,9 +62,11 @@ pub mod registry;
 
 pub use registry::{Category, FixSafety, RULES, Rule, Severity, expand_select, lookup};
 pub mod analysis;
+pub mod catalog;
 pub mod config;
 pub mod detect;
 pub mod fix;
+pub mod json;
 pub mod source;
 pub mod suppress;
 pub mod tier2a;
@@ -76,11 +83,11 @@ pub mod tier5;
 /// clean. Add a code here in the same commit that adds its detector; the
 /// test below fails if a code here has no registry row.
 pub const IMPLEMENTED: &[&str] = &[
-    "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007", "MOD008", "MOD009",
-    "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016", "MOD017", "MOD018",
-    "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD025", "MOD026", "MOD027", "MOD028",
-    "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "MOD035", "MOD036", "MOD037",
-    "MOD038", "MOD039", "MOD040", "PRS001", "SRC002", "SRC003",
+    "CAT001", "CAT002", "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007",
+    "MOD008", "MOD009", "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016",
+    "MOD017", "MOD018", "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD025", "MOD026",
+    "MOD027", "MOD028", "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "MOD035",
+    "MOD036", "MOD037", "MOD038", "MOD039", "MOD040", "PRS001", "SRC002", "SRC003",
 ];
 
 /// Does `code` have a detector?

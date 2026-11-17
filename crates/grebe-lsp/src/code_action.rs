@@ -67,11 +67,15 @@ fn action_for(uri: &str, src: &str, f: &Finding, enc: Encoding) -> Option<Json> 
     }
     let rule = grebe_rules::lookup(f.code)?;
     let safety = rule.fix_safety;
-    if safety == FixSafety::None {
+    // A CAT finding's replacement is the nearest name in the catalog: a
+    // guess `--fix` never applies, and exactly what a quick fix is for.
+    let suggestion = rule.category == grebe_rules::Category::Cat;
+    if safety == FixSafety::None && !suggestion {
         return None;
     }
 
     let title = match safety {
+        _ if suggestion => format!("{}: change to {}", f.code, fix.replacement),
         // Naming the rule, not just the action, is what makes a list of three
         // quick fixes legible when three findings overlap one line.
         FixSafety::Safe => format!("{}: fix {}", f.code, rule.name),
@@ -79,7 +83,7 @@ fn action_for(uri: &str, src: &str, f: &Finding, enc: Encoding) -> Option<Json> 
             "{}: fix {} (unsafe — may change results)",
             f.code, rule.name
         ),
-        FixSafety::None => unreachable!("filtered above"),
+        FixSafety::None => unreachable!("filtered above, CAT handled first"),
     };
 
     let (sl, sc) = position::byte_to_position(src, fix.span.start, enc);

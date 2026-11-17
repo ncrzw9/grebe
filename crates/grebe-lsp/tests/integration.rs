@@ -634,3 +634,418 @@ fn grebe_statements_returns_the_statements_to_run() {
     assert_eq!(start.get("line").and_then(Json::as_f64), Some(1.0));
     assert_eq!(start.get("character").and_then(Json::as_f64), Some(0.0));
 }
+
+// ------------------------------------------------------------- catalog --
+
+const SHOP: &str = r#"[
+    {"database":"shop","schema":"main","table":"orders","column":"id","type":"BIGINT"},
+    {"database":"shop","schema":"main","table":"orders","column":"total","type":"DECIMAL(10,2)"},
+    {"database":"shop","schema":"main","table":"customers","column":"id","type":"BIGINT"},
+    {"database":"shop","schema":"main","table":"customers","column":"name","type":"VARCHAR"}
+]"#;
+
+/// A `grebe/catalog` notification: `columns` is snapshot JSON text, or
+/// `"null"`.
+fn catalog_notification(uri: Option<&str>, columns: &str) -> String {
+    let mut pairs = vec![(
+        "columns".to_string(),
+        json::parse(columns).expect("valid snapshot JSON"),
+    )];
+    if let Some(u) = uri {
+        pairs.push(("uri".to_string(), Json::str(u)));
+    }
+    notification("grebe/catalog", Json::object(pairs))
+}
+
+/// Run `messages` between `initialize` and `shutdown`/`exit`, one batch per
+/// message so each is handled (and its diagnostics published) before the
+/// next arrives. Returns everything the server wrote.
+fn run_session(messages: &[String]) -> Vec<Json> {
+    let mut input: Vec<u8> = Vec::new();
+    transport::write_message(
+        &mut input,
+        &request(
+            1,
+            "initialize",
+            Json::object(vec![("capabilities".into(), Json::object(vec![]))]),
+        ),
+    )
+    .unwrap();
+    transport::write_message(&mut input, &notification("initialized", Json::Null)).unwrap();
+    for m in messages {
+        transport::write_message(&mut input, m).unwrap();
+    }
+    transport::write_message(&mut input, &request(9000, "shutdown", Json::Null)).unwrap();
+    transport::write_message(&mut input, &notification("exit", Json::Null)).unwrap();
+    let mut output: Vec<u8> = Vec::new();
+    let code = server::run(SlowReader::new(input), &mut output);
+    assert_eq!(code, 0, "clean shutdown+exit must return 0");
+    read_all_messages(output)
+}
+
+/// Hands the server one framed message per batch: after each message it
+/// waits long enough for the server to finish with it. The server lints
+/// once per batch, so without this a whole scripted session is one batch
+/// and only the final state of each document is ever published.
+struct SlowReader {
+    inner: std::io::BufReader<Cursor<Vec<u8>>>,
+}
+
+impl SlowReader {
+    fn new(bytes: Vec<u8>) -> Self {
+        SlowReader {
+            inner: std::io::BufReader::new(Cursor::new(bytes)),
+        }
+    }
+}
+
+impl std::io::Read for SlowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::BufRead for SlowReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+    fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        // A header line starts each message: pause before it, so the
+        // message before has been handled on its own.
+        if buf.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        self.inner.read_line(buf)
+    }
+}
+
+/// `(code, message)` of every diagnostic in each `publishDiagnostics` for
+/// `uri`, in the order they were published.
+fn published(messages: &[Json], uri: &str) -> Vec<Vec<(String, String)>> {
+    messages
+        .iter()
+        .filter(|m| {
+            m.get("method").and_then(Json::as_str) == Some("textDocument/publishDiagnostics")
+        })
+        .filter_map(|m| m.get("params"))
+        .filter(|p| p.get("uri").and_then(Json::as_str) == Some(uri))
+        .map(|p| {
+            p.get("diagnostics")
+                .and_then(Json::as_array)
+                .unwrap_or_default()
+                .iter()
+                .map(|d| {
+                    (
+                        d.get("code")
+                            .and_then(Json::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        d.get("message")
+                            .and_then(Json::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> String {
+    request(
+        id,
+        "textDocument/completion",
+        Json::object(vec![
+            ("textDocument".into(), text_document(uri, vec![])),
+            (
+                "position".into(),
+                Json::object(vec![
+                    ("line".into(), Json::num(f64::from(line))),
+                    ("character".into(), Json::num(f64::from(character))),
+                ]),
+            ),
+        ]),
+    )
+}
+
+fn labels(messages: &[Json], id: f64) -> Vec<String> {
+    messages
+        .iter()
+        .find(|m| m.get("id").and_then(Json::as_f64) == Some(id))
+        .and_then(|m| m.get("result"))
+        .and_then(|r| r.get("items"))
+        .and_then(Json::as_array)
+        .expect("a completion list")
+        .iter()
+        .filter_map(|i| i.get("label").and_then(Json::as_str).map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn initialize_advertises_completion() {
+    let messages = run_session(&[]);
+    let caps = messages[0]
+        .get("result")
+        .unwrap()
+        .get("capabilities")
+        .unwrap();
+    let triggers = caps
+        .get("completionProvider")
+        .and_then(|c| c.get("triggerCharacters"))
+        .and_then(Json::as_array)
+        .expect("completionProvider.triggerCharacters");
+    assert_eq!(triggers, &[Json::str(".")]);
+}
+
+/// No catalog, no CAT findings; a catalog arrives and the open document is
+/// linted again against it; it is taken away and they go.
+#[test]
+fn a_catalog_notification_relints_open_documents() {
+    let uri = "file:///catalog/q.sql";
+    let sql = "SELECT o.totl FROM orders o JOIN custmers c ON o.id = c.id;";
+    let messages = run_session(&[
+        did_open(uri, sql),
+        catalog_notification(None, SHOP),
+        catalog_notification(None, "null"),
+    ]);
+    let rounds = published(&messages, uri);
+    assert_eq!(rounds.len(), 3, "{rounds:?}");
+    assert!(rounds[0].is_empty(), "no catalog, no CAT: {:?}", rounds[0]);
+    assert_eq!(
+        rounds[1],
+        [
+            (
+                "CAT002".to_string(),
+                "Column totl is not in the table it is qualified with. Did you mean total?"
+                    .to_string()
+            ),
+            (
+                "CAT001".to_string(),
+                "Table or view custmers is not in the catalog. Did you mean customers?".to_string()
+            ),
+        ]
+    );
+    assert!(rounds[2].is_empty(), "catalog cleared: {:?}", rounds[2]);
+}
+
+/// A catalog sent for one document applies to that document only, and wins
+/// there over the shared one; `columns: null` with a `uri` means that
+/// document has none at all; `default: true` hands it back to the shared one.
+#[test]
+fn a_catalog_can_belong_to_one_document() {
+    let a = "file:///catalog/a.sql";
+    let b = "file:///catalog/b.sql";
+    let other =
+        r#"[{"database":"x","schema":"main","table":"events","column":"ts","type":"TIMESTAMP"}]"#;
+    let back_to_default = notification(
+        "grebe/catalog",
+        Json::object(vec![
+            ("uri".to_string(), Json::str(a)),
+            ("default".to_string(), Json::Bool(true)),
+        ]),
+    );
+    let messages = run_session(&[
+        did_open(a, "SELECT * FROM ordrs;"),
+        did_open(b, "SELECT * FROM ordrs;"),
+        // Only `a` gets a catalog.
+        catalog_notification(Some(a), other),
+        // The shared one reaches `b`; `a` keeps its own.
+        catalog_notification(None, SHOP),
+        // `a` has no catalog now (its session stopped): nothing is checked,
+        // and the shared one does not step in.
+        catalog_notification(Some(a), "null"),
+        // `a` uses the shared one again.
+        back_to_default,
+        // The shared one goes: both are clean.
+        catalog_notification(None, "null"),
+    ]);
+    let rounds = |uri: &str| -> Vec<Vec<(String, String)>> { published(&messages, uri) };
+    let said = |r: &[(String, String)]| -> String {
+        r.iter()
+            .map(|(c, m)| format!("{c} {m}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let a_rounds: Vec<String> = rounds(a).iter().map(|r| said(r)).collect();
+    assert_eq!(
+        a_rounds,
+        [
+            "",
+            "CAT001 Table or view ordrs is not in the catalog.",
+            "",
+            "CAT001 Table or view ordrs is not in the catalog. Did you mean orders?",
+            "",
+        ],
+        "a: opened, own catalog, none, the shared one, shared one cleared"
+    );
+    let b_rounds: Vec<String> = rounds(b).iter().map(|r| said(r)).collect();
+    assert_eq!(
+        b_rounds,
+        [
+            "",
+            "CAT001 Table or view ordrs is not in the catalog. Did you mean orders?",
+            "",
+        ],
+        "b: opened, shared catalog, shared one cleared"
+    );
+}
+
+/// An empty catalog is a catalog: everything is unknown. Closing a document
+/// forgets what was said about it.
+#[test]
+fn an_empty_catalog_is_taken_literally_and_close_forgets_a_documents_own() {
+    let a = "file:///catalog/a.sql";
+    let close = notification(
+        "textDocument/didClose",
+        Json::object(vec![("textDocument".into(), text_document(a, vec![]))]),
+    );
+    let messages = run_session(&[
+        catalog_notification(None, "[]"),
+        catalog_notification(Some(a), "null"),
+        did_open(a, "SELECT * FROM orders;"),
+        close,
+        did_open(a, "SELECT * FROM orders;"),
+    ]);
+    let codes: Vec<Vec<String>> = published(&messages, a)
+        .into_iter()
+        .map(|r| r.into_iter().map(|(c, _)| c).collect())
+        .collect();
+    assert_eq!(
+        codes,
+        [vec![], vec![], vec!["CAT001".to_string()]],
+        "no catalog of its own; closed; reopened under the (empty) shared one"
+    );
+}
+
+#[test]
+fn a_malformed_catalog_is_reported_and_changes_nothing() {
+    let uri = "file:///catalog/q.sql";
+    let messages = run_session(&[
+        did_open(uri, "SELECT * FROM ordrs;"),
+        catalog_notification(None, r#"[{"column":"no table"}]"#),
+    ]);
+    assert_eq!(published(&messages, uri).len(), 1, "not linted again");
+    let said = messages
+        .iter()
+        .find(|m| m.get("method").and_then(Json::as_str) == Some("window/showMessage"))
+        .and_then(|m| {
+            m.get("params")?
+                .get("message")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .expect("a warning");
+    assert!(said.contains("grebe/catalog"), "{said}");
+}
+
+/// `catalog = "..."` in grebe.toml gives an editor that sends no catalog
+/// the same checks `grebe check` runs.
+#[test]
+fn grebe_toml_catalog_is_used_when_the_client_sends_none() {
+    let tree = TempTree::new("toml-catalog");
+    tree.write("grebe.toml", "catalog = \"catalog.json\"\n");
+    tree.write("catalog.json", SHOP);
+    let sql_path = tree.write("q.sql", "");
+    let uri = format!("file://{}", sql_path.display());
+    let messages = run_session(&[
+        did_open(&uri, "SELECT * FROM ordrs;\nSELECT c. FROM customers c;"),
+        completion_request(2, &uri, 1, 9),
+    ]);
+    let rounds = published(&messages, &uri);
+    assert_eq!(rounds[0].len(), 2, "{rounds:?}");
+    assert_eq!(rounds[0][0].0, "CAT001");
+    assert_eq!(
+        rounds[0][1].0, "PRS001",
+        "the second statement does not parse"
+    );
+    assert_eq!(labels(&messages, 2.0), ["id", "name"]);
+}
+
+#[test]
+fn completion_offers_the_catalogs_names() {
+    let uri = "file:///catalog/q.sql";
+    let messages = run_session(&[
+        catalog_notification(None, SHOP),
+        did_open(uri, "SELECT o. FROM orders o;\nSELECT * FROM cu"),
+        completion_request(2, uri, 0, 9),
+        completion_request(3, uri, 1, 16),
+        // A document the server has not seen: an empty list, not an error.
+        completion_request(4, "file:///nope.sql", 0, 0),
+    ]);
+    assert_eq!(labels(&messages, 2.0), ["id", "total"]);
+    assert_eq!(labels(&messages, 3.0), ["customers"]);
+    assert!(labels(&messages, 4.0).is_empty());
+    let first = messages
+        .iter()
+        .find(|m| m.get("id").and_then(Json::as_f64) == Some(2.0))
+        .and_then(|m| m.get("result")?.get("items")?.as_array()?.first().cloned())
+        .unwrap();
+    assert_eq!(first.get("kind").and_then(Json::as_f64), Some(5.0));
+    assert_eq!(
+        first.get("detail").and_then(Json::as_str),
+        Some("BIGINT · orders")
+    );
+}
+
+/// The nearest name is a quick fix in the editor.
+#[test]
+fn a_cat_suggestion_is_a_quick_fix() {
+    let uri = "file:///catalog/q.sql";
+    let messages = run_session(&[
+        catalog_notification(None, SHOP),
+        did_open(uri, "SELECT * FROM ordrs;"),
+        request(
+            2,
+            "textDocument/codeAction",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                (
+                    "range".into(),
+                    Json::object(vec![
+                        (
+                            "start".into(),
+                            Json::object(vec![
+                                ("line".into(), Json::num(0)),
+                                ("character".into(), Json::num(15)),
+                            ]),
+                        ),
+                        (
+                            "end".into(),
+                            Json::object(vec![
+                                ("line".into(), Json::num(0)),
+                                ("character".into(), Json::num(15)),
+                            ]),
+                        ),
+                    ]),
+                ),
+                (
+                    "context".into(),
+                    Json::object(vec![("diagnostics".into(), Json::Array(vec![]))]),
+                ),
+            ]),
+        ),
+    ]);
+    let actions = messages
+        .iter()
+        .find(|m| m.get("id").and_then(Json::as_f64) == Some(2.0))
+        .and_then(|m| m.get("result")?.as_array().map(<[Json]>::to_vec))
+        .expect("code actions");
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(
+        actions[0].get("title").and_then(Json::as_str),
+        Some("CAT001: change to orders")
+    );
+    let edit = actions[0]
+        .get("edit")
+        .and_then(|e| e.get("changes"))
+        .and_then(|c| c.get(uri))
+        .and_then(Json::as_array)
+        .unwrap();
+    assert_eq!(
+        edit[0].get("newText").and_then(Json::as_str),
+        Some("orders")
+    );
+}

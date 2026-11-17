@@ -382,10 +382,24 @@ fn run() -> i32 {
         let mut want_json = false;
         let mut config_flag: Option<&String> = None;
         let mut no_config = false;
+        // `--catalog FILE`: a catalog snapshot (see `grebe catalog`). With
+        // one, the CAT rules check table and column names against it;
+        // without one they do not run, and nothing else changes.
+        let mut catalog_flag: Option<&str> = None;
         let mut paths: Vec<&String> = Vec::new();
         let mut it = args[2..].iter();
         while let Some(a) = it.next() {
-            if a == "--select" {
+            if a == "--catalog" {
+                match it.next() {
+                    Some(v) => catalog_flag = Some(v.as_str()),
+                    None => {
+                        eprintln!("grebe check: --catalog needs a path");
+                        return 2;
+                    }
+                }
+            } else if let Some(v) = a.strip_prefix("--catalog=") {
+                catalog_flag = Some(v);
+            } else if a == "--select" {
                 match it.next() {
                     Some(v) => {
                         select = Some(grebe_rules::expand_select(
@@ -470,7 +484,11 @@ fn run() -> i32 {
             Ok(c) => c,
             Err(code) => return code,
         };
-        let selection = setup::selection(config.as_ref(), select.as_deref());
+        let catalog = match setup::load_catalog(catalog_flag, config.as_ref()) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let selection = setup::selection(config.as_ref(), select.as_deref(), catalog.as_ref());
 
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for a in &paths {
@@ -566,8 +584,15 @@ fn run() -> i32 {
                 // registry default -- not the registry default alone, so a
                 // config that promotes MOD001 to `error` can fail CI on it.
                 let sev = selection.severity_of(fnd.code);
+                // A CAT finding is about one name, and may know a near one:
+                // its replacement is a suggestion, never applied by --fix.
+                let suggestion = fnd
+                    .fix
+                    .as_ref()
+                    .filter(|_| fnd.code.starts_with("CAT"))
+                    .map(|fix| fix.replacement.clone());
                 if want_json {
-                    json_findings.push(grebe_lsp::json::Json::object(vec![
+                    let mut pairs = vec![
                         (
                             "path".to_string(),
                             grebe_lsp::json::Json::str(f.display().to_string()),
@@ -588,7 +613,20 @@ fn run() -> i32 {
                             "end".to_string(),
                             grebe_lsp::json::Json::num(fnd.span.end as f64),
                         ),
-                    ]));
+                    ];
+                    if let Some(s) = suggestion {
+                        pairs.push(("suggestion".to_string(), grebe_lsp::json::Json::str(s)));
+                    }
+                    json_findings.push(grebe_lsp::json::Json::object(pairs));
+                } else if let Some(s) = suggestion {
+                    outln!(
+                        "{}:{}:{}: {} {} (did you mean {s}?)",
+                        f.display(),
+                        line,
+                        col,
+                        fnd.code,
+                        name
+                    );
                 } else {
                     outln!("{}:{}:{}: {} {}", f.display(), line, col, fnd.code, name);
                 }
@@ -660,6 +698,10 @@ fn run() -> i32 {
         return i32::from(errors > 0);
     }
 
+    if args.len() >= 2 && args[1] == "catalog" {
+        return catalog_command(&args[2..]);
+    }
+
     if args.len() >= 2 && args[1] == "rules" {
         if args.len() >= 3 && args[2] == "--help" {
             print_rules_help();
@@ -671,6 +713,126 @@ fn run() -> i32 {
 
     eprintln!("grebe: missing or unknown command; run 'grebe --help' for usage");
     2
+}
+
+/// `grebe catalog [--duckdb PATH] [DATABASE]`: print a catalog snapshot of
+/// DATABASE on stdout, by running the user's own `duckdb` CLI.
+///
+/// grebe embeds no engine, and this does not change that: the snapshot is
+/// whatever `duckdb DATABASE -json -c <query>` prints, passed through after
+/// checking it reads as a snapshot. The database is opened read-only and
+/// `~/.duckdbrc` is not read, so the snapshot is of the file and nothing
+/// else. DuckDB 2.0's CLI renders for an AI agent when it sees one in the
+/// environment; an explicit output mode and `DUCKDB_AGENT_MODE=0` keep it
+/// printing JSON.
+fn catalog_command(args: &[String]) -> i32 {
+    let mut duckdb = "duckdb".to_string();
+    let mut database: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--help" {
+            print_catalog_help();
+            return 0;
+        } else if a == "--duckdb" {
+            match it.next() {
+                Some(v) => duckdb = v.clone(),
+                None => {
+                    eprintln!("grebe catalog: --duckdb needs a path");
+                    return 2;
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--duckdb=") {
+            duckdb = v.to_string();
+        } else if a.starts_with('-') {
+            eprintln!("grebe catalog: unrecognized flag {a}");
+            eprintln!("Run 'grebe catalog --help' for usage.");
+            return 2;
+        } else if database.is_some() {
+            eprintln!("grebe catalog: one database at a time");
+            return 2;
+        } else {
+            database = Some(a.as_str());
+        }
+    }
+    let mut cmd = std::process::Command::new(&duckdb);
+    cmd.env("DUCKDB_AGENT_MODE", "0").arg("-no-init");
+    match database {
+        Some(db) => {
+            if !std::path::Path::new(db).is_file() {
+                eprintln!("grebe catalog: no database file at {db}");
+                return 2;
+            }
+            cmd.arg("-readonly").arg(db);
+        }
+        None => {
+            cmd.arg(":memory:");
+        }
+    }
+    cmd.arg("-json")
+        .arg("-c")
+        .arg(grebe_rules::catalog::SNAPSHOT_SQL);
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("grebe catalog: could not run {duckdb}: {e}");
+            eprintln!("Install the DuckDB CLI, or point at it with --duckdb PATH.");
+            return 2;
+        }
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        eprintln!("grebe catalog: {duckdb} failed: {}", stderr.trim());
+        return 2;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match grebe_rules::catalog::Catalog::from_json_text(&stdout) {
+        Ok(cat) => {
+            out!("{stdout}");
+            let columns: usize = cat.tables().iter().map(|t| t.columns.len()).sum();
+            eprintln!(
+                "{} table(s) and view(s), {columns} column(s)",
+                cat.tables().len()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("grebe catalog: {duckdb} did not print a snapshot: {e}");
+            if !stderr.trim().is_empty() {
+                eprintln!("{}", stderr.trim());
+            }
+            2
+        }
+    }
+}
+
+/// `grebe catalog --help`.
+fn print_catalog_help() {
+    outln!("grebe catalog — print a catalog snapshot of a DuckDB database");
+    outln!();
+    outln!("Usage: grebe catalog [--duckdb PATH] [DATABASE] > catalog.json");
+    outln!();
+    outln!("Arguments:");
+    outln!("  DATABASE   a DuckDB database file, opened read-only. Without one,");
+    outln!("             the snapshot is of an empty in-memory database.");
+    outln!();
+    outln!("Options:");
+    outln!("  --duckdb PATH   the duckdb CLI to run (default: duckdb on PATH)");
+    outln!();
+    outln!("The snapshot is a JSON array with one object per column:");
+    outln!("  {{\"database\", \"schema\", \"table\", \"column\", \"type\"}}");
+    outln!("It is what DuckDB prints in -json mode for:");
+    outln!("  {}", grebe_rules::catalog::SNAPSHOT_SQL);
+    outln!("so any other way of running that query gives the same file.");
+    outln!();
+    outln!("Give it to 'grebe check --catalog FILE', or name it in grebe.toml as");
+    outln!("catalog = \"catalog.json\", and CAT001 (unknown table) and CAT002");
+    outln!("(unknown column) check names against it. grebe itself embeds no");
+    outln!("engine: this command is the only one that runs duckdb, and only");
+    outln!("when you ask for it.");
+    outln!();
+    outln!("Exit codes:");
+    outln!("  0   a snapshot was printed");
+    outln!("  2   usage error, or duckdb could not be run or failed");
 }
 
 /// Top-level `grebe --help`. Lists the user-facing verbs (`check`, `format`,
@@ -685,6 +847,8 @@ fn print_top_help() {
     outln!("  format   rewrite SQL files to canonical layout");
     outln!("  check    lint SQL files or directories");
     outln!("  rules    print the rule registry as a table");
+    outln!("  catalog  print a catalog snapshot of a DuckDB database, for");
+    outln!("           check --catalog (runs your own duckdb CLI)");
     outln!("  lsp      run the language server on stdin/stdout");
     outln!();
     outln!("  --version   print the version and exit");
@@ -738,7 +902,7 @@ fn print_check_help() {
     outln!("grebe check — lint SQL files");
     outln!();
     outln!("Usage: grebe check PATHS... [--select CODE[,CODE...]] [--fix [--unsafe]] [--json]");
-    outln!("                    [--config PATH | --no-config]");
+    outln!("                    [--catalog FILE] [--config PATH | --no-config]");
     outln!();
     outln!("Arguments:");
     outln!("  PATHS   one or more files or directories to lint; directories are");
@@ -762,6 +926,11 @@ fn print_check_help() {
     outln!("  --json                    print one JSON document to stdout instead");
     outln!("                            of text lines; summaries still go to");
     outln!("                            stderr.");
+    outln!("  --catalog FILE            also check table and column names against");
+    outln!("                            this catalog snapshot (CAT001, CAT002);");
+    outln!("                            'grebe catalog DATABASE' writes one. Wins");
+    outln!("                            over a config file's catalog. Without a");
+    outln!("                            catalog those rules do not run.");
     outln!("  --config PATH             read this config file instead of");
     outln!("                            discovering one.");
     outln!("  --no-config               read no config file, even if grebe.toml");
@@ -773,7 +942,7 @@ fn print_check_help() {
     outln!();
     outln!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
     outln!("pyproject.toml) is discovered by walking up from the first path given.");
-    outln!("Its select, [severity] and foreign-heads apply here; a config's own");
+    outln!("Its select, [severity], foreign-heads and catalog apply here; a config's own");
     outln!("select only takes effect when --select is absent on the command line.");
     outln!();
     outln!("Exit codes:");
@@ -809,6 +978,7 @@ fn print_rules_table() {
         grebe_rules::Category::Prs => "PRS",
         grebe_rules::Category::Src => "SRC",
         grebe_rules::Category::Mod => "MOD",
+        grebe_rules::Category::Cat => "CAT",
     };
     // Off-severity rows are opt-in rules, enabled through config: spelling
     // it "off (opt-in)" rather than bare "off" marks them at a glance
