@@ -436,51 +436,192 @@ fn expand_calls(expr: &PegExpr, macros: &HashMap<String, (String, PegExpr)>) -> 
 struct Compiler {
     expressions: Vec<String>,
     rule_ids: HashMap<String, u32>,
+    /// The same expressions as data, for the FIRST-set computation.
+    shapes: Vec<Shape>,
+}
+
+/// What a compiled expression is made of, by index into the expression
+/// table.
+#[derive(Clone, Debug)]
+enum Shape {
+    Literal(String),
+    Rule(String),
+    Identifier,
+    Seq(Vec<usize>),
+    Choice(Vec<usize>),
+    /// `?` and `*`: may match nothing.
+    Maybe(usize),
+    Plus(usize),
+    /// Matches without consuming: lookahead, end of input.
+    ZeroWidth,
+    /// The body of a rule the matcher implements natively.
+    Native,
+}
+
+// What kind of token an expression can begin with. `FIRST_NULLABLE` means it
+// can also match without consuming one. The same bits are in matcher.rs.
+const FIRST_NULLABLE: u8 = 1;
+const FIRST_WORD: u8 = 1 << 1;
+const FIRST_QUOTED_IDENT: u8 = 1 << 2;
+const FIRST_STRING: u8 = 1 << 3;
+const FIRST_NUMBER: u8 = 1 << 4;
+const FIRST_OPERATOR: u8 = 1 << 5;
+
+/// The FIRST set of each rule the matcher implements natively: the token
+/// kinds its code in matcher.rs accepts. A native rule missing here fails
+/// the build, so a new one cannot go unclassified.
+fn native_first(rule: &str) -> u8 {
+    match rule {
+        "StringLiteral" => FIRST_STRING,
+        "NumberLiteral" => FIRST_NUMBER,
+        "OperatorLiteral" | "AnyOperatorLiteral" => FIRST_OPERATOR,
+        "ReservedKeyword" | "UnreservedKeyword" | "ColumnNameKeyword" | "FuncNameKeyword"
+        | "TypeNameKeyword" | "BareLabelKeyword" => FIRST_WORD,
+        "NewlineBefore" | "EndOfInput" => FIRST_NULLABLE,
+        _ => panic!("native rule `{rule}` has no FIRST set; add it to `native_first`"),
+    }
+}
+
+/// For every expression: the token kinds and the literals a match can begin
+/// with. A fixed point over the rule graph, starting from nothing; a set
+/// only grows, so it ends.
+///
+/// The matcher consults this before trying an expression. Most
+/// alternatives of most choices cannot start with the token at hand -- the
+/// precedence chain alone is twenty rules deep under every value -- and
+/// skipping them is a table lookup instead of a descent that ends in a
+/// failed comparison. A set that is too large only costs time; one that is
+/// too small would reject valid SQL, so every case below errs large.
+fn first_sets(
+    shapes: &[Shape],
+    rule_roots: &HashMap<String, usize>,
+    literal_ids: &HashMap<String, u16>,
+) -> Vec<(u8, std::collections::BTreeSet<u16>)> {
+    let mut first: Vec<(u8, std::collections::BTreeSet<u16>)> =
+        vec![(0, Default::default()); shapes.len()];
+    loop {
+        let mut changed = false;
+        for i in (0..shapes.len()).rev() {
+            let mut flags = 0u8;
+            let mut lits = std::collections::BTreeSet::new();
+            match &shapes[i] {
+                Shape::Literal(l) => {
+                    lits.insert(literal_ids[&l.to_ascii_lowercase()]);
+                }
+                Shape::Identifier => flags = FIRST_WORD | FIRST_QUOTED_IDENT,
+                Shape::ZeroWidth => flags = FIRST_NULLABLE,
+                Shape::Native => {} // set through the rule that owns it
+                Shape::Rule(name) => {
+                    let root = rule_roots[name];
+                    if matches!(shapes[root], Shape::Native) {
+                        flags = native_first(name);
+                    } else {
+                        flags = first[root].0;
+                        lits = first[root].1.clone();
+                    }
+                }
+                Shape::Seq(items) => {
+                    flags = FIRST_NULLABLE;
+                    for &item in items {
+                        flags |= first[item].0 & !FIRST_NULLABLE;
+                        lits.extend(first[item].1.iter().copied());
+                        if first[item].0 & FIRST_NULLABLE == 0 {
+                            flags &= !FIRST_NULLABLE;
+                            break;
+                        }
+                    }
+                }
+                Shape::Choice(items) => {
+                    for &item in items {
+                        flags |= first[item].0;
+                        lits.extend(first[item].1.iter().copied());
+                    }
+                }
+                Shape::Maybe(item) => {
+                    flags = first[*item].0 | FIRST_NULLABLE;
+                    lits = first[*item].1.clone();
+                }
+                Shape::Plus(item) => {
+                    flags = first[*item].0;
+                    lits = first[*item].1.clone();
+                }
+            }
+            if (flags, &lits) != (first[i].0, &first[i].1) {
+                first[i] = (flags, lits);
+                changed = true;
+            }
+        }
+        if !changed {
+            return first;
+        }
+    }
 }
 
 impl Compiler {
     fn compile_expr(&mut self, expr: &PegExpr) -> usize {
         let idx = self.expressions.len();
         self.expressions.push(String::new()); // placeholder
-        let compiled = match expr {
-            PegExpr::Literal(s) => format!("Expr::Literal({:?})", s),
+        self.shapes.push(Shape::ZeroWidth); // placeholder
+        let ids = |items: &[usize]| {
+            items
+                .iter()
+                .map(|i| format!("ExprId({i})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (compiled, shape) = match expr {
+            PegExpr::Literal(s) => (format!("Expr::Literal({:?})", s), Shape::Literal(s.clone())),
             PegExpr::Ref(name) => {
                 if name == "EndOfInput" {
-                    "Expr::EndOfInput".to_string()
+                    ("Expr::EndOfInput".to_string(), Shape::ZeroWidth)
                 } else if let Some(&id) = self.rule_ids.get(name) {
-                    format!("Expr::Rule(RuleId({}))", id)
+                    (
+                        format!("Expr::Rule(RuleId({}))", id),
+                        Shape::Rule(name.clone()),
+                    )
                 } else {
                     panic!("undefined reference to rule: {}", name);
                 }
             }
             PegExpr::Seq(items) => {
-                let ids: Vec<String> = items
-                    .iter()
-                    .map(|item| format!("ExprId({})", self.compile_expr(item)))
-                    .collect();
-                format!("Expr::Seq(&[{}])", ids.join(", "))
+                let items: Vec<usize> = items.iter().map(|item| self.compile_expr(item)).collect();
+                (format!("Expr::Seq(&[{}])", ids(&items)), Shape::Seq(items))
             }
             PegExpr::Choice(items) => {
-                let ids: Vec<String> = items
-                    .iter()
-                    .map(|item| format!("ExprId({})", self.compile_expr(item)))
-                    .collect();
-                format!("Expr::Choice(&[{}])", ids.join(", "))
+                let items: Vec<usize> = items.iter().map(|item| self.compile_expr(item)).collect();
+                (
+                    format!("Expr::Choice(&[{}])", ids(&items)),
+                    Shape::Choice(items),
+                )
             }
             PegExpr::Optional(item) => {
-                format!("Expr::Optional(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (
+                    format!("Expr::Optional(ExprId({item}))"),
+                    Shape::Maybe(item),
+                )
             }
             PegExpr::ZeroOrMore(item) => {
-                format!("Expr::ZeroOrMore(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (
+                    format!("Expr::ZeroOrMore(ExprId({item}))"),
+                    Shape::Maybe(item),
+                )
             }
             PegExpr::OneOrMore(item) => {
-                format!("Expr::OneOrMore(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (
+                    format!("Expr::OneOrMore(ExprId({item}))"),
+                    Shape::Plus(item),
+                )
             }
             PegExpr::Not(item) => {
-                format!("Expr::Not(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (format!("Expr::Not(ExprId({item}))"), Shape::ZeroWidth)
             }
             PegExpr::And(item) => {
-                format!("Expr::And(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (format!("Expr::And(ExprId({item}))"), Shape::ZeroWidth)
             }
             PegExpr::Identifier(cat) => {
                 let cat_str = match cat {
@@ -490,16 +631,20 @@ impl Compiler {
                     Category::Any => "Category::Any",
                     Category::BareLabel => "Category::BareLabel",
                 };
-                format!("Expr::Identifier(crate::keyword::{})", cat_str)
+                (
+                    format!("Expr::Identifier(crate::keyword::{})", cat_str),
+                    Shape::Identifier,
+                )
             }
-            PegExpr::EndOfInput => "Expr::EndOfInput".to_string(),
+            PegExpr::EndOfInput => ("Expr::EndOfInput".to_string(), Shape::ZeroWidth),
             // A placeholder the matcher never evaluates: every `Dummy` rule is
             // dispatched by name in `Matcher::evaluate_rule` before its
             // expression is consulted.
-            PegExpr::Dummy => "Expr::EndOfInput".to_string(),
+            PegExpr::Dummy => ("Expr::EndOfInput".to_string(), Shape::Native),
             PegExpr::Call(_, _) => panic!("macro calls should have been expanded"),
         };
         self.expressions[idx] = compiled;
+        self.shapes[idx] = shape;
         idx
     }
 }
@@ -903,6 +1048,7 @@ fn main() {
     let mut compiler = Compiler {
         expressions: Vec::new(),
         rule_ids: rule_ids.clone(),
+        shapes: Vec::new(),
     };
 
     let mut rule_root_exprs = Vec::new();
@@ -934,6 +1080,75 @@ fn main() {
     }
     exprs_static.push_str("];\n\n");
 
+    // FIRST sets. Literals are numbered in sorted order of their lowercase
+    // text, which is the order the matcher's binary search expects.
+    let mut literal_list: Vec<String> = compiler
+        .shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Literal(l) => Some(l.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    literal_list.sort();
+    literal_list.dedup();
+    assert!(literal_list.len() < u16::MAX as usize);
+    let literal_ids: HashMap<String, u16> = literal_list
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.clone(), i as u16))
+        .collect();
+    let rule_roots: HashMap<String, usize> = sorted_rule_names
+        .iter()
+        .cloned()
+        .zip(rule_root_exprs.iter().copied())
+        .collect();
+    let first = first_sets(&compiler.shapes, &rule_roots, &literal_ids);
+    let words = literal_list.len().div_ceil(64);
+    // Many expressions share a set: store each once.
+    let mut set_ids: HashMap<(u8, Vec<u16>), usize> = HashMap::new();
+    let mut sets: Vec<(u8, Vec<u16>)> = Vec::new();
+    let mut first_of = Vec::new();
+    for (flags, lits) in &first {
+        let key = (*flags, lits.iter().copied().collect::<Vec<u16>>());
+        let id = *set_ids.entry(key.clone()).or_insert_with(|| {
+            sets.push(key);
+            sets.len() - 1
+        });
+        first_of.push(id);
+    }
+    assert!(sets.len() < u16::MAX as usize);
+    let mut first_static = String::new();
+    first_static.push_str(&format!(
+        "/// Every grammar literal, lowercase and sorted.\npub static LITERALS: &[&str] = &{:?};\n\n",
+        literal_list
+    ));
+    first_static.push_str(&format!(
+        "/// 64-bit words in a FIRST set's literal bitmap.\npub const FIRST_WORDS: usize = {words};\n\n"
+    ));
+    first_static.push_str(
+        "/// Each expression's FIRST set, as an index into `FIRST_FLAGS` and `FIRST_LITERALS`.\n",
+    );
+    first_static.push_str(&format!(
+        "pub static FIRST_OF: &[u16] = &{:?};\n\n",
+        first_of
+    ));
+    first_static.push_str("/// Token kinds a set admits, and whether it admits no token at all.\n");
+    first_static.push_str(&format!(
+        "pub static FIRST_FLAGS: &[u8] = &{:?};\n\n",
+        sets.iter().map(|(f, _)| *f).collect::<Vec<u8>>()
+    ));
+    first_static.push_str("/// The literals a set admits, a bit per entry of `LITERALS`.\n");
+    first_static.push_str("pub static FIRST_LITERALS: &[[u64; FIRST_WORDS]] = &[\n");
+    for (_, lits) in &sets {
+        let mut bits = vec![0u64; words];
+        for &l in lits {
+            bits[l as usize / 64] |= 1 << (l % 64);
+        }
+        first_static.push_str(&format!("    {:?},\n", bits));
+    }
+    first_static.push_str("];\n\n");
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("grammar_tables.rs");
 
@@ -944,6 +1159,7 @@ fn main() {
     final_content.push('\n');
     final_content.push_str(&rules_static);
     final_content.push_str(&exprs_static);
+    final_content.push_str(&first_static);
 
     std::fs::write(&dest_path, final_content).unwrap_or_else(|e| {
         panic!(

@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use crate::Span;
 use crate::cst::{Node, NodeId, Tree};
 use crate::grammar::{
-    EXPRESSIONS, Expr, ExprId, RULE_ANY_OPERATOR_LITERAL, RULE_BARE_LABEL_KEYWORD,
-    RULE_COLUMN_NAME_KEYWORD, RULE_END_OF_INPUT, RULE_FUNC_NAME_KEYWORD, RULE_NEWLINE_BEFORE,
-    RULE_NUMBER_LITERAL, RULE_OPERATOR_LITERAL, RULE_PROGRAM, RULE_RESERVED_KEYWORD,
-    RULE_STRING_LITERAL, RULE_TYPE_NAME_KEYWORD, RULE_UNRESERVED_KEYWORD, RULES, RuleId,
-    classify_keyword,
+    EXPRESSIONS, Expr, ExprId, FIRST_FLAGS, FIRST_LITERALS, FIRST_OF, LITERALS,
+    RULE_ANY_OPERATOR_LITERAL, RULE_BARE_LABEL_KEYWORD, RULE_COLUMN_NAME_KEYWORD,
+    RULE_END_OF_INPUT, RULE_FUNC_NAME_KEYWORD, RULE_NEWLINE_BEFORE, RULE_NUMBER_LITERAL,
+    RULE_OPERATOR_LITERAL, RULE_PROGRAM, RULE_RESERVED_KEYWORD, RULE_STRING_LITERAL,
+    RULE_TYPE_NAME_KEYWORD, RULE_UNRESERVED_KEYWORD, RULES, RuleId, classify_keyword,
 };
 use crate::keyword::Keyword;
 use crate::token::{Token, TokenKind, tokenize};
@@ -74,6 +74,9 @@ pub struct Matcher<'a> {
     /// Each match token's keyword categories, computed once: identifier and
     /// keyword rules ask about the same token many times during backtracking.
     keywords: Vec<Keyword>,
+    /// Each match token as a FIRST set sees it: its kind as a `FIRST_*` bit,
+    /// and which grammar literal its text is, if any.
+    starts: Vec<(u8, u16)>,
     /// Packrat state for every `(rule, token position)` in the window
     /// `base..base + width`, at `rule * width + (token - base)`: [`UNSEEN`],
     /// [`ACTIVE`] (being matched; re-entering means left recursion),
@@ -160,6 +163,30 @@ struct RawNode {
     size: u32,
 }
 
+// A FIRST set's flags (build.rs computes the sets and has the same bits).
+const FIRST_NULLABLE: u8 = 1;
+const FIRST_WORD: u8 = 1 << 1;
+const FIRST_QUOTED_IDENT: u8 = 1 << 2;
+const FIRST_STRING: u8 = 1 << 3;
+const FIRST_NUMBER: u8 = 1 << 4;
+const FIRST_OPERATOR: u8 = 1 << 5;
+const NO_LITERAL: u16 = u16::MAX;
+
+/// Which entry of `LITERALS` a token's text is, compared the way
+/// `Expr::Literal` compares: ASCII case folded, nothing else.
+fn literal_id(text: &[u8]) -> u16 {
+    let mut buf = [0u8; 32];
+    if text.len() > buf.len() {
+        return NO_LITERAL; // longer than any grammar literal
+    }
+    let lower = &mut buf[..text.len()];
+    lower.copy_from_slice(text);
+    lower.make_ascii_lowercase();
+    LITERALS
+        .binary_search_by(|l| l.as_bytes().cmp(lower))
+        .map_or(NO_LITERAL, |i| i as u16)
+}
+
 /// Largest memo table kept for the next parse on the thread: 64 MB.
 const SPARE_MEMO_LIMIT: usize = 1 << 24;
 
@@ -201,11 +228,26 @@ impl<'a> Matcher<'a> {
                 }
             })
             .collect();
+        let starts = match_tokens
+            .iter()
+            .map(|(t, _)| {
+                let class = match t.kind {
+                    TokenKind::Word => FIRST_WORD,
+                    TokenKind::QuotedIdent => FIRST_QUOTED_IDENT,
+                    TokenKind::String => FIRST_STRING,
+                    TokenKind::Number => FIRST_NUMBER,
+                    TokenKind::Operator => FIRST_OPERATOR,
+                    _ => 0,
+                };
+                (class, literal_id(t.span.slice(src.as_bytes())))
+            })
+            .collect();
         let match_tokens_len = match_tokens.len();
         Matcher {
             src: src.as_bytes(),
             match_tokens,
             keywords,
+            starts,
             // The last parse on this thread left its table behind, all
             // slots unseen again: a file of one query would otherwise zero
             // a table of its own.
@@ -614,7 +656,27 @@ impl<'a> Matcher<'a> {
         self.hits.push((end, offset as u32, len as u32));
     }
 
+    /// Can a match of `expr_id` begin at `token_idx`? `false` is certain;
+    /// `true` means it has to be tried.
+    #[inline]
+    fn can_start(&self, expr_id: ExprId, token_idx: usize) -> bool {
+        let set = FIRST_OF[expr_id.0 as usize] as usize;
+        let flags = FIRST_FLAGS[set];
+        if flags & FIRST_NULLABLE != 0 {
+            return true;
+        }
+        let Some(&(class, literal)) = self.starts.get(token_idx) else {
+            return false; // end of input, and the expression needs a token
+        };
+        flags & class != 0
+            || (literal != NO_LITERAL
+                && FIRST_LITERALS[set][literal as usize >> 6] >> (literal & 63) & 1 != 0)
+    }
+
     fn evaluate(&mut self, expr_id: ExprId, token_idx: usize) -> Option<usize> {
+        if !self.can_start(expr_id, token_idx) {
+            return None;
+        }
         let expr = &EXPRESSIONS[expr_id.0 as usize];
         match expr {
             Expr::Literal(lit) => {
