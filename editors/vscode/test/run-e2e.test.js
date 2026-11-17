@@ -210,6 +210,7 @@ function lspClient(bin) {
   let buf = Buffer.alloc(0);
   let id = 0;
   const pending = new Map();
+  const diagnostics = new Map(); // uri -> the diagnostics last published
   proc.stdout.on("data", (d) => {
     buf = Buffer.concat([buf, d]);
     for (;;) {
@@ -222,6 +223,8 @@ function lspClient(bin) {
       if (msg.id !== undefined && pending.has(msg.id)) {
         pending.get(msg.id)(msg.result);
         pending.delete(msg.id);
+      } else if (msg.method === "textDocument/publishDiagnostics") {
+        diagnostics.set(msg.params.uri, msg.params.diagnostics);
       }
     }
   });
@@ -239,6 +242,8 @@ function lspClient(bin) {
       });
     },
     notify: (method, params) => send({ method, params }),
+    sendNotification: (method, params) => send({ method, params }),
+    diagnostics,
     // The shape run.js uses from vscode-languageclient.
     sendRequest(method, params) {
       return this.request(method, params);
@@ -1534,4 +1539,47 @@ live("the language server is told what each session holds, once per change", asy
   await sync.sync();
   assert.deepEqual(sentTo[4], ["grebe/catalog", { columns: null }]);
   assert.equal(sentTo.length, 5);
+});
+
+live("the editor marks what the session does not have, and completes what it has", async (t) => {
+  const { vscode, runner, client, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const { CatalogSync } = require("../catalogSync");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const sync = new CatalogSync({ clientReady: async () => client, liveSessions: runner.liveSessions, sessionNameOf: runner.sessionNameOf });
+  const load = open(path.join(dir, "load.sql"), "CREATE TABLE orders (id INTEGER, total DECIMAL(10,2));\nCREATE TABLE customers (id INTEGER, name VARCHAR);");
+  const querySql = "SELECT o.id, o.totl\nFROM ordrs o;\nSELECT o.totl FROM orders o;\nSELECT c.name FROM customers c;\nSELECT o. FROM orders o;";
+  const query = open(path.join(dir, "query.sql"), querySql);
+  vscode.workspace.textDocuments = [load, query];
+  const cat = () => (client.diagnostics.get(query.uri.toString()) || []).filter((d) => /^CAT/.test(d.code));
+
+  // No session yet: nothing is known, so nothing is marked.
+  await sync.sync();
+  await client.request("grebe/statements", { textDocument: { uri: query.uri.toString() } });
+  assert.deepEqual(cat(), []);
+
+  await run(load);
+  await sync.sync();
+  await until(() => cat().length === 2, "the catalog findings");
+  const found = cat().map((d) => [d.code, d.range.start.line, d.message]);
+  assert.equal(found[0][0], "CAT001");
+  assert.equal(found[0][1], 1);
+  assert.match(found[0][2], /ordrs.*orders/);
+  assert.equal(found[1][0], "CAT002");
+  assert.equal(found[1][1], 2);
+  assert.match(found[1][2], /totl.*total/);
+
+  // `o.` offers the columns of orders.
+  const at = { line: 4, character: "SELECT o.".length };
+  const completion = await client.request("textDocument/completion", { textDocument: { uri: query.uri.toString() }, position: at });
+  const labels = (completion.items || completion).map((i) => i.label);
+  assert.deepEqual(labels.sort(), ["id", "total"]);
+
+  // The table arrives in the session: the mark goes.
+  const fix = open(path.join(dir, "fix.sql"), "CREATE VIEW ordrs AS FROM orders;");
+  vscode.workspace.textDocuments = [load, query, fix];
+  await run(fix);
+  await sync.sync();
+  await until(() => cat().every((d) => d.code === "CAT002"), "CAT001 to clear");
+  // ordrs is known now, so its misspelt column is what is marked there.
+  assert.deepEqual(cat().map((d) => d.range.start.line), [0, 2]);
 });
