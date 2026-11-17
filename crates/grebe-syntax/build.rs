@@ -788,6 +788,53 @@ fn apply_structural_overrides(rules: &mut HashMap<String, PegExpr>) {
             "`{rule}` no longer has exactly one `{tail}*`; this override is stale"
         );
     }
+
+    // A bare expression as a statement: `1 + 1;`, `42 AS answer, 'x';`.
+    //
+    // The grammar up to 1.5 had `Statement <- ... / ExpressionStatement`; the
+    // v2.0.0 grammar directory does not, because 2.0 moved the rule out of
+    // the core grammar and into the CLI, which adds it when it starts.
+    // Checked against 2.0.0: the `duckdb` shell runs `1+1;` and
+    // `CREATE TABLE z AS 1;`, and the library (`duckdb.extract_statements`)
+    // refuses both; 1.5.5 refuses them everywhere. The shell is how SQL files
+    // are run, by hand and by the editor extension, so a file it accepts must
+    // not be a `PRS001`: the rule is kept, as the last alternative, where it
+    // can only match what nothing else did. That it is not valid through a
+    // client library is a fact about where the file runs, not its syntax.
+    let stmt = rules
+        .get_mut("Statement")
+        .expect("vendored grammar has no `Statement` rule");
+    let PegExpr::Choice(alts) = stmt else {
+        panic!("`Statement` is no longer a choice; this override is stale");
+    };
+    assert!(
+        !alts
+            .iter()
+            .any(|a| matches!(a, PegExpr::Ref(n) if n == "ExpressionStatement")),
+        "upstream has `ExpressionStatement` again; drop this override"
+    );
+    alts.push(PegExpr::Ref("ExpressionStatement".to_string()));
+    let alias = PegExpr::Choice(
+        ["ColIdExpression", "ExpressionAsCollabel", "Expression"]
+            .into_iter()
+            .map(|n| PegExpr::Ref(n.to_string()))
+            .collect(),
+    );
+    for (name, expr) in [
+        ("ExpressionAlias", alias),
+        (
+            "ExpressionStatement",
+            PegExpr::Call(
+                "List".to_string(),
+                Box::new(PegExpr::Ref("ExpressionAlias".to_string())),
+            ),
+        ),
+    ] {
+        assert!(
+            rules.insert(name.to_string(), expr).is_none(),
+            "upstream defines `{name}` now; drop this override"
+        );
+    }
 }
 
 /// `StringLiteral (NewlineBefore StringLiteral)*`: a string literal and the

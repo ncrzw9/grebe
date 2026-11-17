@@ -88,3 +88,24 @@ SELECT `x FROM (SELECT 1 x);
 -- 2.0 has a limit of 1,000 nested expressions (`max_expression_depth`);
 -- 1.5.5 has none that this statement reaches. The matcher's own recursion
 -- limit turns it away as well.
+
+-- === 7. A bare expression as a statement ===
+-- Direction: the 2.0 `duckdb` shell ACCEPTS; the 2.0 library and 1.5.5
+-- reject; we accept.
+-- Count: none in the corpus (its verdicts are the library's).
+--
+-- Up to 1.5 the grammar had `Statement <- ... / ExpressionStatement`. 2.0
+-- took the rule out of the core grammar and has the CLI add it at start-up:
+-- `1 + 1;` and `CREATE TABLE z AS 1;` run in the 2.0.0 shell and are a
+-- Parser Error through `duckdb.extract_statements`. A SQL file is run with
+-- the shell, by hand and by the editor extension, so what the shell takes
+-- must not be a syntax error here. build.rs keeps the rule as the last
+-- alternative of `Statement`.
+-- expect: PARSE
+1 + 1 AS two, 'x';
+-- expect: PARSE
+CREATE TABLE z AS 1;
+-- What the shell still refuses stays refused: a select list is not a
+-- statement.
+-- expect: REJECT
+x FROM t;
