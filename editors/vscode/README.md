@@ -75,14 +75,19 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
 | **grebe: Restart DuckDB Session** | start fresh |
 
 - **One session stays open**, like a terminal: `TEMP` tables, `SET` options
-  and in-memory data survive from one run to the next.
+  and in-memory data survive from one run to the next, and from one file to
+  the next: every file in the window runs in the same session, whichever
+  folder it is in. The session ends when you restart it, choose another
+  database or CLI, or close the window.
 - **Statements run one at a time** and each result shows under its own
   statement. grebe's own tokenizer splits them, so a `;` inside a string or
   a comment never splits a statement.
 - **A run stops at the first error**, marks it in the editor where DuckDB
   reported it, and shows the line with a caret under the spot in the grid.
 - **Relative paths** in SQL (`read_csv('data/orders.csv')`) resolve from
-  the workspace folder, as if you ran `duckdb` from the project root.
+  the workspace folder, as if you ran `duckdb` from the project root. With
+  several folders open (or files from outside the folder), that is the
+  folder of the file that started the session.
 - **DuckDB 1.5 and 2.0** both work; point `grebe.duckdb.path` at the one
   you want. A database file written by 2.0 cannot be opened by 1.5, and if
   that is why a run fails, the error says so.

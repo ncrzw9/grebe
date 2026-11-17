@@ -1303,3 +1303,64 @@ live("file commands given a tree item (not a file) ask for a file instead of fai
   assert.deepEqual(shown.errors, [], "no command failed");
   assert.equal(dialogs.length, 3, "browse, attach and open-in-grid each asked for a file");
 });
+
+live("one session serves files in different folders, and outlives a maxRows change", async (t) => {
+  const config = { path: CLI, database: ":memory:", maxRows: 100 };
+  const { vscode, shown } = makeVscode(config);
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  t.after(() => {
+    Module._load = origLoad;
+  });
+  for (const m of ["../run", "../results", "../log"]) delete require.cache[require.resolve(m)];
+  const runner = require("../run");
+
+  const client = lspClient(GREBE);
+  t.after(() => client.stop());
+  await client.request("initialize", { capabilities: {} });
+
+  // Two files in two folders: with no workspace folder, each file's own
+  // directory is its working directory, which used to mean a new session.
+  const open = (name, sql) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, sql);
+    const doc = fakeDocument(file, sql);
+    shown.docs.set(doc.uri.toString(), doc);
+    client.notify("textDocument/didOpen", { textDocument: { uri: doc.uri.toString(), languageId: "sql", version: 1, text: sql } });
+    return doc;
+  };
+  const load = open("load.sql", "CREATE TABLE shared AS SELECT 42 AS answer;\nCREATE TEMP TABLE scratch AS SELECT 7 AS n;");
+  const read = open("read.sql", "SELECT answer, n FROM shared, scratch;");
+
+  const subs = [];
+  runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") } }, () => Promise.resolve(client));
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+  resolveResultsView(vscode, shown);
+
+  const runFile = async (doc) => {
+    const before = shown.posted.length;
+    vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+    await shown.commands.get("grebe.duckdb.runFile")();
+    return shown.posted.slice(before).filter((m) => m.type === "result").map((m) => m.entry.result);
+  };
+
+  assert.deepEqual((await runFile(load)).map((r) => r.kind), ["ok", "ok"]);
+  let got = await runFile(read);
+  assert.equal(got.length, 1);
+  assert.equal(got[0].kind, "rows", JSON.stringify(got[0]));
+
+  // The other folder is named in the log once, not on every run.
+  await runFile(read);
+  const said = shown.log.filter((l) => /sharing the session/.test(l));
+  assert.equal(said.length, 1, shown.log.join(""));
+  assert.equal(shown.log.filter((l) => /\bstarting /.test(l)).length, 1, `one session was started: ${shown.log.join("")}`);
+
+  // maxRows is read per run: changing it does not throw the session away.
+  config.maxRows = 50;
+  await shown.configChanged({ affectsConfiguration: (k) => k === "grebe.duckdb.maxRows" });
+  got = await runFile(read);
+  assert.equal(got[0].kind, "rows", JSON.stringify(got[0]));
+});
