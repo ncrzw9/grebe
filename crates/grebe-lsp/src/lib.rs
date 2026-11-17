@@ -11,16 +11,21 @@
 //! `textDocument/didOpen|didChange|didSave|didClose`, each publishing the
 //! diagnostics `grebe check` would report; quick fixes
 //! (`textDocument/codeAction`); whole-document formatting; semantic tokens;
-//! `workspace/didChangeConfiguration` for the `grebe.select` setting; and
+//! `workspace/didChangeConfiguration` for the `grebe.select` setting;
 //! `grebe/statements`, which tells an editor where each statement of a
-//! document begins and ends so it can run them one at a time.
+//! document begins and ends so it can run them one at a time;
+//! `textDocument/completion`; and `grebe/catalog`, by which an editor that
+//! has a database open hands over what is in it, for completion and for the
+//! `CAT` rules (a `catalog = "..."` file in `grebe.toml` does the same for
+//! an editor that does not).
 //!
 //! Everything but [`serve`] is `pub(crate)`-shaped in spirit but kept
 //! `pub` where tests in `tests/` need it; [`serve`] is the only API the
 //! CLI crate is meant to call.
 
 pub mod code_action;
-pub mod json;
+pub mod completion;
+pub use grebe_rules::json;
 pub mod position;
 pub mod semantic;
 pub mod server;
