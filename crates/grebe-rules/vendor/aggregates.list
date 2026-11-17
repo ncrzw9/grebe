@@ -19,6 +19,7 @@ bit_xor
 bitstring_agg
 bool_and
 bool_or
+combine_aggr
 corr
 count
 count_if
@@ -27,6 +28,7 @@ countif
 covar_pop
 covar_samp
 cume_dist
+decimal_average
 dense_rank
 entropy
 favg
@@ -46,6 +48,7 @@ last_value
 lead
 list
 listagg
+lttb
 mad
 max
 max_by
@@ -86,3 +89,4 @@ sumkahan
 var_pop
 var_samp
 variance
+variant_group_object

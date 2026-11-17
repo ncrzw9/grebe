@@ -65,6 +65,7 @@ const CLAUSE_RULES: &[&str] = &[
     "FetchClause",
     "FromClause",
     "SampleClause",
+    "SelectSampleClause",
     "OnConflictClause",
     "ReturningClause",
     "DeleteUsingClause",
@@ -151,6 +152,7 @@ const KEYWORD_CATEGORY_RULES: &[&str] = &[
     "ColumnNameKeyword",
     "FuncNameKeyword",
     "TypeNameKeyword",
+    "BareLabelKeyword",
 ];
 
 #[derive(Clone, Copy)]
@@ -511,7 +513,11 @@ impl<'a> Lowerer<'a> {
             ":" => {
                 let slice = matches!(
                     self.owner_rule(li),
-                    "SliceExpression" | "SliceBound" | "EndSliceBound" | "StepSliceBound"
+                    "SliceExpression"
+                        | "SliceBound"
+                        | "EndSliceBound"
+                        | "StepSliceBound"
+                        | "MinusStepSliceBound"
                 );
                 return if slice { Doc::Nil } else { Doc::text(" ") };
             }
@@ -527,7 +533,7 @@ impl<'a> Lowerer<'a> {
         }
         if r == "(" {
             // `WITH r(n) AS (...)` hugs; `INSERT INTO t (a, b)` does not.
-            let cte_columns = self.owner_rule(ri) == "InsertColumnList"
+            let cte_columns = matches!(self.owner_rule(ri), "InsertColumnList" | "ColumnAliases")
                 && self.owner[ri]
                     .and_then(|n| self.tree.parent(n))
                     .is_some_and(|p| self.rule(p) == "WithStatement");
@@ -626,8 +632,15 @@ impl<'a> Lowerer<'a> {
                     let trailing = i + 1 >= items.len();
                     if trailing {
                         let at_statement_end = self.stmt_end.get() == Some(ti);
+                        // `(42,)` is a one-element tuple and `(42)` is 42:
+                        // the only comma of a parenthesised expression is
+                        // not a trailing comma, it is what makes the tuple.
+                        let makes_tuple = self.owner_rule(ti) == "ParenthesisExpression"
+                            && items.iter().filter(|&&x| self.is_tok(x, ",")).count() == 1;
                         let comma = if at_statement_end {
                             Doc::Nil
+                        } else if makes_tuple {
+                            Doc::text(",")
                         } else {
                             Doc::if_break(Doc::text(","), Doc::Nil)
                         };
@@ -700,7 +713,7 @@ impl<'a> Lowerer<'a> {
             | "PivotUsing"
             | "DeleteUsingClause"
             | "PivotOn"
-            | "UpdateSetElementList"
+            | "UpdateSetClauseList"
             | "InsertColumnList" => self.keyword_list_clause(id),
             "WhereClause" | "HavingClause" | "QualifyClause" | "OnClause" => {
                 self.keyword_expr_clause(id)
@@ -708,7 +721,7 @@ impl<'a> Lowerer<'a> {
             "LogicalAndExpression" | "LogicalOrExpression" => self.chain(id),
             // Operator chains break only when they are chains: two or more
             // tails. A lone `a > 1` never splits across lines.
-            "OtherOperatorExpression" | "AdditiveExpression" | "MultiplicativeExpression"
+            "InfixOtherOperatorExpression" | "AdditiveExpression" | "MultiplicativeExpression"
                 if self.items(id).len() >= 3 =>
             {
                 self.chain(id)
@@ -1039,10 +1052,10 @@ impl<'a> Lowerer<'a> {
                     }
                     parts.push(Doc::concat(tparts));
                 }
-                Item::Node(n) if self.rule(n) == "UpdateSetClause" => {
+                Item::Node(n) if self.rule(n) == "UpdateSetClauseList" => {
                     parts.push(Doc::group(Doc::indent(Doc::concat(vec![
                         Doc::Line,
-                        self.generic(n),
+                        self.keyword_list_clause(n),
                     ]))));
                 }
                 _ => {

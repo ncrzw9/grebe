@@ -1,6 +1,10 @@
 # Vendored DuckDB PEG grammar — verbatim, never hand-edited
 source     = https://github.com/duckdb/duckdb
 path       = src/parser/peg/grammar
-commit     = ce512b864cc354d05c1b0ff672ecd38e586db523
-vendored   = 2026-08-29
-refresh    = just vendor-grammar <sha>   # must be followed by a green differential
+tag        = v2.0.0
+commit     = d54cbbe3df17e8e5ce68312f483b4155836112aa
+vendored   = 2026-11-17
+refresh    = copy the directory at a tag over vendor/grammar, then rebuild:
+             build.rs fails loudly where an override no longer fits. Follow
+             with a differential against the engine (examples/verdict.rs)
+             and keep it at zero statements the engine parses and we reject.

@@ -204,12 +204,12 @@ fn in_where(tree: &Tree, node: NodeId) -> bool {
 /// cannot see.
 pub fn wrapped_date_filter(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    // `a <op> b`: an OtherOperatorExpression with exactly one tail.
-    for op_expr in tree.find("OtherOperatorExpression") {
+    // `a <op> b`: a ComparisonExpression with exactly one tail.
+    for op_expr in tree.find("ComparisonExpression") {
         let [subject, tail] = tree.children(op_expr)[..] else {
             continue;
         };
-        if tree.rule_name(tail) != "OtherOperatorTail" || !in_where(tree, op_expr) {
+        if tree.rule_name(tail) != "ComparisonExpressionTail" || !in_where(tree, op_expr) {
             continue;
         }
         let [operator, other] = tree.children(tail)[..] else {
@@ -237,7 +237,7 @@ pub fn wrapped_date_filter(tree: &Tree, src: &str) -> Vec<Finding> {
         let [subject, op] = tree.children(between)[..] else {
             continue;
         };
-        if !is_rule(tree, op, &["BetweenInLikeOp"]) || !in_where(tree, between) {
+        if !is_rule(tree, op, &["InPredicate", "BetweenLikeOp"]) || !in_where(tree, between) {
             continue;
         }
         let negated = tree
@@ -247,7 +247,7 @@ pub fn wrapped_date_filter(tree: &Tree, src: &str) -> Vec<Finding> {
             .is_some_and(|w| w.eq_ignore_ascii_case("NOT"));
         let Some(kind) = tree.descendants(op).into_iter().find(|&d| {
             is_rule(tree, d, &["BetweenClause", "InClause"])
-                && tree.ancestor(d, "BetweenInLikeOp") == Some(op)
+                && tree.ancestor(d, tree.rule_name(op)) == Some(op)
         }) else {
             continue; // LIKE and friends
         };
@@ -422,7 +422,7 @@ pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
                     | "HavingClause"
                     | "QualifyClause"
                     | "WindowClause"
-                    | "SampleClause"
+                    | "SelectSampleClause"
             )
         });
         let reshapes_rows = tree
@@ -464,7 +464,9 @@ pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
 /// flagged: written on the table, it reads as what it does.
 pub fn sample_before_where(tree: &Tree, _src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    for sample in tree.find("SampleClause") {
+    // `SelectSampleClause <- UsingSample SampleEntry` is the query-level
+    // sample; `SampleClause` is `TABLESAMPLE` on one table.
+    for sample in tree.find("SelectSampleClause") {
         let has_where = tree
             .parent(sample)
             .is_some_and(|select| child(tree, select, "WhereClause").is_some());

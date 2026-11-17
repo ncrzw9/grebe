@@ -79,6 +79,25 @@ fn string_literal_value(raw: &str) -> String {
 /// and MOD015 to see through the ~25 levels of precedence-climbing
 /// expression wrappers (`LambdaArrowExpression`, `LogicalOrExpression`, ...)
 /// between an `Expression` node and whatever it actually reduces to.
+/// If `condition` reduces to one binary comparison `lhs <op> rhs` and
+/// nothing more, its left operand, `ComparisonOperator` and right operand.
+fn binary_comparison(tree: &Tree, condition: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+    let comparison = reduce_to(tree, condition, "ComparisonExpression")?;
+    let [lhs, tail] = tree.children(comparison)[..] else {
+        return None;
+    };
+    if tree.rule_name(tail) != "ComparisonExpressionTail" {
+        return None;
+    }
+    let [op, operand] = tree.children(tail)[..] else {
+        return None;
+    };
+    let [rhs] = tree.children(operand)[..] else {
+        return None;
+    };
+    (tree.rule_name(rhs) == "BetweenInLikeExpression").then_some((lhs, op, rhs))
+}
+
 fn reduce_to(tree: &Tree, mut n: NodeId, rule: &str) -> Option<NodeId> {
     loop {
         if tree.rule_name(n) == rule {
@@ -443,32 +462,14 @@ pub fn implicit_cross_join(tree: &Tree, src: &str) -> Vec<Finding> {
 /// more, no `AND`/`OR`/`IS`/`BETWEEN` wrapping it and no second chained
 /// operator — the comparison's left- and right-hand operand nodes.
 ///
-/// This grammar does *not* route a simple `a = b` through
-/// `ComparisonExpression`'s own `ComparisonExpressionTail` /
-/// `ComparisonOperator` / `OperatorEqual` production, as `grebe tree`
-/// shows. `BetweenInLikeExpression` (matched before `ComparisonExpression`'s
-/// own tail is ever tried) already consumes `= rhs` on the way down, as an
-/// `OtherOperatorExpression`'s `OtherOperatorTail` — `OtherOperator` here
-/// matches generically (`NamedOtherOperator` / `OperatorLiteral`), the same
-/// path `<`, `!=`, `<=`, etc. take. So this checks the real shape: exactly
-/// one `OtherOperatorTail` off `OtherOperatorExpression`, whose operator
-/// text is literally `=` or `==` (DuckDB's own alias, `OperatorEqual <- '='
-/// / '=='` — treated as the same equality this rule targets).
+/// `ComparisonExpression <- BetweenInLikeExpression
+/// ComparisonExpressionTail*`, `ComparisonExpressionTail <-
+/// ComparisonOperator ComparisonOperand`: exactly one tail, whose operator
+/// is `=` or `==` (DuckDB's own alias, `OperatorEqual <- '=' / '=='`), and
+/// whose operand is a plain expression rather than `NOT ...`.
 fn as_equality(tree: &Tree, condition: NodeId, src: &str) -> Option<(NodeId, NodeId)> {
-    let other_op_expr = reduce_to(tree, condition, "OtherOperatorExpression")?;
-    let children = tree.children(other_op_expr);
-    let [lhs, tail] = children[..] else {
-        return None;
-    };
-    if tree.rule_name(tail) != "OtherOperatorTail" {
-        return None;
-    }
-    let tail_children = tree.children(tail);
-    let [op, rhs] = tail_children[..] else {
-        return None;
-    };
-    let op_leaf = reduce_to(tree, op, "OperatorLiteral")?;
-    let op_text = tree.text(op_leaf, src);
+    let (lhs, op, rhs) = binary_comparison(tree, condition)?;
+    let op_text = tree.text(op, src).trim();
     if op_text != "=" && op_text != "==" {
         return None;
     }
@@ -543,7 +544,13 @@ pub fn case_to_function(tree: &Tree, src: &str) -> Vec<Finding> {
 
         let as_coalesce = || -> Option<String> {
             let is_expr = reduce_to(tree, condition, "IsExpression")?;
-            let [operand, test] = tree.children(is_expr)[..] else {
+            // `IsExpression <- IsDistinctFromExpression
+            // IsExpressionContinuation?`, the continuation being one
+            // `IsTest` and then any further tails: only the lone test.
+            let [operand, continuation] = tree.children(is_expr)[..] else {
+                return None;
+            };
+            let [test] = tree.children(continuation)[..] else {
                 return None;
             };
             if tree.rule_name(test) != "IsTest" || !is_column(operand) {
@@ -561,16 +568,7 @@ pub fn case_to_function(tree: &Tree, src: &str) -> Vec<Finding> {
             ))
         };
         let as_nullif = || -> Option<String> {
-            let op_expr = reduce_to(tree, condition, "OtherOperatorExpression")?;
-            let [left, tail] = tree.children(op_expr)[..] else {
-                return None;
-            };
-            if tree.rule_name(tail) != "OtherOperatorTail" {
-                return None;
-            }
-            let [operator, right] = tree.children(tail)[..] else {
-                return None;
-            };
+            let (left, operator, right) = binary_comparison(tree, condition)?;
             reduce_to(tree, then_expr, "NullLiteral")?;
             if norm(operator) != "=" {
                 return None;
