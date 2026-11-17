@@ -234,9 +234,9 @@ fn window_frame_contents(tree: &Tree, over: NodeId) -> Option<NodeId> {
 /// it is specifically the negation that turns a `NULL` into "reject
 /// everything".
 ///
-/// `BetweenInLikeOp <- 'NOT'? BetweenInLikeOpExpression` leaves `'NOT'` as
-/// a bare token, not a node of its own, so its presence is read off the
-/// node's own source text rather than a child.
+/// `InPredicate <- 'NOT'? InClause CastOperator*` leaves `'NOT'` as a bare
+/// token, not a node of its own, so its presence is read off the node's own
+/// source text rather than a child.
 ///
 /// No fix: grebe has no catalog, so it cannot know whether the subquery's
 /// column is actually nullable -- only that the shape is one `NULL` away
@@ -245,7 +245,7 @@ fn window_frame_contents(tree: &Tree, over: NodeId) -> Option<NodeId> {
 /// ([`excludes_nulls`]).
 pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    for op in tree.find("BetweenInLikeOp") {
+    for op in tree.find("InPredicate") {
         if !tree
             .text(op, src)
             .trim_start()
@@ -254,10 +254,7 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
         {
             continue;
         }
-        let Some(wrapper) = child(tree, op, "BetweenInLikeOpExpression") else {
-            continue;
-        };
-        let Some(in_clause) = child(tree, wrapper, "InClause") else {
+        let Some(in_clause) = child(tree, op, "InClause") else {
             continue;
         };
         let subquery = tree
@@ -553,7 +550,7 @@ fn defeated_join(tree: &Tree, operand: NodeId, targets: &[String], src: &str) ->
     // test stays out of scope -- `IS NULL` in particular is the idiom for
     // finding unmatched rows.
     if let [subject, test] = tree.children(is_expr)[..] {
-        let is_not_null = tree.rule_name(test) == "IsTest"
+        let is_not_null = tree.rule_name(test) == "IsExpressionContinuation"
             && tree
                 .text(test, src)
                 .split_whitespace()
@@ -573,23 +570,24 @@ fn defeated_join(tree: &Tree, operand: NodeId, targets: &[String], src: &str) ->
         return None;
     }
     let &comparison = tree.children(is_distinct).first()?;
-    // `ComparisonExpression <- BetweenInLikeExpression ComparisonExpressionTail*`
-    // and `BetweenInLikeExpression <- OtherOperatorExpression
-    // BetweenInLikeOp?` are themselves pass-through for an ordinary `=` /
-    // `<` / `<>` comparison: every operator `AnyOp` lists (which is all of
-    // them) is matched one level further down, inside
-    // `OtherOperatorExpression <- BitwiseExpression OtherOperatorTail*`,
-    // before either of these two gets a chance to apply their own,
-    // narrower operator rule. A real predicate is a tail at any of these
-    // three levels (plain operator, or `IN`/`LIKE`/`BETWEEN`); a bare
-    // value with none of them (just `WHERE b.flag`) is left alone.
+    // A real predicate is a tail at any of three levels:
+    // `ComparisonExpression <- BetweenInLikeExpression
+    // ComparisonExpressionTail*` (`=`, `<`, `<>`),
+    // `BetweenInLikeExpression <- OtherOperatorExpression InPredicate*
+    // BetweenLikeOp?` (`IN`/`LIKE`/`BETWEEN`), or
+    // `InfixOtherOperatorExpression <- BitwiseExpression OtherOperatorTail*`
+    // under `OtherOperatorExpression` (any other operator). A bare value
+    // with none of them (just `WHERE b.flag`) is left alone.
     let has_predicate = tree.children(comparison).len() > 1
         || tree.children(comparison).first().is_some_and(|&between| {
             tree.children(between).len() > 1
-                || tree
-                    .children(between)
-                    .first()
-                    .is_some_and(|&other_op| tree.children(other_op).len() > 1)
+                || tree.children(between).first().is_some_and(|&other_op| {
+                    tree.children(other_op).len() > 1
+                        || tree
+                            .children(other_op)
+                            .first()
+                            .is_some_and(|&infix| tree.children(infix).len() > 1)
+                })
         });
     if !has_predicate {
         return None;
@@ -656,8 +654,8 @@ const NULL_PROPAGATING: &[&str] = &[
     "BaseExpression",
     "BetweenClause",
     "BetweenInLikeExpression",
-    "BetweenInLikeOp",
-    "BetweenInLikeOpExpression",
+    "BetweenLikeOp",
+    "BetweenLikeOpExpression",
     "BitwiseExpression",
     "BitwiseExpressionTail",
     "CastExpression",
@@ -666,10 +664,12 @@ const NULL_PROPAGATING: &[&str] = &[
     "ColumnReference",
     "ComparisonExpression",
     "ComparisonExpressionTail",
+    "ComparisonOperand",
     "ExponentiationExpression",
     "ExponentiationExpressionTail",
     "Expression",
     "IsDistinctFromExpression",
+    "InfixOtherOperatorExpression",
     "IsExpression",
     "LambdaArrowExpression",
     "LogicalAndExpression",
@@ -682,6 +682,7 @@ const NULL_PROPAGATING: &[&str] = &[
     "PrefixExpression",
     "SingleExpression",
     "TableReservedColumnName",
+    "TildeExpression",
 ];
 
 /// True unless every node strictly between `node` and `boundary` is in
@@ -711,7 +712,7 @@ fn null_guarded(tree: &Tree, node: NodeId, boundary: NodeId) -> bool {
 /// prefix `NOT x IN (…)` spelling are not matched.
 pub fn not_in_null_list(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    for op in tree.find("BetweenInLikeOp") {
+    for op in tree.find("InPredicate") {
         let negated = tree
             .text(op, src)
             .split_whitespace()
@@ -727,7 +728,7 @@ pub fn not_in_null_list(tree: &Tree, src: &str) -> Vec<Finding> {
         else {
             continue;
         };
-        if tree.ancestor(list, "BetweenInLikeOp") != Some(op) {
+        if tree.ancestor(list, "InPredicate") != Some(op) {
             continue;
         }
         let has_null = tree.children(list).iter().any(|&item| {

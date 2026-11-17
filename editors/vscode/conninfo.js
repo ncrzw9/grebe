@@ -81,4 +81,18 @@ function withPassword(s, password) {
   return `${t} password='${password.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
 }
 
-module.exports = { redact, isConnection, parse, where, aliasFor, withPassword };
+/** `s` with no password in it, to keep: the keyword, the URI's user info
+ *  and the query parameter are each removed whole. A file path is returned
+ *  as it is. */
+function withoutPassword(s) {
+  if (s === null || s === undefined || !isConnection(String(s))) return s;
+  return String(s)
+    .replace(URI_PASSWORD, (m, head) => `${head.slice(0, -1)}@`)
+    .replace(/([?&])password=[^&\s'"]*&?/gi, "$1")
+    .replace(/[?&]$/, "")
+    .replace(KEYWORD_PASSWORD, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+module.exports = { redact, isConnection, parse, where, aliasFor, withPassword, withoutPassword };

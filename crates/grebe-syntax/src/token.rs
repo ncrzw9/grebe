@@ -77,12 +77,13 @@ pub struct Token {
     pub span: Span,
 }
 
-const SINGLE_BYTE: &[char] = &['(', ')', '{', '}', '[', ']', ',', '?', '$', '-', '#'];
+const SINGLE_BYTE: &[char] = &['(', ')', '{', '}', '[', ']', ',', '?', '$', '#'];
+/// The characters an operator is made of (`Tokenizer::CharacterIsOperator`
+/// in DuckDB 2.0).
 const OPRUN: &[char] = &[
-    '+', '*', '/', '<', '>', '=', '~', '!', '@', '%', '^', '&', '|', '`',
+    '+', '-', '*', '/', '%', '^', '<', '>', '=', '~', '!', '@', '&', '|',
 ];
-const CONTROL: &[char] = &['\'', '-', ';', '"', '.'];
-const SPECIAL_OPS: &[&str] = &["->>", "::", ":=", "->", "**", "//"];
+const CONTROL: &[char] = &['\'', ';', '"', '`', '.', ':'];
 const OP_SPECIALS: &[char] = &['~', '!', '@', '#', '%', '^', '&', '|', '`', '?'];
 
 fn is_word_char(c: char) -> bool {
@@ -203,12 +204,14 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             continue;
         }
 
-        // Quoted Identifier
-        if c == '"' {
+        // Quoted identifier. Double quotes are the standard delimiter;
+        // DuckDB 2.0 also takes backticks, with the same doubling rule.
+        if c == '"' || c == '`' {
+            let delim = bytes[i];
             let mut j = i + 1;
             while j < n {
-                if bytes[j] == b'"' {
-                    if j + 1 < n && bytes[j + 1] == b'"' {
+                if bytes[j] == delim {
+                    if j + 1 < n && bytes[j + 1] == delim {
                         j += 2;
                         continue;
                     }
@@ -338,24 +341,6 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             continue;
         }
 
-        // Special multi-byte operators
-        let mut special_op_matched = false;
-        for op in SPECIAL_OPS.iter() {
-            let op_bytes = op.as_bytes();
-            if i + op_bytes.len() <= n && &bytes[i..i + op_bytes.len()] == op_bytes {
-                tokens.push(Token {
-                    kind: TokenKind::Operator,
-                    span: Span::new(start as u32, (start + op_bytes.len()) as u32),
-                });
-                i += op_bytes.len();
-                special_op_matched = true;
-                break;
-            }
-        }
-        if special_op_matched {
-            continue;
-        }
-
         // Number
         if c.is_ascii_digit() || (c == '.' && i + 1 < n && (bytes[i + 1] as char).is_ascii_digit())
         {
@@ -390,99 +375,64 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             continue;
         }
 
-        // Operator runs or colons
-        if OPRUN.contains(&c) || c == ':' {
+        // Colons: `::` (cast) and `:=` (named argument) are one token each;
+        // any other `:` stands alone (slices, `$name:`-style parameters).
+        if c == ':' {
+            let len = if i + 1 < n && (bytes[i + 1] == b':' || bytes[i + 1] == b'=') {
+                2
+            } else {
+                1
+            };
+            tokens.push(Token {
+                kind: TokenKind::Operator,
+                span: Span::new(start as u32, (start + len) as u32),
+            });
+            i += len;
+            continue;
+        }
+
+        // Operator runs. As in DuckDB's tokenizer (and PostgreSQL's lexer
+        // before it), a run of operator characters is ONE token, so `->>`,
+        // `<->`, `||` and `!~~*` need no table of known operators. Two
+        // exceptions: a comment opener ends the run (`a+/* c */b`), and a run
+        // may not end in `+` or `-` unless it contains one of `OP_SPECIALS`,
+        // so `*-` and `=-` lex as the operator followed by a prefix sign.
+        if OPRUN.contains(&c) {
             let mut j = i;
-            while j < n && (OPRUN.contains(&(bytes[j] as char)) || bytes[j] == b':') {
-                // A comment opener ends the run, so `a+/* c */b` keeps its comment.
-                if j + 1 < n && &bytes[j..j + 2] == b"--" {
-                    break;
-                }
-                if j + 1 < n && &bytes[j..j + 2] == b"/*" {
+            while j < n && OPRUN.contains(&(bytes[j] as char)) {
+                if j + 1 < n && (&bytes[j..j + 2] == b"--" || &bytes[j..j + 2] == b"/*") {
                     break;
                 }
                 j += 1;
             }
-            let run_len = j - i;
-            let run_start = i;
-            let mut k = 0;
-            while k < run_len {
-                let current_idx = run_start + k;
-                let remaining_bytes = &bytes[current_idx..j];
-                let mut matched = false;
-                for op in SPECIAL_OPS.iter() {
-                    let op_bytes = op.as_bytes();
-                    if remaining_bytes.starts_with(op_bytes) {
-                        tokens.push(Token {
-                            kind: TokenKind::Operator,
-                            span: Span::new(
-                                current_idx as u32,
-                                (current_idx + op_bytes.len()) as u32,
-                            ),
-                        });
-                        k += op_bytes.len();
-                        matched = true;
-                        break;
-                    }
+            let mut end = j;
+            if !bytes[i..j]
+                .iter()
+                .any(|&b| OP_SPECIALS.contains(&(b as char)))
+            {
+                while end > i + 1 && (bytes[end - 1] == b'+' || bytes[end - 1] == b'-') {
+                    end -= 1;
                 }
-                if matched {
-                    continue;
-                }
-                if bytes[current_idx] == b':' {
-                    tokens.push(Token {
-                        kind: TokenKind::Operator,
-                        span: Span::new(current_idx as u32, (current_idx + 1) as u32),
-                    });
-                    k += 1;
-                    continue;
-                }
-                let mut m = k;
-                while m < run_len
-                    && OPRUN.contains(&(bytes[run_start + m] as char))
-                    && bytes[run_start + m] != b':'
-                {
-                    let sub_rem = &bytes[(run_start + m)..j];
-                    if SPECIAL_OPS
-                        .iter()
-                        .any(|op| sub_rem.starts_with(op.as_bytes()))
-                    {
-                        break;
-                    }
-                    m += 1;
-                }
-                // The PostgreSQL rule: a multi-byte operator may not end in
-                // `+` unless it contains one of `OP_SPECIALS`, so `*+` lexes
-                // as `*` then `+` (a prefix plus on the next operand).
-                let mut piece_len = m - k;
-                while piece_len > 1 && bytes[run_start + k + piece_len - 1] == b'+' {
-                    let piece_str =
-                        std::str::from_utf8(&bytes[run_start + k..run_start + k + piece_len])
-                            .unwrap();
-                    if !piece_str.chars().any(|ch| OP_SPECIALS.contains(&ch)) {
-                        piece_len -= 1;
-                    } else {
-                        break;
-                    }
-                }
+            }
+            tokens.push(Token {
+                kind: TokenKind::Operator,
+                span: Span::new(i as u32, end as u32),
+            });
+            for extra in end..j {
                 tokens.push(Token {
                     kind: TokenKind::Operator,
-                    span: Span::new((run_start + k) as u32, (run_start + k + piece_len) as u32),
+                    span: Span::new(extra as u32, (extra + 1) as u32),
                 });
-                for extra in (k + piece_len)..m {
-                    tokens.push(Token {
-                        kind: TokenKind::Operator,
-                        span: Span::new((run_start + extra) as u32, (run_start + extra + 1) as u32),
-                    });
-                }
-                k = m;
             }
             i = j;
             continue;
         }
 
         // Bare word
+        // `$` is identifier material after the first character (`a$b`), as
+        // in PostgreSQL; at the start it is a parameter or a dollar quote.
         let mut j = i;
-        while j < n && is_word_char(bytes[j] as char) {
+        while j < n && (is_word_char(bytes[j] as char) || (j > i && bytes[j] == b'$')) {
             j += 1;
         }
         if j == i {
@@ -573,4 +523,68 @@ pub fn split_statements(src: &str) -> Vec<crate::Span> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The code tokens of `src`, as text.
+    fn code(src: &str) -> Vec<&str> {
+        tokenize(src)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia())
+            .map(|t| &src[t.span.start as usize..t.span.end as usize])
+            .collect()
+    }
+
+    #[test]
+    fn a_run_of_operator_characters_is_one_token() {
+        assert_eq!(code("a <-> b"), ["a", "<->", "b"]);
+        assert_eq!(code("j->>'k'"), ["j", "->>", "'k'"]);
+        assert_eq!(code("a!~~*b"), ["a", "!~~*", "b"]);
+        assert_eq!(code("a||b"), ["a", "||", "b"]);
+        assert_eq!(code("x <@ y"), ["x", "<@", "y"]);
+    }
+
+    #[test]
+    fn a_run_does_not_end_in_a_sign_unless_it_has_a_special_character() {
+        // PostgreSQL's rule, which DuckDB keeps: `=-` is `=` and a prefix `-`.
+        assert_eq!(code("a=-1"), ["a", "=", "-", "1"]);
+        assert_eq!(code("a*-b"), ["a", "*", "-", "b"]);
+        assert_eq!(code("a**-b"), ["a", "**", "-", "b"]);
+        assert_eq!(code("a<=+b"), ["a", "<=", "+", "b"]);
+        // `|` is one of the special characters, so the sign stays in the run.
+        assert_eq!(code("a||-b"), ["a", "||-", "b"]);
+        assert_eq!(code("a - -b"), ["a", "-", "-", "b"]);
+    }
+
+    #[test]
+    fn a_comment_opener_ends_an_operator_run() {
+        assert_eq!(code("a+--c\nb"), ["a", "+", "b"]);
+        assert_eq!(code("8//**/2"), ["8", "/", "2"]);
+    }
+
+    #[test]
+    fn colons_are_their_own_tokens() {
+        assert_eq!(code("x::INT"), ["x", "::", "INT"]);
+        assert_eq!(code("f(a := 1)"), ["f", "(", "a", ":=", "1", ")"]);
+        assert_eq!(code("l[1:-1]"), ["l", "[", "1", ":", "-", "1", "]"]);
+    }
+
+    #[test]
+    fn backticks_quote_an_identifier() {
+        let toks = tokenize("`a``b` `x");
+        assert_eq!(toks[0].kind, TokenKind::QuotedIdent);
+        assert_eq!(toks[0].span, Span::new(0, 6));
+        // Unclosed: runs to the end of the input and matches nothing.
+        assert_eq!(toks.last().unwrap().kind, TokenKind::Unlexed);
+    }
+
+    #[test]
+    fn a_dollar_continues_a_word_but_does_not_start_one() {
+        assert_eq!(code("a$b a$1"), ["a$b", "a$1"]);
+        assert_eq!(code("$1"), ["$", "1"]);
+        assert_eq!(code("$$x$$"), ["$$x$$"]);
+    }
 }

@@ -65,6 +65,18 @@ const CANCEL_GRACE_MS = 3000;
 // Every session not yet ended, so they can all be ended together.
 const live = new Set();
 
+/**
+ * The environment the CLI runs in. DuckDB 2.0 switches to an "agent mode"
+ * (markdown tables, a start-up line on stderr, capped output) when it sees
+ * an AI coding agent's variable -- CLAUDECODE, AI_AGENT and the like -- and
+ * stdout is not a terminal. An editor started from such a terminal passes
+ * those on, and here stdout is always a pipe; DUCKDB_AGENT_MODE=0 keeps the
+ * CLI answering as it does for a person. 1.5 ignores the variable.
+ */
+function cliEnv(extra = {}) {
+  return { ...process.env, DUCKDB_AGENT_MODE: "0", ...extra };
+}
+
 /** Terminal colour codes removed: the CLI colours its "Loading resources
  *  from ~/.duckdbrc" line even when writing to a pipe. */
 function plain(text) {
@@ -92,7 +104,7 @@ function spawnMessage(cli, e) {
  */
 function checkCli(cli) {
   return new Promise((resolve) => {
-    execFile(cli, ["--version"], { timeout: 10000 }, (err, stdout, stderr) => {
+    execFile(cli, ["--version"], { timeout: 10000, env: cliEnv() }, (err, stdout, stderr) => {
       const text = String(stdout || "").trim();
       if (err && err.code === "ENOENT") return resolve({ text: null, error: spawnMessage(cli, err), missing: true });
       if (err && err.code === "EACCES") return resolve({ text: null, error: spawnMessage(cli, err) });
@@ -174,6 +186,46 @@ function errorOf(text) {
   };
 }
 
+// How 2.0 ends a parser error: the line of the statement, and carets under
+// the place. A long line is cut to its surroundings, with `...` at the cut.
+const PROSE_PLACE = /\n\nLINE (\d+): (.*)\n( *)\^+\s*$/;
+
+/**
+ * Where a prose error points, as the byte offset into `sql` that 1.5 gives
+ * in its JSON: 2.0's parser reports "syntax error at or near ..." as text
+ * even with errors_as_json on, with the place drawn under the line.
+ * Resolves `{ position, message }` with the drawing taken off the message,
+ * or null when there is none or the line shown cannot be found in `sql`
+ * exactly once.
+ */
+function prosePlace(message, sql) {
+  const m = PROSE_PLACE.exec(message);
+  if (!m) return null;
+  const lines = sql.split("\n");
+  const line = lines[Number(m[1]) - 1];
+  if (line === undefined) return null;
+  let shown = m[2];
+  let caret = m[3].length - `LINE ${m[1]}: `.length; // into `shown`
+  if (caret < 0) return null;
+  let column;
+  if (shown === line.replace(/\s+$/, "") || shown === line) {
+    column = caret;
+  } else {
+    // Cut at one end or both: place what is left in the line.
+    let lead = 0;
+    if (shown.startsWith("... ")) lead = 4;
+    else if (shown.startsWith("...")) lead = 3;
+    let core = shown.slice(lead);
+    if (core.endsWith("...")) core = core.slice(0, -3).replace(/ $/, "");
+    const at = core === "" ? -1 : line.indexOf(core);
+    if (at < 0 || at !== line.lastIndexOf(core) || caret < lead) return null;
+    column = at + caret - lead;
+  }
+  if (column > line.length) return null;
+  const before = lines.slice(0, Number(m[1]) - 1).map((l) => `${l}\n`).join("") + line.slice(0, column);
+  return { position: Buffer.byteLength(before, "utf8"), message: message.slice(0, m.index) };
+}
+
 /** A statement as a query body: trailing whitespace and one final `;`
  *  removed. Callers wrap it on lines of its own, so a trailing `-- comment`
  *  cannot swallow the closing parenthesis. */
@@ -207,10 +259,7 @@ class Session {
     this.queue = Promise.resolve();
     this.closedWith = null;
     this.starting = false;
-  }
-
-  get key() {
-    return JSON.stringify([this.opts.cli, this.opts.database, this.opts.cwd]);
+    this.dir = opts.cwd; // the working directory now (see chdir)
   }
 
   get alive() {
@@ -224,7 +273,7 @@ class Session {
       cwd: this.opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-      env: INTERRUPTIBLE ? { ...process.env, DUCKDB_HISTORY: "/dev/null" } : process.env,
+      env: INTERRUPTIBLE ? cliEnv({ DUCKDB_HISTORY: "/dev/null" }) : cliEnv(),
     });
     this.proc = proc;
     live.add(this);
@@ -295,10 +344,23 @@ class Session {
       }
       const { out, err, cancelled } = reply;
       let result = classify(err.trim() ? `${err}\n${out}` : out);
+      // 2.0 draws where a parser error is instead of giving its offset.
+      if (result.kind === "error" && result.position === null) {
+        const place = prosePlace(result.message, trimmed);
+        if (place) {
+          result.position = place.position;
+          result.message = place.message;
+          if (result.type === "Parser" && /^syntax error/.test(place.message)) result.subtype = "SYNTAX_ERROR";
+        }
+      }
       // A cancelled query prints nothing. If it printed rows or an error
       // anyway, it finished before the interrupt reached it: that result is
       // real and is kept.
-      if (cancelled && (result.kind === "ok" || (result.kind === "error" && /interrupt/i.test(result.type)))) {
+      // 2.0 writes a result as it is produced, so a query stopped before
+      // its first row leaves the array's opening bracket (or the rows so
+      // far, cut off) behind: output that begins like rows and is not.
+      const cut = result.kind === "text" && out.trimStart().startsWith("[");
+      if (cancelled && (result.kind === "ok" || cut || (result.kind === "error" && /interrupt/i.test(result.type)))) {
         result = { kind: "cancelled", reason: cancelled };
       }
       result.ms = Number(process.hrtime.bigint() - started) / 1e6;
@@ -306,6 +368,29 @@ class Session {
     });
     this.queue = job.catch(() => {});
     return job;
+  }
+
+  /**
+   * Make `dir` the working directory, so relative paths in the SQL that
+   * follows resolve from it. The CLI's `.cd`, in line with the statements:
+   * it takes effect after whatever is running. Measured on 1.5.5 and 2.0.0:
+   * a double-quoted argument with backslash escapes carries spaces, quotes
+   * and backslashes; an unquoted or single-quoted one does not. A directory
+   * that is not there leaves the session where it was.
+   */
+  chdir(dir) {
+    if (!dir || dir === this.dir) return Promise.resolve(true);
+    const job = this.queue.then(async () => {
+      if (dir === this.dir) return true;
+      // Forward slashes work on Windows too, and need no escaping.
+      const arg = (process.platform === "win32" ? dir.replace(/\\/g, "/") : dir).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const { out, err } = await this.send(`.cd "${arg}"`);
+      if ((err + out).trim() !== "") return false;
+      this.dir = dir;
+      return true;
+    });
+    this.queue = job.catch(() => {});
+    return job.catch(() => false);
   }
 
   /** A statement is running (not start-up, not idle). */
@@ -500,4 +585,4 @@ class Session {
   }
 }
 
-module.exports = { Session, INTERRUPTIBLE, classify, checkCli, cliVersion, parseVersion, plain, queryBody };
+module.exports = { Session, INTERRUPTIBLE, cliEnv, prosePlace, classify, checkCli, cliVersion, parseVersion, plain, queryBody };

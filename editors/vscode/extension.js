@@ -17,6 +17,7 @@ const runner = require("./run");
 const inspect = require("./inspect");
 const catalog = require("./catalog");
 const dataEditor = require("./dataEditor");
+const catalogSync = require("./catalogSync");
 const { Session } = require("./duckdb-session");
 
 // A server that has not answered `initialize` by then is not going to: a
@@ -31,6 +32,8 @@ let generation = 0;
 // every (re)start; run.js awaits whichever is current.
 let ready = Promise.resolve(null);
 let settle = () => {};
+// Keeps the language server told of what the running sessions hold.
+let catalogFeed = null;
 
 exports.activate = function activate(context) {
   // Created up front, not on the client's first log line, so "grebe" is in
@@ -50,30 +53,54 @@ exports.activate = function activate(context) {
       if (e.affectsConfiguration("grebe.path")) restart(context);
     }),
   );
-  results.init(context.extensionUri);
-  results.register(context);
-  // The shared results' Cancel button stops whatever is filling them: a run,
-  // an export, a catalog preview or a file inspection.
-  results.setCancelHandler(() => {
-    if (runner.isRunning()) runner.cancel();
-    else Session.cancelAll();
+  // Each feature is set up on its own: one that throws is logged and
+  // shown, and the rest still come up. The Catalog goes first, so its view
+  // never stays empty because something set up before it failed.
+  const catalogView = setUp("the Catalog", () =>
+    catalog.activate(context, {
+      currentSession: runner.currentSession,
+      liveSession: runner.liveSession,
+      liveSessions: runner.liveSessions,
+      sessionName: runner.currentSessionName,
+      remember: async (name) => {
+        await runner.rememberAttachments(name);
+        if (catalogFeed) catalogFeed.schedule();
+      },
+      remembered: runner.rememberedAttachments,
+      forget: runner.forgetAttachment,
+      state: context.workspaceState,
+      onDidRun: runner.onDidRun,
+      settings: runner.settings,
+      cli: () => runner.settings().cli,
+    }),
+  );
+  catalogFeed = setUp("the catalog in the editor", () =>
+    catalogSync.activate(context, {
+      clientReady: () => ready,
+      liveSessions: runner.liveSessions,
+      sessionNameOf: runner.sessionNameOf,
+      onDidRun: runner.onDidRun,
+    }),
+  );
+  setUp("the results view", () => {
+    results.init(context.extensionUri);
+    results.register(context);
+    // The shared results' Cancel button stops whatever is filling them: a
+    // run, an export, a catalog preview or a file inspection.
+    results.setCancelHandler(() => {
+      if (runner.isRunning()) runner.cancel();
+      else Session.cancelAll();
+    });
   });
-  runner.activate(context, () => ready);
-  inspect.activate(context);
-  dataEditor.activate(context);
-  const catalogView = catalog.activate(context, {
-    currentSession: runner.currentSession,
-    liveSession: runner.liveSession,
-    onDidRun: runner.onDidRun,
-    settings: runner.settings,
-    cli: () => runner.settings().cli,
-  });
+  setUp("running SQL", () => runner.activate(context, () => ready));
+  setUp("data file inspection", () => inspect.activate(context));
+  setUp("the data grid editor", () => dataEditor.activate(context));
   // Trust granted: the folder's own grebe.path now applies, and DuckDB may
   // run.
   context.subscriptions.push(
     workspace.onDidGrantWorkspaceTrust(() => {
       restart(context);
-      catalogView.refresh();
+      if (catalogView) catalogView.refresh();
     }),
   );
   return start(context);
@@ -84,6 +111,18 @@ exports.deactivate = function deactivate() {
   Session.disposeAll();
   return stopClient();
 };
+
+/** Run one feature's setup; if it throws, say so and carry on. */
+function setUp(what, fn) {
+  try {
+    return fn();
+  } catch (err) {
+    const text = `could not set up ${what}: ${err.message ?? err}`;
+    logger.error("activate", text, err);
+    logger.notify(text);
+    return undefined;
+  }
+}
 
 async function restart(context) {
   await stopClient();
@@ -167,6 +206,7 @@ async function start(context) {
     log("server running");
     settle(next);
     runner.clientChanged();
+    if (catalogFeed) catalogFeed.reset();
   } catch (err) {
     if (client !== next) return;
     server?.kill();

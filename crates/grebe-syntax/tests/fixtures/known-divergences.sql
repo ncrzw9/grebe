@@ -38,3 +38,74 @@ CREATE OR REPLACE TEMPORARY TABLE t1 AS ...;
 -- change in either direction fail loudly.
 -- expect: REJECT
 SELECT FROM read_json('birds.json');
+
+-- === 3. Chained comparisons -- RESOLVED ===
+-- Direction: the grammar text ACCEPTS, both engines reject; we follow the
+-- engines and reject.
+--
+-- `ComparisonExpression <- BetweenInLikeExpression ComparisonExpressionTail*`
+-- takes any number of tails. The 2.0 transformer refuses more than one
+-- ("Chained comparisons are not supported, use AND to combine comparisons")
+-- and 1.5.5 calls it a syntax error. `apply_structural_overrides` narrows
+-- the `*` to `?`, here and for `IS DISTINCT FROM`.
+-- expect: REJECT
+SELECT 1 < 2 < 3;
+
+-- === 4. Checks the engine makes after the grammar has matched ===
+-- Direction: engine (1.5.5 and 2.0) REJECTS with a ParserException, we
+-- accept.
+-- Count: 291 of the 62,194 statements of DuckDB's own test suite at v2.0.0.
+-- Ruling: record as a fixture.
+--
+-- These are well-formed by the grammar and refused by the transformer that
+-- runs on the parse tree: contradictory sequence bounds, an option given
+-- twice, `COUNT(DISTINCT)` with no argument, a duplicate CTE name, DDL
+-- inside a CTE, a hex literal with an odd number of digits. Each is a
+-- semantic rule of one statement kind, not syntax, and reimplementing the
+-- transformer is out of scope for a parser generated from the grammar.
+-- The statement still fails when it is run, with the engine's own message.
+-- expect: PARSE
+CREATE SEQUENCE seq MINVALUE 7 MAXVALUE 5;
+-- expect: PARSE
+SELECT COUNT(DISTINCT);
+
+-- === 5. A stray backtick ===
+-- Direction: engine 1.5.5 ACCEPTS, engine 2.0 rejects; we follow 2.0.
+-- Count: 1 statement, from a test of exactly this.
+--
+-- 2.0 reads a backtick as a quoted-identifier delimiter, so an unpaired one
+-- is "unterminated quoted identifier". 1.5.5 lexes it as an operator
+-- character and so parses `SELECT `x` as a prefix operator applied to `x`.
+-- One tokenizer cannot do both; backtick identifiers are the documented
+-- feature and the prefix operator is an accident.
+-- expect: REJECT
+SELECT `x FROM (SELECT 1 x);
+
+-- === 6. Nesting depth ===
+-- Direction: engine 1.5.5 ACCEPTS, engine 2.0 rejects; we reject.
+-- Count: 1 statement, 1,100 nested parentheses (too long to keep here).
+--
+-- 2.0 has a limit of 1,000 nested expressions (`max_expression_depth`);
+-- 1.5.5 has none that this statement reaches. The matcher's own recursion
+-- limit turns it away as well.
+
+-- === 7. A bare expression as a statement ===
+-- Direction: the 2.0 `duckdb` shell ACCEPTS; the 2.0 library and 1.5.5
+-- reject; we accept.
+-- Count: none in the corpus (its verdicts are the library's).
+--
+-- Up to 1.5 the grammar had `Statement <- ... / ExpressionStatement`. 2.0
+-- took the rule out of the core grammar and has the CLI add it at start-up:
+-- `1 + 1;` and `CREATE TABLE z AS 1;` run in the 2.0.0 shell and are a
+-- Parser Error through `duckdb.extract_statements`. A SQL file is run with
+-- the shell, by hand and by the editor extension, so what the shell takes
+-- must not be a syntax error here. build.rs keeps the rule as the last
+-- alternative of `Statement`.
+-- expect: PARSE
+1 + 1 AS two, 'x';
+-- expect: PARSE
+CREATE TABLE z AS 1;
+-- What the shell still refuses stays refused: a select list is not a
+-- statement.
+-- expect: REJECT
+x FROM t;

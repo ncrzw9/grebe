@@ -10,7 +10,11 @@ not a copy bundled into the editor.
   above a statement just that one. Results land in a fast grid you can put
   anywhere.
 - **Catalog**: the tables, views and columns in your database, in any
-  `.duckdb` file you browse, and in PostgreSQL databases you attach.
+  `.duckdb` file you browse, and in PostgreSQL databases you attach. The
+  editor knows them too: it completes table and column names and marks the
+  ones the session does not have.
+- **One session for the whole window**, kept from file to file; tables
+  that can outlive a reload (`:workspace:`); attachments that come back.
 - **Data files in the grid**: open a `.parquet` file and its rows appear in
   the grid, with column types; CSV and TSV through **Open With...**.
 - **Lint as you type, quick fixes, formatting** and DuckDB-aware
@@ -45,11 +49,12 @@ does not inherit your shell's -- set its path:
 
 Two status bar items, bottom right:
 
-- **grebe 0.6.4** with a check mark: the language server is up and linting.
+- **grebe 1.0.0** with a check mark: the language server is up and linting.
   With an error icon on red, it could not start; click it for the reason.
-- **DuckDB 1.5.5 · :memory:**: the CLI SQL runs with, and the database.
-  Click it to choose `:memory:` or a database file. A warning icon means the
-  CLI could not be used; hover it for why.
+- **DuckDB 2.0.0 · :memory:**: the CLI SQL runs with, and the database.
+  Click it to choose `:memory:`, `:workspace:` or a database file. A file
+  running in a session of its own adds that session's name. A warning icon
+  means the CLI could not be used; hover it for why.
 
 Paste this into a `.sql` file to see both at work:
 
@@ -70,22 +75,66 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
 | `Cmd/Ctrl+Shift+Enter` | run the whole file |
 | **▶ Run** above a statement | run just that statement |
 | ▶ in the editor title bar | the same as the keys, with the mouse |
-| **grebe: Choose DuckDB Database** | `:memory:` or a `.duckdb` file |
+| **grebe: Choose DuckDB Database** | `:memory:`, `:workspace:` or a `.duckdb` file |
 | **grebe: Cancel Running Query** | stop the statement running now; the session carries on |
-| **grebe: Restart DuckDB Session** | start fresh |
+| **grebe: Restart DuckDB Session** | start fresh, and hand back all the memory the session held: the session of the file in front (also the ↻ on the Catalog) |
+| **grebe: Delete Workspace Database** | delete what `:workspace:` has kept |
 
 - **One session stays open**, like a terminal: `TEMP` tables, `SET` options
-  and in-memory data survive from one run to the next.
+  and in-memory data survive from one run to the next, and from one file to
+  the next: every file in the window runs in the same session, whichever
+  folder it is in. The session ends when you restart it, choose another
+  database or CLI, or close the window.
 - **Statements run one at a time** and each result shows under its own
   statement. grebe's own tokenizer splits them, so a `;` inside a string or
   a comment never splits a statement.
 - **A run stops at the first error**, marks it in the editor where DuckDB
   reported it, and shows the line with a caret under the spot in the grid.
 - **Relative paths** in SQL (`read_csv('data/orders.csv')`) resolve from
-  the workspace folder, as if you ran `duckdb` from the project root.
+  the workspace folder of the file being run, as if you ran `duckdb` from
+  the project root; for a file outside every folder, from the file's own
+  directory. With several folders open the session follows the file: no
+  restart, nothing lost.
 - **DuckDB 1.5 and 2.0** both work; point `grebe.duckdb.path` at the one
   you want. A database file written by 2.0 cannot be opened by 1.5, and if
   that is why a run fails, the error says so.
+
+## Sessions
+
+- **A session of its own for a file.** Start a file with
+
+  ```sql
+  -- grebe: session prod
+  ```
+
+  and it runs in a separate DuckDB process named `prod`: its tables, TEMP
+  tables and settings are its own, and nothing it does touches the shared
+  session. Every file with the same name shares that session. The status
+  bar and the Catalog follow the file in front; **Restart DuckDB Session**
+  restarts that one.
+- **Its database.** A named session is in memory unless the comment says
+  otherwise: `-- grebe: session prod warehouse/prod.duckdb` opens that file
+  (relative to the workspace folder), `-- grebe: session prod :workspace:`
+  keeps it with the workspace. It never opens the file the shared session
+  has open, and naming that file in the comment is an error: two DuckDB
+  processes cannot write one file.
+- **`:workspace:`: tables that outlive the window.** Set
+  `grebe.duckdb.database` to `:workspace:` (or choose it from the status
+  bar) and the session's database is a file in the editor's own storage for
+  this workspace. Tables and views are still there after a window reload,
+  an editor restart or a crash, and nothing is added to your project.
+  It needs a folder or workspace to be open; without one it is `:memory:`.
+  `TEMP` tables and `SET` options still end with the session. **grebe:
+  Delete Workspace Database** starts over. A file written by DuckDB 2.0
+  cannot be opened by 1.5: after switching back to an older CLI, delete it.
+- **Attachments come back.** Whatever a session has attached -- from the
+  Catalog or by an `ATTACH` in your SQL -- is noted when a run ends, and
+  attached again when the session next starts, in the same mode
+  (read-only or not), after a restart or in a new window. Passwords are
+  never kept: a server that needs one asks again. One that cannot be
+  brought back (a file that moved, a server that is down) stays in the
+  Catalog as *not attached*, with the reason; **Forget** drops it.
+  `grebe.duckdb.reattach: false` turns this off.
 
 ## Stopping a long query
 
@@ -123,7 +172,9 @@ panel. One run fills it:
 - a **tab for each result set** (`L2 · 37 rows`), and a **Messages** tab:
   every statement echoed with its outcome and time, and an error in full,
   with the line and a caret under the spot DuckDB reported. A run that
-  fails opens on Messages; otherwise on its newest result;
+  fails opens on Messages; otherwise on its newest result. When the tabs
+  do not fit, a list beside them names every result with its line, row
+  count and statement, one pick away;
 - the **grid**, filling the rest, with a **filter** above it: type to keep
   the rows that match, *contains* by default (or *equals*, *starts with*,
   *regex*), in all columns or one, not case-sensitive. `Cmd/Ctrl+F` jumps
@@ -171,8 +222,15 @@ The **DuckDB** icon in the activity bar opens the **Catalog**: everything
 your session holds, refreshed after every run. Like any view, it can be
 dragged to another side bar or the panel.
 
+- **Every running session** has a line of its own when files run in named
+  sessions; the one the file in front uses is the open one.
+
 - **The session line** shows how much memory DuckDB is using, of its
-  limit.
+  limit. Its **↻** (also in the Catalog's title bar) restarts the session,
+  which frees all of it without reloading the window. It asks first when
+  the session is running: an in-memory database goes with it, while a
+  database file is kept. The Catalog stays usable during a long query; the
+  memory figure catches up when DuckDB is free.
 - **Databases**: the session's own (`:memory:` or a file) first, then every
   attached one, described in a few words: `attached · warehouse.duckdb ·
   read-only`, `attached · in-memory`, or its type when it is not DuckDB
@@ -192,9 +250,29 @@ into Editor**.
 right-click a `.duckdb` or `.sqlite` file in the Explorer) attaches a file
 to the session, read-only or read-write, under a name taken from the file:
 `warehouse.duckdb` becomes `warehouse`, so `FROM warehouse.orders` works in
-your SQL. **Detach** (on an attached database) removes it. Attaching
-happens in the session, so it lasts until the session restarts, the same as
-an `ATTACH` in your own SQL.
+your SQL. **Detach** (on an attached database) removes it. An attachment is
+[attached again](#sessions) when the session restarts, the same as an
+`ATTACH` in your own SQL; detach it to stop that. The files you browse are
+kept with the workspace too.
+
+### The catalog in the editor
+
+After every run the language server is told which tables, views, columns
+and macros the session holds, so in a `.sql` file:
+
+- **Completion** offers them: tables and views after `FROM` and `JOIN`,
+  the columns of the tables in the statement, and `alias.` or `table.`
+  their columns.
+- **A table or column the session does not have** is marked (`CAT001`,
+  `CAT002`), with the nearest name when there is one. Tables a file
+  creates itself, CTEs, files (`'data.csv'`) and table functions are never
+  marked.
+
+A session with no tables yet says nothing, and a file in a named session
+is checked against that session only. `grebe.duckdb.catalogInEditor: false`
+turns it off. The same check runs from the command line with a snapshot:
+`grebe check --catalog catalog.json` (see the
+[grebe README](https://github.com/ncrzw9/grebe#catalog)).
 
 ### PostgreSQL
 
@@ -297,8 +375,13 @@ timing, and on a failure the whole statement and where DuckDB stopped),
 
 - `grebe.duckdb.path`: the `duckdb` CLI to run SQL with (default: `duckdb`
   on `PATH`). grebe never bundles or links DuckDB.
-- `grebe.duckdb.database`: `:memory:` (the default) or a database file;
-  relative paths resolve against the workspace folder.
+- `grebe.duckdb.database`: `:memory:` (the default), `:workspace:` (a
+  database kept with the workspace, see [Sessions](#sessions)) or a
+  database file; relative paths resolve against the workspace folder.
+- `grebe.duckdb.reattach`: attach again what a session had attached when
+  it starts (default on).
+- `grebe.duckdb.catalogInEditor`: give the language server the session's
+  tables and columns for completion and the `CAT` checks (default on).
 - `grebe.duckdb.maxRows`: most rows a query shows, and read from a data file
   opened in the grid (default 10,000). DuckDB stops producing rows there;
   **Count** gives the full total and Export always writes every row.
@@ -419,7 +502,7 @@ npm install
 npx @vscode/vsce package
 ```
 
-This produces `grebe-0.6.4.vsix` in this directory: the universal package,
+This produces `grebe-1.0.0.vsix` in this directory: the universal package,
 with no binary inside, so set `grebe.path` or put `grebe` on `PATH`.
 `package-targets.js` builds the per-platform packages from the release
 archives.

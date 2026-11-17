@@ -23,9 +23,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::SystemTime;
 
 use grebe_rules::Severity;
 use grebe_rules::analysis::Selection;
+use grebe_rules::catalog::Catalog;
 use grebe_rules::config::Config;
 #[cfg(test)]
 use grebe_rules::detect::Finding;
@@ -202,6 +205,11 @@ fn handle_message<W: Write>(
             let result = handle_statements(&params, state);
             respond(writer, id, result);
         }
+        Some("textDocument/completion") => {
+            let result = handle_completion(&params, state, writer);
+            respond(writer, id, result);
+        }
+        Some("grebe/catalog") => handle_catalog(&params, state, writer),
         Some("workspace/didChangeConfiguration") => {
             handle_did_change_configuration(&params, state, writer);
         }
@@ -241,6 +249,14 @@ fn exit_code(state: &State) -> i32 {
     i32::from(!state.shutdown)
 }
 
+/// A catalog file as last read: the modification time and size it had, and
+/// the catalog, or `None` if it could not be read as one.
+struct CatalogFile {
+    modified: Option<SystemTime>,
+    len: u64,
+    catalog: Option<Rc<Catalog>>,
+}
+
 /// Server-side session state: open documents and what's been negotiated.
 #[derive(Default)]
 struct State {
@@ -266,6 +282,22 @@ struct State {
     /// Forgotten when that file next loads cleanly: fixing it and breaking
     /// it again is news again.
     reported_config_errors: HashMap<PathBuf, String>,
+    /// The catalog the client last sent with `grebe/catalog` and no `uri`:
+    /// the one every document is checked and completed against, unless it
+    /// has one of its own.
+    catalog: Option<Rc<Catalog>>,
+    /// What `grebe/catalog` said about one document (a `uri`): an editor
+    /// that runs different files in different sessions sends each file its
+    /// session's catalog. `None` is "this document has no catalog" (its
+    /// session is not running): it is not checked, and does not fall back
+    /// to the shared one.
+    document_catalogs: HashMap<String, Option<Rc<Catalog>>>,
+    /// Catalog files named by a `grebe.toml` (`catalog = "..."`), as last
+    /// read, with the modification time and size they had: a client that
+    /// sends no catalog still gets the one the project configured, and a
+    /// rewritten file is picked up at the next lint without being re-read
+    /// on every keystroke.
+    catalog_files: HashMap<PathBuf, CatalogFile>,
 }
 
 fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Json {
@@ -329,6 +361,16 @@ fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W)
             // no range or on-type variant: the formatter only ever knows how
             // to lay out a complete document.
             ("documentFormattingProvider".into(), Json::Bool(true)),
+            // Names from the catalog (when one was sent or configured), the
+            // statement's own relations, keywords and functions. `.` asks
+            // for a relation's columns or a schema's tables.
+            (
+                "completionProvider".into(),
+                Json::object(vec![(
+                    "triggerCharacters".into(),
+                    Json::Array(vec![Json::str(".")]),
+                )]),
+            ),
         ]),
     )])
 }
@@ -503,6 +545,7 @@ struct Resolved {
     select: Option<Vec<String>>,
     severity: Vec<(String, Severity)>,
     foreign_heads: Vec<String>,
+    catalog: Option<Rc<Catalog>>,
 }
 
 impl Resolved {
@@ -511,8 +554,68 @@ impl Resolved {
             select: self.select.as_deref(),
             severity: &self.severity,
             foreign_heads: &self.foreign_heads,
+            catalog: self.catalog.as_deref(),
         }
     }
+}
+
+/// The catalog `uri` is checked and completed against: what was sent for
+/// that document (which may be "none"), else the one sent for every
+/// document, else the file its `grebe.toml` names. `None` when there is
+/// none, and then the CAT rules do not run.
+fn catalog_for_uri<W: Write>(
+    uri: &str,
+    config: Option<&Config>,
+    state: &mut State,
+    writer: &mut W,
+) -> Option<Rc<Catalog>> {
+    if let Some(own) = state.document_catalogs.get(uri) {
+        return own.clone();
+    }
+    if let Some(c) = &state.catalog {
+        return Some(Rc::clone(c));
+    }
+    let path = config?.catalog.as_ref()?;
+    let meta = std::fs::metadata(path).ok();
+    let stamp = (
+        meta.as_ref().and_then(|m| m.modified().ok()),
+        meta.as_ref().map_or(0, std::fs::Metadata::len),
+    );
+    if let Some(f) = state.catalog_files.get(path) {
+        if (f.modified, f.len) == stamp {
+            return f.catalog.clone();
+        }
+    }
+    let loaded = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| Catalog::from_json_text(&text));
+    let catalog = match loaded {
+        Ok(c) => Some(Rc::new(c)),
+        Err(e) => {
+            // Said once per version of the file, not once per keystroke.
+            let params = Json::object(vec![
+                ("type".into(), Json::num(2)),
+                (
+                    "message".into(),
+                    Json::str(format!(
+                        "grebe: could not read the catalog {}: {e}",
+                        path.display()
+                    )),
+                ),
+            ]);
+            notify(writer, "window/showMessage", params);
+            None
+        }
+    };
+    state.catalog_files.insert(
+        path.clone(),
+        CatalogFile {
+            modified: stamp.0,
+            len: stamp.1,
+            catalog: catalog.clone(),
+        },
+    );
+    catalog
 }
 
 /// Merge `state`'s editor-level selection with `config`'s. The editor's
@@ -521,7 +624,13 @@ impl Resolved {
 /// on the command line: it is the more specific, more recent choice.
 /// `[severity]` and `foreign-heads` have no editor-level equivalent, so they
 /// always come from the config alone.
-fn resolve_selection(state: &State, config: Option<&Config>) -> Resolved {
+fn resolve_selection<W: Write>(
+    uri: &str,
+    state: &mut State,
+    config: Option<&Config>,
+    writer: &mut W,
+) -> Resolved {
+    let catalog = catalog_for_uri(uri, config, state, writer);
     let select = state
         .select
         .clone()
@@ -532,6 +641,7 @@ fn resolve_selection(state: &State, config: Option<&Config>) -> Resolved {
         select,
         severity,
         foreign_heads,
+        catalog,
     }
 }
 
@@ -664,6 +774,7 @@ fn handle_did_close<W: Write>(params: &Json, state: &mut State, writer: &mut W) 
     };
     state.documents.remove(uri);
     state.versions.remove(uri);
+    state.document_catalogs.remove(uri);
     state.dirty.retain(|u| u != uri);
     // Publish an empty set so a closed document's squiggles don't linger.
     publish_diagnostics(writer, uri, &[], None);
@@ -736,7 +847,7 @@ fn handle_code_action<W: Write>(params: &Json, state: &mut State, writer: &mut W
     let range = Span::new(to_byte(start), to_byte(end));
 
     let config = config_for_uri(&uri, state, writer);
-    let resolved = resolve_selection(state, config.as_ref());
+    let resolved = resolve_selection(&uri, state, config.as_ref(), writer);
     let findings = grebe_rules::analysis::analyze(&text, &resolved.selection());
     Json::Array(crate::code_action::actions(
         &uri, &text, &findings, range, encoding,
@@ -760,7 +871,7 @@ fn severity_to_lsp(sev: Severity) -> f64 {
 fn publish<W: Write>(writer: &mut W, uri: &str, text: &str, state: &mut State) {
     let encoding = state.encoding;
     let config = config_for_uri(uri, state, writer);
-    let resolved = resolve_selection(state, config.as_ref());
+    let resolved = resolve_selection(uri, state, config.as_ref(), writer);
     let selection = resolved.selection();
     let findings = grebe_rules::analysis::analyze(text, &selection);
     let lines = position::LineIndex::new(text);
@@ -784,7 +895,16 @@ fn publish<W: Write>(writer: &mut W, uri: &str, text: &str, state: &mut State) {
                 ),
                 ("code".into(), Json::str(rule.code)),
                 ("source".into(), Json::str("grebe")),
-                ("message".into(), Json::str(rule.message)),
+                // A CAT finding names the table or column it is about; every
+                // other rule's message is the registry's fixed prose.
+                (
+                    "message".into(),
+                    if rule.category == grebe_rules::Category::Cat {
+                        Json::str(grebe_rules::catalog::message(f, text))
+                    } else {
+                        Json::str(rule.message)
+                    },
+                ),
             ]))
         })
         .collect();
@@ -836,6 +956,121 @@ fn handle_formatting<W: Write>(params: &Json, state: &mut State, writer: &mut W)
         ("newText".into(), Json::str(formatted)),
     ]);
     Json::Array(vec![edit])
+}
+
+/// `grebe/catalog`: the client's catalog snapshot (rows as in
+/// [`grebe_rules::catalog`]).
+///
+/// - `{ columns: [row...], functions?: [...] }`: the catalog for every
+///   document that has none of its own. `{ columns: null }` takes it away.
+///   An empty array is a catalog with nothing in it, and is taken at its
+///   word.
+/// - `{ uri, columns: [row...] }`: that document's own catalog.
+///   `{ uri, columns: null }`: that document has no catalog, and does not
+///   fall back to the shared one. `{ uri, default: true }`: it uses the
+///   shared one again.
+///
+/// Every open document the change reaches is linted again.
+fn handle_catalog<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
+    let uri = params.get("uri").and_then(Json::as_str).map(str::to_string);
+    let to_default = params.get("default") == Some(&Json::Bool(true));
+    let catalog = match params.get("columns") {
+        None | Some(Json::Null) => None,
+        Some(_) => match Catalog::from_json(params) {
+            Ok(c) => Some(Rc::new(c)),
+            Err(e) => {
+                let p = Json::object(vec![
+                    ("type".into(), Json::num(2)),
+                    (
+                        "message".into(),
+                        Json::str(format!("grebe/catalog: not a catalog snapshot: {e}")),
+                    ),
+                ]);
+                notify(writer, "window/showMessage", p);
+                return;
+            }
+        },
+    };
+    match (&uri, catalog) {
+        (Some(u), None) if to_default => {
+            state.document_catalogs.remove(u);
+        }
+        (Some(u), own) => {
+            state.document_catalogs.insert(u.clone(), own);
+        }
+        (None, shared) => state.catalog = shared,
+    }
+    let mut affected: Vec<String> = match &uri {
+        Some(u) => state
+            .documents
+            .keys()
+            .filter(|d| *d == u)
+            .cloned()
+            .collect(),
+        // A document with a catalog of its own does not see the shared one.
+        None => state
+            .documents
+            .keys()
+            .filter(|d| !state.document_catalogs.contains_key(*d))
+            .cloned()
+            .collect(),
+    };
+    affected.sort();
+    for u in affected {
+        mark_dirty(state, &u);
+    }
+}
+
+/// `textDocument/completion`: see [`crate::completion`]. A document the
+/// server has not seen answers with an empty list.
+fn handle_completion<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Json {
+    let empty = || {
+        Json::object(vec![
+            ("isIncomplete".into(), Json::Bool(false)),
+            ("items".into(), Json::Array(vec![])),
+        ])
+    };
+    let Some(uri) = params
+        .get("textDocument")
+        .and_then(|d| d.get("uri"))
+        .and_then(Json::as_str)
+        .map(str::to_string)
+    else {
+        return empty();
+    };
+    let Some(text) = state.documents.get(&uri).cloned() else {
+        return empty();
+    };
+    let num = |v: Option<&Json>| v.and_then(Json::as_f64).unwrap_or(0.0) as u32;
+    let p = params.get("position");
+    let offset = position::position_to_byte(
+        &text,
+        num(p.and_then(|p| p.get("line"))),
+        num(p.and_then(|p| p.get("character"))),
+        state.encoding,
+    );
+    // The config is only needed for a catalog file it may name, and only
+    // when the client has not sent a catalog itself.
+    let config = if state.document_catalogs.contains_key(&uri) || state.catalog.is_some() {
+        None
+    } else {
+        config_for_uri(&uri, state, writer)
+    };
+    let catalog = catalog_for_uri(&uri, config.as_ref(), state, writer);
+    let found = crate::completion::complete(&text, offset, catalog.as_deref());
+    Json::object(vec![
+        ("isIncomplete".into(), Json::Bool(found.incomplete)),
+        (
+            "items".into(),
+            Json::Array(
+                found
+                    .items
+                    .iter()
+                    .map(crate::completion::Item::to_json)
+                    .collect(),
+            ),
+        ),
+    ])
 }
 
 /// `grebe/statements`: the statements a run should execute, as

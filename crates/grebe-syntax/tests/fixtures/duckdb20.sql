@@ -1,10 +1,12 @@
 -- DuckDB 2.0 feature samples, transcribed verbatim from the release
 -- highlights post: https://duckdb.org/2026/08/17/duckdb-20-highlights
 --
--- These matter because the vendored grammar IS a 2.0 grammar (ce512b8) while
--- the dogfood corpus (TPC-H/TPC-DS queries and examples mined from DuckDB's
--- 1.x-era documentation) exercises no 2.0-only syntax. Every statement here
--- should parse, except the three marked `-- expect: REJECT`.
+-- These matter because the vendored grammar is the v2.0.0 grammar (d54cbbe)
+-- while the dogfood corpus (TPC-H/TPC-DS queries and examples mined from
+-- DuckDB's 1.x-era documentation) exercises no 2.0-only syntax. Every
+-- statement here should parse, except those marked `-- expect: REJECT`.
+-- Every verdict in this file, either way, was checked against the v2.0.0
+-- engine's own parser.
 --
 -- server: quack_serve
 CALL quack_serve(token = 'my_token');
@@ -84,11 +86,10 @@ SELECT add_numbers(40);
 SELECT add_numbers(b := 2, a := 40);
 SELECT add_numbers(40, NULL);
 -- custom extension repositories
--- NOT YET SHIPPED: the blog announces these, but engine v1.6.0-dev12831
--- rejects all three with ParserException and the vendored grammar has no
--- REPOSITORY production at all. We agree with the engine by rejecting them.
--- Re-check at 2.0 GA; if the engine starts accepting, this is an
--- engine-only accept, which the differential gate forbids.
+-- The spelling the highlights post announced is not the one that shipped:
+-- v2.0.0 rejects these three with ParserException, and so do we. The
+-- syntax that did ship (`WITH PREFIX ... USING PUBLIC KEY`, `LOAD x FROM
+-- repo`) is in the next section.
 SET allow_extension_repositories = 'allowed';
 -- expect: REJECT
 CREATE EXTENSION REPOSITORY my_repo FROM 'https://extensions.example.org';
@@ -98,3 +99,97 @@ LOAD my_repo/my_ext;
 -- expect: REJECT
 CREATE EXTENSION REPOSITORY my_repo FROM 's3://my-bucket/extensions'
     USING PUBLIC KEY '-----BEGIN PUBLIC KEY----- ...';
+
+
+-- ---------------------------------------------------------------------------
+-- DuckDB 2.0 GA. Statements from DuckDB's own test suite at tag v2.0.0 that
+-- the pre-release snapshot of the grammar could not parse. Each was run
+-- through the v2.0.0 engine's parser.
+-- ---------------------------------------------------------------------------
+-- extension repositories, as shipped
+CREATE EXTENSION REPOSITORY acme WITH PREFIX 'http://foo.com' USING PUBLIC KEY 'not a key';
+LOAD some_extension FROM acme;
+DROP EXTENSION REPOSITORY acme;
+-- external resources
+ATTACH TO NEW TEMPORARY EXTERNAL RESOURCE 'quack@local' AS qk;
+ATTACH TO NEW TEMPORARY EXTERNAL RESOURCE 'quack@local' (INSTANCE 'r7i.16xlarge', REGION 'eu-west-1', SPOT, ANYTHING 'else') AS qk2;
+ATTACH TO EXTERNAL RESOURCE shared_res AS qk3;
+CONNECT TO NEW TEMPORARY EXTERNAL RESOURCE 'quack@local';
+-- nested schemas: more than catalog.schema.table
+CREATE SCHEMA s1.s2.s3.s4;
+CREATE TABLE s1.s2.s3.tbl(i INTEGER, s STRUCT(a INTEGER));
+SELECT memory.s1.s2.s3.tbl.s.a FROM s1.s2.s3.tbl;
+UPDATE memory.s1.s2.s3.tbl SET i = i + 1;
+CREATE MACRO s1.s2.s3.dbl(a) AS a * 2;
+SELECT s1.s2.s3.dbl(21), memory.s1.s2.s3.dbl(10);
+CREATE TYPE s1.s2.s3.mood AS ENUM ('happy');
+select cast(1 as memory.main.bla.text);
+-- schema options
+ALTER SCHEMA s1 SET (foo='baz', buzz='wizz');
+ALTER SCHEMA s1 RESET (foo, buzz);
+CREATE OR REPLACE SCHEMA s1 WITH (location='s3://bucket/folder');
+-- backtick-quoted identifiers
+SELECT `t`.`a col`, `t`.`b col` FROM `my table` AS `t` ORDER BY ALL;
+SELECT "a`b" FROM (SELECT 1 AS `a``b`);
+SELECT `from`.`select` FROM (SELECT 5 AS `select`) `from`;
+UPDATE `my table` SET `b col` = 'ONE' WHERE `a col` = 1;
+-- operators are any run of operator characters
+SELECT [1.0, 2.0] <-> [2.0, 4.0];
+SELECT ([0.0, 0.0] <-> [3.0, 4.0]) + 1;
+SELECT @ -5 + -6;
+SELECT 8//**/2;
+SELECT 2 = SOME(SELECT 1 UNION ALL SELECT 2);
+-- IS, IN and NOT in the comparison chain
+SELECT 10 IS NOT NULL::VARCHAR;
+SELECT 1 NOT IN (1, 2)::INT, 1 IN (1)::INT::VARCHAR::INT;
+SELECT 3 IN (1, 2) IN (FALSE);
+SELECT false < NOT true IS NULL = true;
+SELECT NULL ISNULL = TRUE;
+SELECT 5 NOT BETWEEN ASYMMETRIC 1 AND 10;
+-- FETCH FIRST, with and without a count, and before OFFSET
+SELECT * FROM range(10) FETCH FIRST 3 ROWS ONLY;
+SELECT * FROM range(10) FETCH FIRST ROW ONLY;
+SELECT * FROM range(10) FETCH NEXT 2 ROWS ONLY OFFSET 1;
+-- UNNEST in GROUP BY
+SELECT unnest(l) AS x, count(*) FROM (SELECT [1, 2, 2] AS l) GROUP BY unnest(l);
+-- aliases and samples on more table expressions
+SELECT v.col0 FROM v: VALUES (42) ORDER BY v.col0;
+SELECT t.a FROM t: (SELECT 42 AS a) ORDER BY t.a;
+SELECT count(*) FROM (SELECT * FROM range(100)) TABLESAMPLE 10 ROWS;
+-- the rest
+ALTER TABLE t ALTER COLUMN id TYPE VARCHAR COLLATE nocase USING 'x' || id::VARCHAR;
+UPDATE t1 SET (a, b) = (1, 2), a = 3;
+INSERT INTO strings OVERRIDING SYSTEM VALUE VALUES (1);
+CREATE INDEX i1 ON t1(foo) WITH (deferrable);
+CREATE TYPE enum_list AS ENUM ('sad', 'ok', 'happy')[];
+TRUNCATE a AS ignored_alias RESTRICT;
+DROP MACRO TABLE db2.s2.tm;
+PIVOT Cities ON Year USING SUM(Population) GROUP BY (Country);
+COPY copy_file_name_compressed FROM copy_file_name_auto.csv.gz;
+SELECT 1 a$c;
+SELECT DATE '2020-'
+'01-01'::VARCHAR;
+-- A select-list alias without AS must be a bare-label word: these keywords
+-- are unreserved, and still not aliases.
+SELECT a AS month, b AS filter, a "over" FROM t ORDER BY a;
+-- expect: REJECT
+SELECT count(*) filter FROM t;
+-- expect: REJECT
+SELECT DATE '2020-01-01' + 1 month;
+-- expect: REJECT
+SELECT * exclude FROM t;
+-- What the lexer and the literal matchers refuse.
+-- expect: REJECT
+SELECT 1.2.3;
+-- expect: REJECT
+SELECT 1..2;
+-- expect: REJECT
+SELECT "";
+-- expect: REJECT
+CREATE TABLE s1.""(i INTEGER);
+-- expect: REJECT
+SELECT 'one' /* comment
+*/ 'two';
+-- expect: REJECT
+SELECT $tag$a$tag$
+'b';

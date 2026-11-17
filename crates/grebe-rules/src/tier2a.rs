@@ -68,19 +68,17 @@ fn reduces_to(tree: &Tree, id: NodeId, rule: &str) -> bool {
 /// production itself, but it is kept explicit so the restriction does not
 /// depend on that shape.
 ///
-/// The vendored grammar routes `=`/`==`/`!=`/`<>` (and other DuckDB "other
-/// operators") through `OtherOperatorExpression <- BitwiseExpression
-/// OtherOperatorTail*`, `OtherOperatorTail <- OtherOperator
-/// BitwiseExpression` — a flat sequence, not a `ComparisonExpression` node
-/// (that node exists but only wraps the whole chain; the operator and its
-/// operands live one level down, in the tail).
-/// For a tail at position *i*, its left operand is whatever came right
-/// before it in that flat sequence: the parent's own leading
-/// `BitwiseExpression` when *i* is the first tail, else the previous tail's
-/// own right-hand `BitwiseExpression`.
+/// The grammar routes `=`/`==`/`!=`/`<>` through `ComparisonExpression <-
+/// BetweenInLikeExpression ComparisonExpressionTail*`,
+/// `ComparisonExpressionTail <- ComparisonOperator ComparisonOperand` — a
+/// flat sequence. For a tail at position *i*, its left operand is whatever
+/// came right before it in that sequence: the parent's own leading
+/// `BetweenInLikeExpression` when *i* is the first tail, else the previous
+/// tail's own right-hand operand. (Up to the 1.x grammar snapshot these
+/// operators matched one level further down, as an `OtherOperatorTail`.)
 pub fn null_comparison(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    for tail in tree.find("OtherOperatorTail") {
+    for tail in tree.find("ComparisonExpressionTail") {
         let in_condition_clause = tree.ancestor(tail, "WhereClause").is_some()
             || tree.ancestor(tail, "HavingClause").is_some()
             || tree.ancestor(tail, "QualifyClause").is_some();
@@ -90,10 +88,10 @@ pub fn null_comparison(tree: &Tree, src: &str) -> Vec<Finding> {
         let Some(parent) = tree.parent(tail) else {
             continue;
         };
-        if tree.rule_name(parent) != "OtherOperatorExpression" {
+        if tree.rule_name(parent) != "ComparisonExpression" {
             continue;
         }
-        let Some(op_node) = child(tree, tail, "OtherOperator") else {
+        let Some(op_node) = child(tree, tail, "ComparisonOperator") else {
             continue;
         };
         let is_not = match text(tree, op_node, src) {
@@ -101,7 +99,13 @@ pub fn null_comparison(tree: &Tree, src: &str) -> Vec<Finding> {
             "!=" | "<>" => true,
             _ => continue,
         };
-        let Some(right) = child(tree, tail, "BitwiseExpression") else {
+        // `ComparisonOperand <- NotComparisonOperand / BetweenInLikeExpression`:
+        // `x = NOT y` is not a comparison with NULL.
+        let operand_of = |tail: NodeId| {
+            child(tree, tail, "ComparisonOperand")
+                .and_then(|o| child(tree, o, "BetweenInLikeExpression"))
+        };
+        let Some(right) = operand_of(tail) else {
             continue;
         };
 
@@ -113,10 +117,10 @@ pub fn null_comparison(tree: &Tree, src: &str) -> Vec<Finding> {
             continue; // malformed: a tail is never the parent's first child
         }
         let prev = siblings[idx - 1];
-        let left = if tree.rule_name(prev) == "BitwiseExpression" {
+        let left = if tree.rule_name(prev) == "BetweenInLikeExpression" {
             prev
         } else {
-            let Some(l) = child(tree, prev, "BitwiseExpression") else {
+            let Some(l) = operand_of(prev) else {
                 continue;
             };
             l

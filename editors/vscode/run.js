@@ -6,13 +6,21 @@
 
 const path = require("path");
 const vscode = require("vscode");
-const { Session, checkCli, parseVersion, queryBody } = require("./duckdb-session");
+const fs = require("fs");
+const { checkCli, parseVersion, queryBody } = require("./duckdb-session");
+const { Sessions, directive, databaseFor, resolveDatabase, DEFAULT, MEMORY, WORKSPACE } = require("./sessions");
+const conninfo = require("./conninfo");
 const { columnar } = require("./lenient-json");
 const results = require("./results");
 const log = require("./log");
 const trust = require("./trust");
 
-let session = null;
+// Every DuckDB session of this window (see sessions.js), and the name of
+// the one the status bar and the Catalog show: the session of the file
+// last run or last brought to the front.
+let manager = null;
+let currentName = DEFAULT;
+let storageDir = null;
 let status = null;
 let runtimeErrors = null;
 let output = null;
@@ -60,7 +68,6 @@ async function exportResult(id, format) {
     r = await sess.exportTo(item.sql, target.fsPath, format);
   } catch (e) {
     r = e && e.cancelled ? cancelledResult(e) : { kind: "error", type: "Session", message: String(e.message ?? e) };
-    if (e && e.ended) session = null;
   } finally {
     endActivity();
   }
@@ -87,7 +94,8 @@ function settings() {
   const cfg = vscode.workspace.getConfiguration("grebe.duckdb");
   return {
     cli: cfg.get("path", "") || "duckdb",
-    database: cfg.get("database", "") || ":memory:",
+    database: cfg.get("database", "") || MEMORY,
+    reattach: cfg.get("reattach", true) !== false,
     maxRows: Math.max(1, cfg.get("maxRows", 10000)),
     timeoutMs: Math.max(0, cfg.get("queryTimeout", 0)) * 1000,
   };
@@ -138,16 +146,51 @@ function cancelledResult(e, ms) {
 }
 
 /** The directory relative paths in SQL resolve against: the file's
- *  workspace folder, like running `duckdb` from the project root. */
+ *  workspace folder, like running `duckdb` from the project root; the
+ *  file's own folder when it is outside every workspace folder. Null for a
+ *  document that is not a file (an untitled one): the session stays where
+ *  it is. */
 function cwdFor(uri) {
   const folder = vscode.workspace.getWorkspaceFolder(uri);
   if (folder) return folder.uri.fsPath;
-  return uri.scheme === "file" ? path.dirname(uri.fsPath) : process.cwd();
+  return uri.scheme === "file" ? path.dirname(uri.fsPath) : null;
 }
 
-function resolveDatabase(database, cwd) {
-  if (database === ":memory:" || path.isAbsolute(database)) return database;
-  return path.join(cwd, database);
+/** Where a session starts when no file says: the first workspace folder. */
+function homeDir() {
+  const folder = (vscode.workspace.workspaceFolders || [])[0];
+  return folder ? folder.uri.fsPath : process.cwd();
+}
+
+/** The text of `uri` if it is open, to read its session comment. */
+function textOf(uri) {
+  const key = uri.toString();
+  const doc = (vscode.workspace.textDocuments || []).find((d) => d.uri.toString() === key);
+  return doc ? doc.getText() : undefined;
+}
+
+/** Which session a file runs in, and what that session is:
+ *  `{ name, cli, database, cwd }`. `text` is the file's text (its leading
+ *  comment may name a session); without it the file uses the shared one. */
+function specFor(uri, text) {
+  const s = settings();
+  const cwd = cwdFor(uri);
+  const asked = text === undefined ? null : directive(text);
+  const name = asked ? asked.name : DEFAULT;
+  const database = resolveDatabase(databaseFor(name, s.database, asked && asked.database), {
+    cwd: cwd || homeDir(),
+    name,
+    storageDir,
+  });
+  // Two DuckDB processes cannot both write one file: a named session may
+  // not name the database the shared session is for.
+  if (name !== DEFAULT && database !== MEMORY) {
+    const shared = resolveDatabase(s.database, { cwd: cwd || homeDir(), storageDir });
+    if (shared !== MEMORY && path.resolve(shared) === path.resolve(database)) {
+      throw new Error(`the session "${name}" names ${database}, the database the shared session uses. Give it a database of its own, or none for an in-memory one.`);
+    }
+  }
+  return { name, cli: s.cli, database, cwd: cwd || (manager.live(name) ? null : homeDir()) };
 }
 
 /**
@@ -161,44 +204,55 @@ function reportError(message) {
   });
 }
 
-/** The session ended on its own (crashed, killed, out of memory): say so
+/** A session ended on its own (crashed, killed, out of memory): say so
  *  now, not at the next run. */
-function sessionEnded(which, reason) {
-  if (session !== which) return;
-  session = null;
-  output.appendLine(`session ended: ${reason}`);
+function sessionEnded(name, reason) {
+  const which = name === DEFAULT ? "the DuckDB session" : `the DuckDB session "${name}"`;
+  output.appendLine(`${name === DEFAULT ? "session" : `session ${name}`} ended: ${reason}`);
+  const s = settings();
+  const kept = s.database === WORKSPACE ? " Tables in the workspace database are kept." : "";
   Promise.resolve(
     vscode.window.showWarningMessage(
-      `grebe: the DuckDB session ended: ${reason.replace(/[.!]?$/, ".")} The next run starts a new session; TEMP tables and in-memory data are gone.`,
+      `grebe: ${which} ended: ${reason.replace(/[.!]?$/, ".")} The next run starts a new session; TEMP tables and in-memory data are gone.${kept}`,
       "Show Output",
     ),
   ).then((pick) => pick && output.show(true));
   for (const l of runListeners) l();
 }
 
-async function sessionFor(uri) {
-  const s = settings();
-  const cwd = cwdFor(uri);
-  const wanted = new Session({
-    cli: s.cli,
-    database: resolveDatabase(s.database, cwd),
-    cwd,
-    // What DuckDB says outside a statement (the rc file, warnings) goes to
-    // the log as it arrives.
-    onStderr: (text) => output.append(text),
-    onExit: (reason) => sessionEnded(wanted, reason),
+/** The session a run of `uri` uses, started if need be, with the file's
+ *  folder as its working directory. One session serves every file in the
+ *  window, so in-memory tables, TEMP tables, SET options and ATTACHed
+ *  databases carry from one file to the next; a file whose leading comment
+ *  says `-- grebe: session NAME` has a session of that name instead. */
+async function sessionFor(uri, text = textOf(uri)) {
+  const spec = specFor(uri, text);
+  const sess = await manager.open(spec);
+  setCurrent(spec.name);
+  return sess;
+}
+
+/** Make `name` the session the status bar and the Catalog show. */
+function setCurrent(name) {
+  if (name === currentName) return;
+  currentName = name;
+  refreshStatus();
+  for (const l of runListeners) l();
+}
+
+/** An attachment that did not come back with its session. */
+function reattachFailed(name, rec, error) {
+  const where = conninfo.where(rec.path);
+  Promise.resolve(
+    vscode.window.showWarningMessage(
+      `grebe: could not re-attach ${rec.alias} (${where}) to the session: ${conninfo.redact(error)}`,
+      "Forget It",
+      "Show Output",
+    ),
+  ).then((pick) => {
+    if (pick === "Forget It") manager.forget(name, rec.alias);
+    else if (pick === "Show Output") output.show(true);
   });
-  if (session && session.alive && session.key === wanted.key) return session;
-  if (session) session.dispose();
-  session = wanted;
-  output.appendLine(`starting ${s.cli} ${wanted.opts.database} (cwd ${cwd})`);
-  try {
-    await session.start();
-  } catch (e) {
-    session = null;
-    throw e;
-  }
-  return session;
 }
 
 /**
@@ -214,10 +268,11 @@ async function refreshStatus({ recheck = false } = {}) {
     versionFor = { cli: s.cli, ...(await checkCli(s.cli)) };
   }
   const v = parseVersion(versionFor.text);
-  const db = s.database === ":memory:" ? ":memory:" : path.basename(s.database);
-  status.text = v ? `$(database) DuckDB ${v.join(".")} · ${db}` : `$(warning) DuckDB`;
+  const db = s.database === MEMORY || s.database === WORKSPACE ? s.database : path.basename(s.database);
+  const named = currentName === DEFAULT ? "" : ` · ${currentName}`;
+  status.text = v ? `$(database) DuckDB ${v.join(".")} · ${db}${named}` : `$(warning) DuckDB`;
   status.tooltip = v
-    ? `${versionFor.text}\nDatabase: ${s.database}\nClick to choose a database.`
+    ? `${versionFor.text}\nDatabase: ${s.database}${named ? `\nSession: ${currentName}` : ""}\nClick to choose a database.`
     : `${versionFor.error} Set grebe.duckdb.path.`;
   status.show();
   if (v) {
@@ -244,7 +299,7 @@ function explicitPath() {
  *  new session now, so a bad path, a broken ~/.duckdbrc or a database this
  *  CLI cannot open is reported when it is chosen, not at the next run. */
 async function applySettings() {
-  restart();
+  manager.end();
   if (!(await refreshStatus({ recheck: true }))) return;
   if (!trust.trusted()) return;
   const folder = (vscode.workspace.workspaceFolders || [])[0];
@@ -320,7 +375,7 @@ async function run(client, { doc, range }) {
 
   let sess;
   try {
-    sess = await sessionFor(doc.uri);
+    sess = await sessionFor(doc.uri, doc.getText());
   } catch (e) {
     const msg = startHint(String(e.message ?? e));
     results.end(`Could not start duckdb: ${msg}`);
@@ -363,7 +418,6 @@ async function run(client, { doc, range }) {
         ? cancelledResult(e, Date.now() - t0)
         : { kind: "error", type: "Session", subtype: null, message: String(e.message ?? e), position: null };
       // The session is gone either way; the next run starts a new one.
-      if (e && e.ended && session === sess) session = null;
     }
     ran++;
     if (r.kind === "rows") {
@@ -419,6 +473,7 @@ async function run(client, { doc, range }) {
         : `${ran} statement${ran === 1 ? "" : "s"} succeeded.`,
   );
   // A run may have created, dropped or attached something.
+  await manager.remember(sess.name);
   for (const l of runListeners) l();
 }
 
@@ -512,13 +567,18 @@ function markError(doc, range, text, r) {
 async function chooseDatabase() {
   const pick = await vscode.window.showQuickPick(
     [
-      { label: ":memory:", description: "a fresh in-memory database for this session" },
+      { label: MEMORY, description: "in memory: gone when the session ends" },
+      {
+        label: WORKSPACE,
+        description: "kept for this workspace: tables survive a reload or a restart",
+        detail: storageDir ? undefined : "Needs a folder or workspace to be open.",
+      },
       { label: "$(folder-opened) Choose a file…", file: true },
     ],
     { placeHolder: "Database for running SQL" },
   );
   if (!pick) return;
-  let value = ":memory:";
+  let value = pick.label === WORKSPACE ? WORKSPACE : MEMORY;
   if (pick.file) {
     const picked = await vscode.window.showOpenDialog({
       canSelectMany: false,
@@ -540,25 +600,89 @@ function onDidRun(listener) {
   return { dispose: () => runListeners.delete(listener) };
 }
 
-/** The session the explorer should read: the running one if there is one,
- *  else one started for the workspace (or the active file's folder). */
+/** The session the explorer should read: the current one if it is
+ *  running, else one started for the active file (or the workspace). */
 async function currentSession() {
-  if (session && session.alive) return session;
+  const live = manager.live(currentName);
+  if (live) return live;
   if (!trust.trusted()) throw new Error("this folder is open in Restricted Mode; trust it to start DuckDB");
   const folder = (vscode.workspace.workspaceFolders || [])[0];
-  const active = vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri;
-  const uri = active && active.scheme === "file" ? active : folder ? folder.uri : null;
-  if (!uri) throw new Error("open a folder or a .sql file first");
-  return sessionFor(uri);
+  const editor = vscode.window.activeTextEditor;
+  const doc = editor && editor.document.uri.scheme === "file" ? editor.document : null;
+  if (doc) return sessionFor(doc.uri, doc.languageId === "sql" ? doc.getText() : undefined);
+  if (!folder) throw new Error("open a folder or a .sql file first");
+  return sessionFor(folder.uri, undefined);
 }
 
-/** The session only if it is already running -- never starts one. */
-const liveSession = () => (session && session.alive ? session : null);
+/** The current session only if it is already running -- never starts one. */
+const liveSession = () => (manager ? manager.live(currentName) : null);
+
+/** The name of the session the Catalog shows. */
+const currentSessionName = () => currentName;
+
+/** Note what the current session has attached, to attach it again when the
+ *  session next starts. */
+const rememberAttachments = (name = currentName) => manager.remember(name);
+
+/** What the current session attaches when it starts. */
+const rememberedAttachments = () => (manager ? manager.remembered(currentName) : []);
+const forgetAttachment = (alias) => manager.forget(currentName, alias);
+
+/** Every running session: `[{ name, session }]`. */
+const liveSessions = () => (manager ? manager.names().map((name) => ({ name, session: manager.live(name) })) : []);
+
+/** The name of the session `doc` runs in. */
+const sessionNameOf = (doc) => (directive(doc.getText()) || { name: DEFAULT }).name;
 
 function restart() {
-  if (session) session.dispose();
-  session = null;
+  manager.end(currentName);
   vscode.window.setStatusBarMessage("grebe: DuckDB session restarted", 3000);
+  for (const l of runListeners) l();
+}
+
+/** Delete the workspace database files (`:workspace:`), ending the sessions
+ *  that have them open. */
+async function resetWorkspaceDatabase() {
+  if (!storageDir || !fs.existsSync(storageDir)) {
+    vscode.window.showInformationMessage("grebe: there is no workspace database to reset.");
+    return;
+  }
+  const files = fs.readdirSync(storageDir).filter((f) => /^session(-.*)?\.duckdb(\.wal)?$/.test(f));
+  if (files.length === 0) {
+    vscode.window.showInformationMessage("grebe: there is no workspace database to reset.");
+    return;
+  }
+  const pick = await vscode.window.showWarningMessage(
+    "grebe: delete the workspace database? Every table kept in it is gone; your project's files are not touched.",
+    { modal: true },
+    "Delete",
+  );
+  if (pick !== "Delete") return;
+  manager.end();
+  // A session that was running has to let go of the file first.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  for (const f of files) fs.rmSync(path.join(storageDir, f), { force: true });
+  log.info("duckdb", `deleted the workspace database (${files.join(", ")})`);
+  for (const l of runListeners) l();
+}
+
+/** The Restart DuckDB Session command, from the palette or the Catalog: ends
+ *  the duckdb process, which hands back all the memory it held. A running
+ *  session loses what lives only in it, so that asks first. */
+async function restartSession() {
+  const live = liveSession();
+  if (live) {
+    const db = live.opts.database;
+    const kept = settings().database === WORKSPACE && storageDir && path.dirname(db) === storageDir ? "The workspace database" : path.basename(db);
+    const detail =
+      db === MEMORY
+        ? "The in-memory database and every table in it are discarded."
+        : `Temporary tables, settings and secrets are discarded. ${kept} is kept, and attached databases are attached again.`;
+    const which = currentName === DEFAULT ? "the DuckDB session" : `the DuckDB session "${currentName}"`;
+    const pick = await vscode.window.showWarningMessage(`Restart ${which}?`, { modal: true, detail }, "Restart");
+    if (pick !== "Restart") return;
+  }
+  restart();
 }
 
 /**
@@ -612,6 +736,40 @@ class StatementLenses {
  */
 function activate(context, clientReady) {
   output = log.tagged("duckdb");
+  storageDir = context.storageUri ? context.storageUri.fsPath : null;
+  currentName = DEFAULT;
+  // Attachments are remembered per workspace, by session name. Passwords
+  // are never part of what is kept (sessions.js strips them).
+  const state = context.workspaceState;
+  const KEY = "grebe.duckdb.attachments";
+  const memory = {};
+  const all = () => (state ? state.get(KEY, {}) : memory);
+  manager = new Sessions({
+    storageDir,
+    store: {
+      get: (name) => all()[name] || [],
+      set: (name, recs) => {
+        const next = { ...all(), [name]: recs };
+        if (recs.length === 0) delete next[name];
+        if (state) state.update(KEY, next);
+        else Object.assign(memory, { [name]: recs });
+      },
+    },
+    reattach: () => settings().reattach,
+    askPassword: (rec) =>
+      vscode.window.showInputBox({
+        title: `Password for ${conninfo.where(rec.path)}`,
+        prompt: `To attach ${rec.alias} again. It is used for this attach only and is not stored.`,
+        password: true,
+        ignoreFocusOut: true,
+      }),
+    // What DuckDB says outside a statement (the rc file, warnings) goes to
+    // the log as it arrives.
+    onStderr: (text) => output.append(text),
+    onExit: (name, reason) => sessionEnded(name, reason),
+    onReattach: (name, rec, error) => error && reattachFailed(name, rec, error),
+    log: (line) => output.appendLine(line),
+  });
   runtimeErrors = vscode.languages.createDiagnosticCollection("duckdb");
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   status.command = "grebe.duckdb.chooseDatabase";
@@ -659,9 +817,15 @@ function activate(context, clientReady) {
     log.command("grebe.duckdb.runRange", runRange),
     vscode.languages.registerCodeLensProvider({ language: "sql" }, lenses),
     lenses,
-    log.command("grebe.duckdb.restart", restart),
+    log.command("grebe.duckdb.restart", restartSession),
     log.command("grebe.duckdb.cancel", cancel),
     log.command("grebe.duckdb.chooseDatabase", chooseDatabase),
+    log.command("grebe.duckdb.resetWorkspaceDatabase", resetWorkspaceDatabase),
+    // The status bar and the Catalog follow the file in front: a file with
+    // a session of its own shows that session.
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor && editor.document.languageId === "sql") setCurrent(sessionNameOf(editor.document));
+    }),
     // A runtime error describes the text it ran; once that text changes, it
     // no longer points at anything.
     vscode.workspace.onDidChangeTextDocument((e) => runtimeErrors.delete(e.document.uri)),
@@ -669,11 +833,11 @@ function activate(context, clientReady) {
       if (e.affectsConfiguration("grebe.duckdb.codeLens")) lenses.refresh();
       if (e.affectsConfiguration("grebe.duckdb.path") || e.affectsConfiguration("grebe.duckdb.database")) {
         applySettings();
-      } else if (e.affectsConfiguration("grebe.duckdb.maxRows")) {
-        restart();
       }
+      // grebe.duckdb.maxRows is read at each run: changing it keeps the
+      // session, and what it holds in memory.
     }),
-    { dispose: () => session && session.dispose() },
+    { dispose: () => manager.end() },
   );
   refreshStatus();
 }
@@ -686,4 +850,22 @@ function clientChanged() {
 /** A run or export is in progress. */
 const isRunning = () => active !== null;
 
-module.exports = { activate, clientChanged, cancel, isRunning, errorContext, caretLines, currentSession, liveSession, onDidRun, settings, resolveDatabase, cwdFor };
+module.exports = {
+  activate,
+  clientChanged,
+  cancel,
+  isRunning,
+  errorContext,
+  caretLines,
+  currentSession,
+  currentSessionName,
+  liveSession,
+  liveSessions,
+  sessionNameOf,
+  rememberAttachments,
+  rememberedAttachments,
+  forgetAttachment,
+  onDidRun,
+  settings,
+  cwdFor,
+};

@@ -11,7 +11,12 @@ members = [
 [workspace.package]
 # One version for the workspace and the VS Code client alike; the release tag
 # (`v0.2.0`) is the same number. `grebe --version` reports it.
-version = "0.6.4"
+#
+# A release candidate is the exception: the crates and the tag carry the
+# semver pre-release (`1.0.0-rc.1`), and the VS Code client a plain number
+# below the release (`0.99.1`), because its marketplaces take no suffix and
+# no version twice. The release workflow checks both.
+version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -20,10 +25,10 @@ keywords = ["duckdb", "sql", "formatter", "linter"]
 categories = ["development-tools", "command-line-utilities", "parser-implementations"]
 
 [workspace.dependencies]
-grebe-syntax = { path = "crates/grebe-syntax", version = "0.6.4" }
-grebe-rules = { path = "crates/grebe-rules", version = "0.6.4" }
-grebe-format = { path = "crates/grebe-format", version = "0.6.4" }
-grebe-lsp = { path = "crates/grebe-lsp", version = "0.6.4" }
+grebe-syntax = { path = "crates/grebe-syntax", version = "1.0.0-rc.1" }
+grebe-rules = { path = "crates/grebe-rules", version = "1.0.0-rc.1" }
+grebe-format = { path = "crates/grebe-format", version = "1.0.0-rc.1" }
+grebe-lsp = { path = "crates/grebe-lsp", version = "1.0.0-rc.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"          # safe Rust only

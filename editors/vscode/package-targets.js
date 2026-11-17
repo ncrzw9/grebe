@@ -33,8 +33,12 @@ const version = JSON.parse(fs.readFileSync(path.join(here, "package.json"), "utf
 const bin = path.join(here, "bin");
 fs.mkdirSync(out, { recursive: true });
 
+// A release candidate is packaged as a pre-release: the flag lives in the
+// .vsix, and the marketplaces offer it only to editors that opted in.
+const preRelease = process.env.GREBE_PRERELEASE === "true" ? ["--pre-release"] : [];
+
 function vsce(args) {
-  execFileSync("npx", ["--yes", "@vscode/vsce", "package", ...args], { cwd: here, stdio: "inherit" });
+  execFileSync("npx", ["--yes", "@vscode/vsce", "package", ...preRelease, ...args], { cwd: here, stdio: "inherit" });
 }
 
 function extract(archive, rustTarget) {

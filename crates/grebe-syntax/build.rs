@@ -13,6 +13,7 @@ enum Category {
     TypeName,
     TypeFunc,
     Any,
+    BareLabel,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -435,51 +436,192 @@ fn expand_calls(expr: &PegExpr, macros: &HashMap<String, (String, PegExpr)>) -> 
 struct Compiler {
     expressions: Vec<String>,
     rule_ids: HashMap<String, u32>,
+    /// The same expressions as data, for the FIRST-set computation.
+    shapes: Vec<Shape>,
+}
+
+/// What a compiled expression is made of, by index into the expression
+/// table.
+#[derive(Clone, Debug)]
+enum Shape {
+    Literal(String),
+    Rule(String),
+    Identifier,
+    Seq(Vec<usize>),
+    Choice(Vec<usize>),
+    /// `?` and `*`: may match nothing.
+    Maybe(usize),
+    Plus(usize),
+    /// Matches without consuming: lookahead, end of input.
+    ZeroWidth,
+    /// The body of a rule the matcher implements natively.
+    Native,
+}
+
+// What kind of token an expression can begin with. `FIRST_NULLABLE` means it
+// can also match without consuming one. The same bits are in matcher.rs.
+const FIRST_NULLABLE: u8 = 1;
+const FIRST_WORD: u8 = 1 << 1;
+const FIRST_QUOTED_IDENT: u8 = 1 << 2;
+const FIRST_STRING: u8 = 1 << 3;
+const FIRST_NUMBER: u8 = 1 << 4;
+const FIRST_OPERATOR: u8 = 1 << 5;
+
+/// The FIRST set of each rule the matcher implements natively: the token
+/// kinds its code in matcher.rs accepts. A native rule missing here fails
+/// the build, so a new one cannot go unclassified.
+fn native_first(rule: &str) -> u8 {
+    match rule {
+        "StringLiteral" => FIRST_STRING,
+        "NumberLiteral" => FIRST_NUMBER,
+        "OperatorLiteral" | "AnyOperatorLiteral" => FIRST_OPERATOR,
+        "ReservedKeyword" | "UnreservedKeyword" | "ColumnNameKeyword" | "FuncNameKeyword"
+        | "TypeNameKeyword" | "BareLabelKeyword" => FIRST_WORD,
+        "NewlineBefore" | "EndOfInput" => FIRST_NULLABLE,
+        _ => panic!("native rule `{rule}` has no FIRST set; add it to `native_first`"),
+    }
+}
+
+/// For every expression: the token kinds and the literals a match can begin
+/// with. A fixed point over the rule graph, starting from nothing; a set
+/// only grows, so it ends.
+///
+/// The matcher consults this before trying an expression. Most
+/// alternatives of most choices cannot start with the token at hand -- the
+/// precedence chain alone is twenty rules deep under every value -- and
+/// skipping them is a table lookup instead of a descent that ends in a
+/// failed comparison. A set that is too large only costs time; one that is
+/// too small would reject valid SQL, so every case below errs large.
+fn first_sets(
+    shapes: &[Shape],
+    rule_roots: &HashMap<String, usize>,
+    literal_ids: &HashMap<String, u16>,
+) -> Vec<(u8, std::collections::BTreeSet<u16>)> {
+    let mut first: Vec<(u8, std::collections::BTreeSet<u16>)> =
+        vec![(0, Default::default()); shapes.len()];
+    loop {
+        let mut changed = false;
+        for i in (0..shapes.len()).rev() {
+            let mut flags = 0u8;
+            let mut lits = std::collections::BTreeSet::new();
+            match &shapes[i] {
+                Shape::Literal(l) => {
+                    lits.insert(literal_ids[&l.to_ascii_lowercase()]);
+                }
+                Shape::Identifier => flags = FIRST_WORD | FIRST_QUOTED_IDENT,
+                Shape::ZeroWidth => flags = FIRST_NULLABLE,
+                Shape::Native => {} // set through the rule that owns it
+                Shape::Rule(name) => {
+                    let root = rule_roots[name];
+                    if matches!(shapes[root], Shape::Native) {
+                        flags = native_first(name);
+                    } else {
+                        flags = first[root].0;
+                        lits = first[root].1.clone();
+                    }
+                }
+                Shape::Seq(items) => {
+                    flags = FIRST_NULLABLE;
+                    for &item in items {
+                        flags |= first[item].0 & !FIRST_NULLABLE;
+                        lits.extend(first[item].1.iter().copied());
+                        if first[item].0 & FIRST_NULLABLE == 0 {
+                            flags &= !FIRST_NULLABLE;
+                            break;
+                        }
+                    }
+                }
+                Shape::Choice(items) => {
+                    for &item in items {
+                        flags |= first[item].0;
+                        lits.extend(first[item].1.iter().copied());
+                    }
+                }
+                Shape::Maybe(item) => {
+                    flags = first[*item].0 | FIRST_NULLABLE;
+                    lits = first[*item].1.clone();
+                }
+                Shape::Plus(item) => {
+                    flags = first[*item].0;
+                    lits = first[*item].1.clone();
+                }
+            }
+            if (flags, &lits) != (first[i].0, &first[i].1) {
+                first[i] = (flags, lits);
+                changed = true;
+            }
+        }
+        if !changed {
+            return first;
+        }
+    }
 }
 
 impl Compiler {
     fn compile_expr(&mut self, expr: &PegExpr) -> usize {
         let idx = self.expressions.len();
         self.expressions.push(String::new()); // placeholder
-        let compiled = match expr {
-            PegExpr::Literal(s) => format!("Expr::Literal({:?})", s),
+        self.shapes.push(Shape::ZeroWidth); // placeholder
+        let ids = |items: &[usize]| {
+            items
+                .iter()
+                .map(|i| format!("ExprId({i})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (compiled, shape) = match expr {
+            PegExpr::Literal(s) => (format!("Expr::Literal({:?})", s), Shape::Literal(s.clone())),
             PegExpr::Ref(name) => {
                 if name == "EndOfInput" {
-                    "Expr::EndOfInput".to_string()
+                    ("Expr::EndOfInput".to_string(), Shape::ZeroWidth)
                 } else if let Some(&id) = self.rule_ids.get(name) {
-                    format!("Expr::Rule(RuleId({}))", id)
+                    (
+                        format!("Expr::Rule(RuleId({}))", id),
+                        Shape::Rule(name.clone()),
+                    )
                 } else {
                     panic!("undefined reference to rule: {}", name);
                 }
             }
             PegExpr::Seq(items) => {
-                let ids: Vec<String> = items
-                    .iter()
-                    .map(|item| format!("ExprId({})", self.compile_expr(item)))
-                    .collect();
-                format!("Expr::Seq(&[{}])", ids.join(", "))
+                let items: Vec<usize> = items.iter().map(|item| self.compile_expr(item)).collect();
+                (format!("Expr::Seq(&[{}])", ids(&items)), Shape::Seq(items))
             }
             PegExpr::Choice(items) => {
-                let ids: Vec<String> = items
-                    .iter()
-                    .map(|item| format!("ExprId({})", self.compile_expr(item)))
-                    .collect();
-                format!("Expr::Choice(&[{}])", ids.join(", "))
+                let items: Vec<usize> = items.iter().map(|item| self.compile_expr(item)).collect();
+                (
+                    format!("Expr::Choice(&[{}])", ids(&items)),
+                    Shape::Choice(items),
+                )
             }
             PegExpr::Optional(item) => {
-                format!("Expr::Optional(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (
+                    format!("Expr::Optional(ExprId({item}))"),
+                    Shape::Maybe(item),
+                )
             }
             PegExpr::ZeroOrMore(item) => {
-                format!("Expr::ZeroOrMore(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (
+                    format!("Expr::ZeroOrMore(ExprId({item}))"),
+                    Shape::Maybe(item),
+                )
             }
             PegExpr::OneOrMore(item) => {
-                format!("Expr::OneOrMore(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (
+                    format!("Expr::OneOrMore(ExprId({item}))"),
+                    Shape::Plus(item),
+                )
             }
             PegExpr::Not(item) => {
-                format!("Expr::Not(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (format!("Expr::Not(ExprId({item}))"), Shape::ZeroWidth)
             }
             PegExpr::And(item) => {
-                format!("Expr::And(ExprId({}))", self.compile_expr(item))
+                let item = self.compile_expr(item);
+                (format!("Expr::And(ExprId({item}))"), Shape::ZeroWidth)
             }
             PegExpr::Identifier(cat) => {
                 let cat_str = match cat {
@@ -487,17 +629,22 @@ impl Compiler {
                     Category::TypeName => "Category::TypeName",
                     Category::TypeFunc => "Category::TypeFunc",
                     Category::Any => "Category::Any",
+                    Category::BareLabel => "Category::BareLabel",
                 };
-                format!("Expr::Identifier(crate::keyword::{})", cat_str)
+                (
+                    format!("Expr::Identifier(crate::keyword::{})", cat_str),
+                    Shape::Identifier,
+                )
             }
-            PegExpr::EndOfInput => "Expr::EndOfInput".to_string(),
+            PegExpr::EndOfInput => ("Expr::EndOfInput".to_string(), Shape::ZeroWidth),
             // A placeholder the matcher never evaluates: every `Dummy` rule is
             // dispatched by name in `Matcher::evaluate_rule` before its
             // expression is consulted.
-            PegExpr::Dummy => "Expr::EndOfInput".to_string(),
+            PegExpr::Dummy => ("Expr::EndOfInput".to_string(), Shape::Native),
             PegExpr::Call(_, _) => panic!("macro calls should have been expanded"),
         };
         self.expressions[idx] = compiled;
+        self.shapes[idx] = shape;
         idx
     }
 }
@@ -548,68 +695,43 @@ fn apply_structural_overrides(rules: &mut HashMap<String, PegExpr>) {
     // tokens, which a PEG shape cannot express; every literal is still matched
     // by the real `StringLiteral` rule, so the CST keeps `StringLiteral` nodes
     // for rules that read them.
-    alts[sidx] = PegExpr::Seq(vec![
-        PegExpr::Ref("StringLiteral".to_string()),
-        PegExpr::ZeroOrMore(Box::new(PegExpr::Seq(vec![
-            PegExpr::Ref("NewlineBefore".to_string()),
-            PegExpr::Ref("StringLiteral".to_string()),
-        ]))),
-    ]);
+    alts[sidx] = continued_string();
 
-    // `CopyFileName <- CopyFileNameExpression / CopyFileNameStringLiteral /
-    //                   CopyFileNameIdentifier / CopyFileNameIdentifierColId`
-    // (statements/copy.gram:11), where
-    //   CopyFileNameIdentifier      <- Identifier
-    //   CopyFileNameIdentifierColId <- Identifier '.' ColId
-    //
-    // The alternatives are in the wrong order for a PEG. `COPY t TO out.csv`
-    // tries `CopyFileNameIdentifier` first, it succeeds on `out` alone, and
-    // ordered choice does not re-enter the alternation when the enclosing
-    // sequence then fails on the leftover `.csv` -- so the dotted form is
-    // unreachable and every unquoted filename with an extension would be a
-    // false `PRS001` on SQL DuckDB parses happily. Upstream never feels it: the
-    // shipping parser is the PG/bison one, and the PEG grammar is not what
-    // runs. Longest alternative first is the fix.
-    //
-    // Left as written, this is an engine-only accept -- the direction the
-    // differential test holds at zero.
-    let copy = rules
-        .get_mut("CopyFileName")
-        .expect("vendored grammar has no `CopyFileName` rule");
-    let PegExpr::Choice(alts) = copy else {
-        panic!("`CopyFileName` is no longer a choice; this override is stale");
-    };
-    let pos = |name: &str, alts: &[PegExpr]| {
-        alts.iter()
-            .position(|a| matches!(a, PegExpr::Ref(n) if n == name))
-    };
-    let short = pos("CopyFileNameIdentifier", alts)
-        .expect("`CopyFileName` no longer offers `CopyFileNameIdentifier`");
-    let long = pos("CopyFileNameIdentifierColId", alts)
-        .expect("`CopyFileName` no longer offers `CopyFileNameIdentifierColId`");
+    // The engine does the same wherever a string literal is matched, not
+    // only in an expression: its string matcher consumes the continuation
+    // lines itself, so `DATE '2020-'\n'01-01'` and a continued COPY path are
+    // one literal too. Every other reference gets the same shape. `TableName`
+    // is left alone: there the engine matches a string token as an
+    // identifier, with no continuation.
+    let mut widened = 0;
+    for (name, expr) in rules.iter_mut() {
+        if name == "LiteralExpression" || name == "TableName" {
+            continue;
+        }
+        widened += widen_string_literals(expr);
+    }
     assert!(
-        short < long,
-        "`CopyFileName` alternatives are already longest-first upstream; \
-         this override is stale and should be removed"
+        widened > 0,
+        "no rule references `StringLiteral` any more; this override is stale"
     );
-    let moved = alts.remove(long);
-    alts.insert(short, moved);
+
+    // (`CopyFileName` used to be reordered here, longest alternative first,
+    // so that `COPY t TO out.csv` could reach the dotted form. The v2.0.0
+    // grammar lists `CopyFileNameIdentifierColId` before
+    // `CopyFileNameIdentifier` itself, so the override is gone; the
+    // differential corpus has the statements that needed it.)
 
     // `SelectClause <- 'SELECT' DistinctClause? TargetList?`
     // (statements/select.gram). The grammar makes the selection list
     // optional; both shipping engines raise "SELECT clause without selection
     // list". Drop the `?`.
     //
-    // Checked against 1.5.5 AND the 2.0 preview (1.6.0.dev358): both reject
-    // it, so it is a grammar bug, and following the engines costs us nothing
-    // on either gate.
+    // Checked against 1.5.5 and 2.0.0: both reject it, so it is a grammar
+    // bug, and following the engines costs us nothing on either gate.
     //
-    // NOTE: `Statement <- ... / ExpressionStatement` is the other half of this
-    // class and is deliberately NOT touched here -- 1.5.5 rejects a bare
-    // expression statement but the 2.0 preview accepts it, so removing the
-    // alternative would create engine-only accepts against 2.0, the one thing
-    // the differential forbids. It belongs in a lint rule instead,
-    // which is version-aware in a way a grammar edit cannot be.
+    // (The other member of this class was `Statement <- ... /
+    // ExpressionStatement`, a bare expression as a statement. The v2.0.0
+    // grammar dropped the alternative itself.)
     let sel = rules
         .get_mut("SelectClause")
         .expect("vendored grammar has no `SelectClause` rule");
@@ -631,6 +753,125 @@ fn apply_structural_overrides(rules: &mut HashMap<String, PegExpr>) {
         "`SelectClause` no longer has exactly one optional `TargetList`; \
          this override is stale"
     );
+
+    // `ComparisonExpression <- BetweenInLikeExpression ComparisonExpressionTail*`
+    // and `IsDistinctFromExpression <- ComparisonExpression IsDistinctFromTail*`
+    // (statements/expression.gram). The grammar text takes any number of
+    // tails; the engine's transformer then refuses more than one of either
+    // with "Chained comparisons are not supported" (transform_expression.cpp),
+    // and 1.5.5 refuses the same statements as plain syntax errors. So
+    // `WHERE 1 < x < 10` does not run on any supported engine, and a linter
+    // that parses it has nothing to say about a classic mistake. At most one
+    // tail: `*` becomes `?`.
+    for (rule, tail) in [
+        ("ComparisonExpression", "ComparisonExpressionTail"),
+        ("IsDistinctFromExpression", "IsDistinctFromTail"),
+    ] {
+        let expr = rules
+            .get_mut(rule)
+            .unwrap_or_else(|| panic!("vendored grammar has no `{rule}` rule"));
+        let PegExpr::Seq(items) = expr else {
+            panic!("`{rule}` is no longer a sequence; this override is stale");
+        };
+        let mut narrowed = 0;
+        for item in items.iter_mut() {
+            let PegExpr::ZeroOrMore(inner) = item else {
+                continue;
+            };
+            if matches!(&**inner, PegExpr::Ref(n) if n == tail) {
+                *item = PegExpr::Optional(Box::new(PegExpr::Ref(tail.to_string())));
+                narrowed += 1;
+            }
+        }
+        assert_eq!(
+            narrowed, 1,
+            "`{rule}` no longer has exactly one `{tail}*`; this override is stale"
+        );
+    }
+
+    // A bare expression as a statement: `1 + 1;`, `42 AS answer, 'x';`.
+    //
+    // The grammar up to 1.5 had `Statement <- ... / ExpressionStatement`; the
+    // v2.0.0 grammar directory does not, because 2.0 moved the rule out of
+    // the core grammar and into the CLI, which adds it when it starts.
+    // Checked against 2.0.0: the `duckdb` shell runs `1+1;` and
+    // `CREATE TABLE z AS 1;`, and the library (`duckdb.extract_statements`)
+    // refuses both; 1.5.5 refuses them everywhere. The shell is how SQL files
+    // are run, by hand and by the editor extension, so a file it accepts must
+    // not be a `PRS001`: the rule is kept, as the last alternative, where it
+    // can only match what nothing else did. That it is not valid through a
+    // client library is a fact about where the file runs, not its syntax.
+    let stmt = rules
+        .get_mut("Statement")
+        .expect("vendored grammar has no `Statement` rule");
+    let PegExpr::Choice(alts) = stmt else {
+        panic!("`Statement` is no longer a choice; this override is stale");
+    };
+    assert!(
+        !alts
+            .iter()
+            .any(|a| matches!(a, PegExpr::Ref(n) if n == "ExpressionStatement")),
+        "upstream has `ExpressionStatement` again; drop this override"
+    );
+    alts.push(PegExpr::Ref("ExpressionStatement".to_string()));
+    let alias = PegExpr::Choice(
+        ["ColIdExpression", "ExpressionAsCollabel", "Expression"]
+            .into_iter()
+            .map(|n| PegExpr::Ref(n.to_string()))
+            .collect(),
+    );
+    for (name, expr) in [
+        ("ExpressionAlias", alias),
+        (
+            "ExpressionStatement",
+            PegExpr::Call(
+                "List".to_string(),
+                Box::new(PegExpr::Ref("ExpressionAlias".to_string())),
+            ),
+        ),
+    ] {
+        assert!(
+            rules.insert(name.to_string(), expr).is_none(),
+            "upstream defines `{name}` now; drop this override"
+        );
+    }
+}
+
+/// `StringLiteral (NewlineBefore StringLiteral)*`: a string literal and the
+/// continuation lines that concatenate onto it.
+fn continued_string() -> PegExpr {
+    PegExpr::Seq(vec![
+        PegExpr::Ref("StringLiteral".to_string()),
+        PegExpr::ZeroOrMore(Box::new(PegExpr::Seq(vec![
+            PegExpr::Ref("NewlineBefore".to_string()),
+            PegExpr::Ref("StringLiteral".to_string()),
+        ]))),
+    ])
+}
+
+/// Replace every `StringLiteral` reference in `expr` with
+/// [`continued_string`]; returns how many were replaced.
+fn widen_string_literals(expr: &mut PegExpr) -> usize {
+    match expr {
+        PegExpr::Ref(name) if name == "StringLiteral" => {
+            *expr = continued_string();
+            1
+        }
+        PegExpr::Call(_, arg) => widen_string_literals(arg),
+        PegExpr::Seq(items) | PegExpr::Choice(items) => {
+            items.iter_mut().map(widen_string_literals).sum()
+        }
+        PegExpr::Optional(item)
+        | PegExpr::ZeroOrMore(item)
+        | PegExpr::OneOrMore(item)
+        | PegExpr::Not(item)
+        | PegExpr::And(item) => widen_string_literals(item),
+        PegExpr::Ref(_)
+        | PegExpr::Literal(_)
+        | PegExpr::Identifier(_)
+        | PegExpr::EndOfInput
+        | PegExpr::Dummy => 0,
+    }
 }
 
 fn main() {
@@ -655,6 +896,9 @@ fn main() {
         ("column_name", "column_name_keyword.list"),
         ("func_name", "func_name_keyword.list"),
         ("type_name", "type_name_keyword.list"),
+        // New in the v2.0.0 grammar: the words that may alias a select-list
+        // item without `AS` (`BareColLabel <- BareLabelKeyword / Identifier`).
+        ("bare_label", "bare_label_keyword.list"),
     ];
 
     for (cat_name, file_name) in files {
@@ -681,10 +925,21 @@ fn main() {
         ("column_name", "Keyword::COLUMN_NAME"),
         ("type_name", "Keyword::TYPE_NAME"),
         ("func_name", "Keyword::FUNC_NAME"),
+        ("bare_label", "Keyword::BARE_LABEL"),
     ] {
         for kw in keyword_lists.get(cat).unwrap() {
             kw_flags.entry(kw.clone()).or_default().push(flag);
         }
+    }
+    // Bare-label is a property of a keyword, not a category of its own:
+    // `Keyword::matches` treats a word with no category bit as an ordinary
+    // identifier, so a bare-label word that is in no other list would
+    // silently stop being a keyword.
+    for (kw, flags) in &kw_flags {
+        assert!(
+            flags.iter().any(|f| *f != "Keyword::BARE_LABEL"),
+            "`{kw}` is in bare_label_keyword.list but in no keyword category list"
+        );
     }
     let mut kw_source = String::new();
     kw_source.push_str("use crate::keyword::Keyword;\n\n");
@@ -751,6 +1006,10 @@ fn main() {
         ("FunctionName", PegExpr::Identifier(Category::TypeFunc)),
         ("TableFunctionName", PegExpr::Identifier(Category::TypeFunc)),
         ("TypeName", PegExpr::Identifier(Category::TypeName)),
+        // `BareColLabel <- BareLabelKeyword / Identifier` in the text; the
+        // engine replaces it with an identifier matcher whose only keyword
+        // category is bare-label.
+        ("BareColLabel", PegExpr::Identifier(Category::BareLabel)),
         ("ReservedIdentifier", PegExpr::Identifier(Category::Any)),
         ("ReservedSchemaName", PegExpr::Identifier(Category::Any)),
         ("ReservedTableName", PegExpr::Identifier(Category::Any)),
@@ -766,11 +1025,13 @@ fn main() {
         ("NewlineBefore", PegExpr::Dummy),
         ("NumberLiteral", PegExpr::Dummy),
         ("OperatorLiteral", PegExpr::Dummy),
+        ("AnyOperatorLiteral", PegExpr::Dummy),
         ("ReservedKeyword", PegExpr::Dummy),
         ("UnreservedKeyword", PegExpr::Dummy),
         ("ColumnNameKeyword", PegExpr::Dummy),
         ("FuncNameKeyword", PegExpr::Dummy),
         ("TypeNameKeyword", PegExpr::Dummy),
+        ("BareLabelKeyword", PegExpr::Dummy),
     ];
 
     let mut rules_map = HashMap::new();
@@ -834,6 +1095,7 @@ fn main() {
     let mut compiler = Compiler {
         expressions: Vec::new(),
         rule_ids: rule_ids.clone(),
+        shapes: Vec::new(),
     };
 
     let mut rule_root_exprs = Vec::new();
@@ -865,6 +1127,75 @@ fn main() {
     }
     exprs_static.push_str("];\n\n");
 
+    // FIRST sets. Literals are numbered in sorted order of their lowercase
+    // text, which is the order the matcher's binary search expects.
+    let mut literal_list: Vec<String> = compiler
+        .shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Literal(l) => Some(l.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    literal_list.sort();
+    literal_list.dedup();
+    assert!(literal_list.len() < u16::MAX as usize);
+    let literal_ids: HashMap<String, u16> = literal_list
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.clone(), i as u16))
+        .collect();
+    let rule_roots: HashMap<String, usize> = sorted_rule_names
+        .iter()
+        .cloned()
+        .zip(rule_root_exprs.iter().copied())
+        .collect();
+    let first = first_sets(&compiler.shapes, &rule_roots, &literal_ids);
+    let words = literal_list.len().div_ceil(64);
+    // Many expressions share a set: store each once.
+    let mut set_ids: HashMap<(u8, Vec<u16>), usize> = HashMap::new();
+    let mut sets: Vec<(u8, Vec<u16>)> = Vec::new();
+    let mut first_of = Vec::new();
+    for (flags, lits) in &first {
+        let key = (*flags, lits.iter().copied().collect::<Vec<u16>>());
+        let id = *set_ids.entry(key.clone()).or_insert_with(|| {
+            sets.push(key);
+            sets.len() - 1
+        });
+        first_of.push(id);
+    }
+    assert!(sets.len() < u16::MAX as usize);
+    let mut first_static = String::new();
+    first_static.push_str(&format!(
+        "/// Every grammar literal, lowercase and sorted.\npub static LITERALS: &[&str] = &{:?};\n\n",
+        literal_list
+    ));
+    first_static.push_str(&format!(
+        "/// 64-bit words in a FIRST set's literal bitmap.\npub const FIRST_WORDS: usize = {words};\n\n"
+    ));
+    first_static.push_str(
+        "/// Each expression's FIRST set, as an index into `FIRST_FLAGS` and `FIRST_LITERALS`.\n",
+    );
+    first_static.push_str(&format!(
+        "pub static FIRST_OF: &[u16] = &{:?};\n\n",
+        first_of
+    ));
+    first_static.push_str("/// Token kinds a set admits, and whether it admits no token at all.\n");
+    first_static.push_str(&format!(
+        "pub static FIRST_FLAGS: &[u8] = &{:?};\n\n",
+        sets.iter().map(|(f, _)| *f).collect::<Vec<u8>>()
+    ));
+    first_static.push_str("/// The literals a set admits, a bit per entry of `LITERALS`.\n");
+    first_static.push_str("pub static FIRST_LITERALS: &[[u64; FIRST_WORDS]] = &[\n");
+    for (_, lits) in &sets {
+        let mut bits = vec![0u64; words];
+        for &l in lits {
+            bits[l as usize / 64] |= 1 << (l % 64);
+        }
+        first_static.push_str(&format!("    {:?},\n", bits));
+    }
+    first_static.push_str("];\n\n");
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("grammar_tables.rs");
 
@@ -875,6 +1206,7 @@ fn main() {
     final_content.push('\n');
     final_content.push_str(&rules_static);
     final_content.push_str(&exprs_static);
+    final_content.push_str(&first_static);
 
     std::fs::write(&dest_path, final_content).unwrap_or_else(|e| {
         panic!(

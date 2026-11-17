@@ -440,3 +440,48 @@ browserTest("a page that missed part of a run asks for it again, and then shows 
   assert.equal(await readies(), 2);
   assert.deepEqual(errors, []);
 });
+
+browserTest("tabs that do not fit get a list of every result beside them", async (t) => {
+  const browser = await chromium.launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 700, height: 500 } });
+  await page.setContent(html());
+
+  const run = (n) =>
+    page.evaluate(
+      ({ n, result }) => {
+        window.postMessage({ type: "begin", header: { title: "q.sql", detail: `${n} statements` } }, "*");
+        for (let i = 0; i < n; i++) {
+          window.postMessage({ type: "result", entry: { id: i + 1, uri: "file:///q.sql", line: i * 3, preview: `SELECT ${i} AS n`, result, exportable: true } }, "*");
+        }
+        window.postMessage({ type: "end", summary: `${n} statements succeeded.` }, "*");
+      },
+      { n, result: rowsResult(3) },
+    );
+
+  // Two results fit: no list.
+  await run(2);
+  await page.waitForSelector("canvas");
+  assert.equal(await page.isVisible("#tabpick"), false);
+
+  // Twenty do not: the list holds them all, with their statements, and
+  // shows the active one (the last to arrive).
+  await run(20);
+  await page.waitForSelector("#tabpick", { state: "visible" });
+  const options = await page.locator("#tabpick option").allTextContents();
+  assert.equal(options.length, 21);
+  assert.equal(options[4], "L13 · 3 rows — SELECT 4 AS n");
+  assert.equal(options[20], "Messages");
+  assert.equal(await page.inputValue("#tabpick"), "19");
+
+  // Picking one shows it and scrolls its tab into view.
+  await page.selectOption("#tabpick", "4");
+  assert.equal(await page.textContent("#tablist .tab.active"), "L13 · 3 rows");
+  const tab = await page.locator("#tablist .tab.active").boundingBox();
+  const strip = await page.locator("#tablist").boundingBox();
+  assert.ok(tab.x >= strip.x - 1 && tab.x + tab.width <= strip.x + strip.width + 1, "the picked tab is in view");
+
+  // Clicking a tab keeps the list in step.
+  await page.click("#tablist .tab >> nth=5");
+  assert.equal(await page.inputValue("#tabpick"), "5");
+});

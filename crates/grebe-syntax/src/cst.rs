@@ -62,6 +62,15 @@ pub struct Tree {
     /// Every node in depth-first, left-to-right order, computed once:
     /// `walk` and `find` are called by every detector over the whole file.
     preorder: Vec<NodeId>,
+    /// Where each node sits in `preorder`, and where its subtree ends
+    /// there: a node's descendants are the slice between the two.
+    position: Vec<(u32, u32)>,
+    /// `preorder` grouped by rule, each group still in pre-order, with the
+    /// group of rule `r` at `by_rule[rule_start[r]..rule_start[r + 1]]`.
+    /// Detectors ask for one rule's nodes at a time, dozens of times per
+    /// file; scanning every node for each was an eighth of a lint run.
+    by_rule: Vec<NodeId>,
+    rule_start: Vec<u32>,
 }
 
 impl Tree {
@@ -75,11 +84,41 @@ impl Tree {
             // reversed so children come out left-to-right
             stack.extend(nodes[id.0 as usize].children.iter().rev());
         }
+        // Subtree extents: a node's subtree ends where its last child's
+        // does, so one pass from the back fills them in.
+        let mut position = vec![(0u32, 0u32); nodes.len()];
+        for (at, id) in preorder.iter().enumerate() {
+            position[id.0 as usize] = (at as u32, at as u32 + 1);
+        }
+        for id in preorder.iter().rev() {
+            if let Some(&last) = nodes[id.0 as usize].children.last() {
+                position[id.0 as usize].1 = position[last.0 as usize].1;
+            }
+        }
+        // Counting sort by rule keeps each group in pre-order.
+        let rules = crate::grammar::RULES.len();
+        let mut rule_start = vec![0u32; rules + 1];
+        for id in &preorder {
+            rule_start[nodes[id.0 as usize].rule.0 as usize + 1] += 1;
+        }
+        for r in 0..rules {
+            rule_start[r + 1] += rule_start[r];
+        }
+        let mut next = rule_start.clone();
+        let mut by_rule = vec![root; preorder.len()];
+        for &id in &preorder {
+            let slot = &mut next[nodes[id.0 as usize].rule.0 as usize];
+            by_rule[*slot as usize] = id;
+            *slot += 1;
+        }
         Tree {
             nodes,
             tokens,
             root,
             preorder,
+            position,
+            by_rule,
+            rule_start,
         }
     }
 
@@ -129,15 +168,8 @@ impl Tree {
     /// Pre-order descendants of `id`, excluding `id` itself.
     #[must_use]
     pub fn descendants(&self, id: NodeId) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        let mut stack: Vec<NodeId> = self.children(id).iter().rev().copied().collect();
-        while let Some(n) = stack.pop() {
-            out.push(n);
-            for &c in self.children(n).iter().rev() {
-                stack.push(c);
-            }
-        }
-        out
+        let (at, end) = self.position[id.0 as usize];
+        self.preorder[at as usize + 1..end as usize].to_vec()
     }
 
     /// Every node produced by the named grammar rule, in pre-order.
@@ -145,16 +177,10 @@ impl Tree {
     /// The workhorse for detectors: `tree.find("GroupByClause")`.
     #[must_use]
     pub fn find(&self, rule: &str) -> Vec<NodeId> {
-        // Resolve the name once and compare rule ids per node: detectors call
-        // this for every rule they check, over every node of the file.
         let Some(id) = crate::grammar::RULES.iter().position(|r| r.name == rule) else {
             return Vec::new();
         };
-        self.preorder
-            .iter()
-            .copied()
-            .filter(|&n| self.nodes[n.0 as usize].rule.0 as usize == id)
-            .collect()
+        self.by_rule[self.rule_start[id] as usize..self.rule_start[id + 1] as usize].to_vec()
     }
 
     /// Nearest ancestor produced by the named rule, if any.

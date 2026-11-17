@@ -82,17 +82,21 @@ fn walk(dir: &Path, config: Option<&Config>, out: &mut Vec<PathBuf>) {
 
 /// Builds the `Selection` `grebe check` (and its `--fix`) runs with: a
 /// `--select` flag wins over a config `select`, `[severity]` overrides and
-/// `foreign-heads` come from the config unconditionally.
+/// `foreign-heads` come from the config unconditionally. `catalog` is the
+/// snapshot the CAT rules read, already loaded (see [`load_catalog`]); with
+/// `None` they do not run.
 #[must_use]
 pub fn selection<'a>(
     config: Option<&'a Config>,
     select_flag: Option<&'a [String]>,
+    catalog: Option<&'a grebe_rules::catalog::Catalog>,
 ) -> grebe_rules::analysis::Selection<'a> {
     let select = select_flag.or_else(|| config.and_then(|c| c.select.as_deref()));
     grebe_rules::analysis::Selection {
         select,
         severity: config.map_or(&[][..], |c| c.severity.as_slice()),
         foreign_heads: config.map_or(&[][..], |c| c.foreign_heads.as_slice()),
+        catalog,
     }
 }
 
@@ -120,4 +124,35 @@ pub fn format_options(config: Option<&Config>) -> grebe_format::Options {
         };
     }
     opts
+}
+
+/// Reads the catalog snapshot `grebe check` runs the CAT rules against:
+/// `--catalog FILE` if given, else the config's `catalog` key, else none.
+/// Prints `grebe check: <error>` and hands back exit code `2` for a file
+/// that cannot be read or is not a snapshot.
+pub fn load_catalog(
+    flag: Option<&str>,
+    config: Option<&Config>,
+) -> Result<Option<grebe_rules::catalog::Catalog>, i32> {
+    let path = match (flag, config.and_then(|c| c.catalog.as_ref())) {
+        (Some(p), _) => PathBuf::from(p),
+        (None, Some(p)) => p.clone(),
+        (None, None) => return Ok(None),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        eprintln!(
+            "grebe check: could not read catalog {}: {e}",
+            path.display()
+        );
+        2
+    })?;
+    grebe_rules::catalog::Catalog::from_json_text(&text)
+        .map(Some)
+        .map_err(|e| {
+            eprintln!(
+                "grebe check: {} is not a catalog snapshot: {e}",
+                path.display()
+            );
+            2
+        })
 }

@@ -10,17 +10,63 @@ use std::collections::HashMap;
 use crate::Span;
 use crate::cst::{Node, NodeId, Tree};
 use crate::grammar::{
-    EXPRESSIONS, Expr, ExprId, RULE_COLUMN_NAME_KEYWORD, RULE_END_OF_INPUT, RULE_FUNC_NAME_KEYWORD,
-    RULE_NEWLINE_BEFORE, RULE_NUMBER_LITERAL, RULE_OPERATOR_LITERAL, RULE_PROGRAM,
-    RULE_RESERVED_KEYWORD, RULE_STRING_LITERAL, RULE_TYPE_NAME_KEYWORD, RULE_UNRESERVED_KEYWORD,
-    RULES, RuleId, classify_keyword,
+    EXPRESSIONS, Expr, ExprId, FIRST_FLAGS, FIRST_LITERALS, FIRST_OF, LITERALS,
+    RULE_ANY_OPERATOR_LITERAL, RULE_BARE_LABEL_KEYWORD, RULE_COLUMN_NAME_KEYWORD,
+    RULE_END_OF_INPUT, RULE_FUNC_NAME_KEYWORD, RULE_NEWLINE_BEFORE, RULE_NUMBER_LITERAL,
+    RULE_OPERATOR_LITERAL, RULE_PROGRAM, RULE_RESERVED_KEYWORD, RULE_STRING_LITERAL,
+    RULE_TYPE_NAME_KEYWORD, RULE_UNRESERVED_KEYWORD, RULES, RuleId, classify_keyword,
 };
 use crate::keyword::Keyword;
 use crate::token::{Token, TokenKind, tokenize};
 
 const OPRUN: &[char] = &[
-    '+', '*', '/', '<', '>', '=', '~', '!', '@', '%', '^', '&', '|', '`',
+    '+', '-', '*', '/', '%', '^', '<', '>', '=', '~', '!', '@', '&', '|',
 ];
+
+/// `NumberLiteralMatcher` in DuckDB 2.0: the tokenizer takes any run of
+/// digits and dots, and the matcher then refuses a second dot or a dot in
+/// the exponent, so `1.2.3` and `1..2` are syntax errors.
+fn well_formed_number(text: &[u8]) -> bool {
+    let mut has_dot = false;
+    let mut exponent = false;
+    // `0x1F` and `0b101`: digits only, and `e` there is a hex digit.
+    if text.len() > 1 && text[0] == b'0' && matches!(text[1], b'x' | b'X' | b'b' | b'B') {
+        return true;
+    }
+    for &b in text {
+        match b {
+            b'.' if has_dot || exponent => return false,
+            b'.' => has_dot = true,
+            b'e' | b'E' => exponent = true,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `OperatorMatcher::HasSpecialPrecedence` in DuckDB 2.0.
+fn has_special_precedence(op: &[u8]) -> bool {
+    matches!(
+        op,
+        b"=" | b"<"
+            | b">"
+            | b"~"
+            | b"->"
+            | b"<="
+            | b">="
+            | b"!="
+            | b"=="
+            | b"<>"
+            | b"~~"
+            | b"~*"
+            | b"!~"
+            | b"~~*"
+            | b"~~~"
+            | b"!~~"
+            | b"!~*"
+            | b"!~~*"
+    )
+}
 
 pub struct Matcher<'a> {
     src: &'a [u8],
@@ -28,6 +74,9 @@ pub struct Matcher<'a> {
     /// Each match token's keyword categories, computed once: identifier and
     /// keyword rules ask about the same token many times during backtracking.
     keywords: Vec<Keyword>,
+    /// Each match token as a FIRST set sees it: its kind as a `FIRST_*` bit,
+    /// and which grammar literal its text is, if any.
+    starts: Vec<(u8, u16)>,
     /// Packrat state for every `(rule, token position)` in the window
     /// `base..base + width`, at `rule * width + (token - base)`: [`UNSEEN`],
     /// [`ACTIVE`] (being matched; re-entering means left recursion),
@@ -42,6 +91,9 @@ pub struct Matcher<'a> {
     /// file took ~4 KB per token (1,000+ rules) and its subtree pool as much
     /// again, ~120 KB per line of typical SQL.
     memo: Vec<u32>,
+    /// The window slots written since the window opened, so the next
+    /// statement can reset those and nothing else.
+    touched: Vec<usize>,
     base: usize,
     width: usize,
     /// Entries outside the window (lookahead past a statement's `;`),
@@ -68,6 +120,12 @@ pub struct Matcher<'a> {
     /// Accept/reject callers (`parse_check`, the differential gate) do not
     /// need a tree, and building one costs roughly half the throughput.
     build_nodes: bool,
+    /// Set when [`Matcher::build`] could not follow the memo table (see
+    /// there); the caller then matches again the slow way.
+    build_failed: bool,
+    /// Match and build in one pass, copying subtrees through `pool`. The
+    /// fallback for a statement `build` gave up on.
+    one_pass: bool,
 }
 
 /// Recursion ceiling for `evaluate_rule`.
@@ -105,6 +163,50 @@ struct RawNode {
     size: u32,
 }
 
+// A FIRST set's flags (build.rs computes the sets and has the same bits).
+const FIRST_NULLABLE: u8 = 1;
+const FIRST_WORD: u8 = 1 << 1;
+const FIRST_QUOTED_IDENT: u8 = 1 << 2;
+const FIRST_STRING: u8 = 1 << 3;
+const FIRST_NUMBER: u8 = 1 << 4;
+const FIRST_OPERATOR: u8 = 1 << 5;
+const NO_LITERAL: u16 = u16::MAX;
+
+/// Which entry of `LITERALS` a token's text is, compared the way
+/// `Expr::Literal` compares: ASCII case folded, nothing else.
+fn literal_id(text: &[u8]) -> u16 {
+    let mut buf = [0u8; 32];
+    if text.len() > buf.len() {
+        return NO_LITERAL; // longer than any grammar literal
+    }
+    let lower = &mut buf[..text.len()];
+    lower.copy_from_slice(text);
+    lower.make_ascii_lowercase();
+    LITERALS
+        .binary_search_by(|l| l.as_bytes().cmp(lower))
+        .map_or(NO_LITERAL, |i| i as u16)
+}
+
+/// Largest memo table kept for the next parse on the thread: 64 MB.
+const SPARE_MEMO_LIMIT: usize = 1 << 24;
+
+thread_local! {
+    /// A memo table with every slot [`UNSEEN`], left by the last matcher.
+    static SPARE_MEMO: std::cell::Cell<Vec<u32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+impl Drop for Matcher<'_> {
+    fn drop(&mut self) {
+        if self.memo.len() > SPARE_MEMO_LIMIT {
+            return;
+        }
+        for &i in &self.touched {
+            self.memo[i] = UNSEEN;
+        }
+        SPARE_MEMO.with(|m| m.set(std::mem::take(&mut self.memo)));
+    }
+}
+
 impl<'a> Matcher<'a> {
     fn new(src: &'a str, tokens: &[Token], build_nodes: bool) -> Self {
         let match_tokens: Vec<(Token, usize)> = tokens
@@ -126,12 +228,31 @@ impl<'a> Matcher<'a> {
                 }
             })
             .collect();
+        let starts = match_tokens
+            .iter()
+            .map(|(t, _)| {
+                let class = match t.kind {
+                    TokenKind::Word => FIRST_WORD,
+                    TokenKind::QuotedIdent => FIRST_QUOTED_IDENT,
+                    TokenKind::String => FIRST_STRING,
+                    TokenKind::Number => FIRST_NUMBER,
+                    TokenKind::Operator => FIRST_OPERATOR,
+                    _ => 0,
+                };
+                (class, literal_id(t.span.slice(src.as_bytes())))
+            })
+            .collect();
         let match_tokens_len = match_tokens.len();
         Matcher {
             src: src.as_bytes(),
             match_tokens,
             keywords,
-            memo: Vec::new(),
+            starts,
+            // The last parse on this thread left its table behind, all
+            // slots unseen again: a file of one query would otherwise zero
+            // a table of its own.
+            memo: SPARE_MEMO.with(|m| m.take()),
+            touched: Vec::new(),
             base: 0,
             width: 0,
             overflow: HashMap::new(),
@@ -146,6 +267,8 @@ impl<'a> Matcher<'a> {
             nodes: Vec::new(),
             depth: 0,
             build_nodes,
+            build_failed: false,
+            one_pass: false,
         }
     }
 
@@ -159,11 +282,23 @@ impl<'a> Matcher<'a> {
             .map_or(self.match_tokens.len(), |i| at + i + 1);
         self.base = at;
         self.width = end - at + 1;
-        // A fresh zeroed table, not a cleared one: the allocator hands out
-        // zeroed pages lazily, so only the slots this statement touches
-        // cost anything. Clearing and resizing would write every byte -- a
-        // file with no `;` is one window over the whole file.
-        self.memo = vec![UNSEEN; RULES.len() * self.width];
+        let needed = RULES.len() * self.width;
+        if needed > self.memo.len() {
+            // A fresh zeroed table, not a resized one: the allocator hands
+            // out zeroed pages lazily, so only the slots this statement
+            // touches cost anything -- a file with no `;` is one window
+            // over the whole file.
+            self.memo = vec![UNSEEN; needed];
+        } else {
+            // The table is reused: a statement writes a few slots per token
+            // out of a thousand, so undoing those is far cheaper than
+            // zeroing a table per statement, which was an eighth of the
+            // time to lint a file of ordinary queries.
+            for &i in &self.touched {
+                self.memo[i] = UNSEEN;
+            }
+        }
+        self.touched.clear();
         self.overflow.clear();
         self.hits.clear();
         self.pool.clear();
@@ -217,6 +352,9 @@ impl<'a> Matcher<'a> {
         if self.depth >= MAX_DEPTH {
             return None;
         }
+        if let Slot::Window(i) = slot {
+            self.touched.push(i);
+        }
         self.memo_set(slot, ACTIVE);
         self.depth += 1;
 
@@ -237,7 +375,7 @@ impl<'a> Matcher<'a> {
             RULE_NUMBER_LITERAL => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
-                    if t.kind == TokenKind::Number {
+                    if t.kind == TokenKind::Number && well_formed_number(t.span.slice(self.src)) {
                         Some(token_idx + 1)
                     } else {
                         None
@@ -266,23 +404,35 @@ impl<'a> Matcher<'a> {
                 if token_idx == 0 || token_idx >= self.match_tokens.len() {
                     None
                 } else {
-                    let prev_end = self.match_tokens[token_idx - 1].0.span.end as usize;
+                    let prev = self.match_tokens[token_idx - 1].0.span;
                     let next_start = self.match_tokens[token_idx].0.span.start as usize;
-                    if self.src[prev_end..next_start].contains(&b'\n') {
+                    let gap = &self.src[prev.end as usize..next_start];
+                    // A continuation line is a plain single-quoted string
+                    // (no `E`/`X`/`B` prefix) after a newline, with no block
+                    // comment in between, and a dollar-quoted string is
+                    // never continued.
+                    if gap.contains(&b'\n')
+                        && !gap.windows(2).any(|w| w == b"/*")
+                        && self.src[next_start] == b'\''
+                        && self.src[prev.end as usize - 1] == b'\''
+                    {
                         Some(token_idx) // zero-width
                     } else {
                         None
                     }
                 }
             }
-            RULE_OPERATOR_LITERAL => {
+            // `OperatorMatcher` in DuckDB: any operator token. The generic
+            // form leaves out the operators that have a precedence level of
+            // their own in the grammar (comparisons, `->`, the LIKE family),
+            // so `a = b` is a comparison and never a custom operator.
+            RULE_OPERATOR_LITERAL | RULE_ANY_OPERATOR_LITERAL => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
+                    let text = t.span.slice(self.src);
                     if t.kind == TokenKind::Operator
-                        && t.span
-                            .slice(self.src)
-                            .iter()
-                            .all(|&b| OPRUN.contains(&(b as char)))
+                        && text.iter().all(|&b| OPRUN.contains(&(b as char)))
+                        && (rule_id == RULE_ANY_OPERATOR_LITERAL || !has_special_precedence(text))
                     {
                         Some(token_idx + 1)
                     } else {
@@ -303,6 +453,7 @@ impl<'a> Matcher<'a> {
             | RULE_UNRESERVED_KEYWORD
             | RULE_COLUMN_NAME_KEYWORD
             | RULE_FUNC_NAME_KEYWORD
+            | RULE_BARE_LABEL_KEYWORD
             | RULE_TYPE_NAME_KEYWORD => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
@@ -313,6 +464,7 @@ impl<'a> Matcher<'a> {
                             RULE_UNRESERVED_KEYWORD => kw.has(Keyword::UNRESERVED),
                             RULE_COLUMN_NAME_KEYWORD => kw.has(Keyword::COLUMN_NAME),
                             RULE_FUNC_NAME_KEYWORD => kw.has(Keyword::FUNC_NAME),
+                            RULE_BARE_LABEL_KEYWORD => kw.has(Keyword::BARE_LABEL),
                             _ => kw.has(Keyword::TYPE_NAME),
                         };
                         if is_match { Some(token_idx + 1) } else { None }
@@ -380,12 +532,151 @@ impl<'a> Matcher<'a> {
         res
     }
 
+    /// Emit the nodes of `expr_id` matched at `token_idx`, and return where
+    /// the match ends. Only called for a match the memo table already
+    /// holds: every rule under it was matched while the statement was
+    /// recognised, so each rule is entered once and no alternative is tried
+    /// for longer than a table lookup per rule it names. Nothing is copied.
+    ///
+    /// (Building nodes while matching has to keep each rule's subtree so a
+    /// later memo hit can replay it. A value nested `d` deep is re-entered
+    /// at every precedence level on the way down, and its subtree was copied
+    /// each time: 400 nested parentheses took 460 ms, and one long statement
+    /// held gigabytes of copies.)
+    fn build(&mut self, expr_id: ExprId, token_idx: usize) -> usize {
+        let expr = &EXPRESSIONS[expr_id.0 as usize];
+        match expr {
+            Expr::Literal(_) | Expr::Identifier(_) => token_idx + 1,
+            Expr::Rule(rule_id) => self.build_rule(*rule_id, token_idx),
+            Expr::Seq(items) => {
+                let mut curr = token_idx;
+                for &item in *items {
+                    curr = self.build(item, curr);
+                }
+                curr
+            }
+            Expr::Choice(items) => {
+                for &item in *items {
+                    if self.evaluate(item, token_idx).is_some() {
+                        return self.build(item, token_idx);
+                    }
+                }
+                self.build_failed = true;
+                token_idx
+            }
+            Expr::Optional(item) => {
+                if self.evaluate(*item, token_idx).is_some() {
+                    self.build(*item, token_idx)
+                } else {
+                    token_idx
+                }
+            }
+            Expr::ZeroOrMore(item) | Expr::OneOrMore(item) => {
+                let mut curr = token_idx;
+                if matches!(expr, Expr::OneOrMore(_)) {
+                    curr = self.build(*item, curr);
+                }
+                while curr < self.match_tokens.len() {
+                    match self.evaluate(*item, curr) {
+                        // A zero-width repetition ends the loop and leaves
+                        // no nodes, as in `evaluate`.
+                        Some(next) if next != curr => {
+                            self.build(*item, curr);
+                            curr = next;
+                        }
+                        _ => break,
+                    }
+                }
+                curr
+            }
+            Expr::Not(_) | Expr::And(_) | Expr::EndOfInput => token_idx,
+        }
+    }
+
+    fn build_rule(&mut self, rule_id: RuleId, token_idx: usize) -> usize {
+        let slot = self.slot(rule_id, token_idx);
+        let hit = self.memo_get(slot);
+        if hit < HIT_BASE {
+            self.build_failed = true;
+            return token_idx;
+        }
+        let end_idx = self.hits[(hit - HIT_BASE) as usize].0;
+        let body_start = self.nodes.len();
+        let native = matches!(
+            rule_id,
+            RULE_STRING_LITERAL
+                | RULE_NUMBER_LITERAL
+                | RULE_NEWLINE_BEFORE
+                | RULE_OPERATOR_LITERAL
+                | RULE_ANY_OPERATOR_LITERAL
+                | RULE_END_OF_INPUT
+                | RULE_RESERVED_KEYWORD
+                | RULE_UNRESERVED_KEYWORD
+                | RULE_COLUMN_NAME_KEYWORD
+                | RULE_FUNC_NAME_KEYWORD
+                | RULE_BARE_LABEL_KEYWORD
+                | RULE_TYPE_NAME_KEYWORD
+        );
+        if !native {
+            // While the rule's own body is walked the rule is active, as it
+            // was when the body was matched: a re-entry at this position
+            // fails, which is how left recursion is refused.
+            self.memo_set(slot, ACTIVE);
+            let end = self.build(RULES[rule_id.0 as usize].expr, token_idx);
+            self.memo_set(slot, hit);
+            if end != end_idx {
+                // The walk disagrees with the table. Not seen on any
+                // corpus; the caller starts over in one pass.
+                self.build_failed = true;
+            }
+        }
+        let start_byte = if token_idx < self.match_tokens.len() {
+            self.match_tokens[token_idx].0.span.start
+        } else if !self.match_tokens.is_empty() {
+            self.match_tokens.last().unwrap().0.span.end
+        } else {
+            0
+        };
+        let end_byte = if end_idx > token_idx && end_idx <= self.match_tokens.len() {
+            self.match_tokens[end_idx - 1].0.span.end
+        } else {
+            start_byte
+        };
+        let size = (self.nodes.len() - body_start) as u32;
+        self.nodes.push(RawNode {
+            rule: rule_id,
+            span: Span::new(start_byte, end_byte),
+            size,
+        });
+        end_idx
+    }
+
     fn record_hit(&mut self, slot: Slot, end: usize, offset: usize, len: usize) {
         self.memo_set(slot, HIT_BASE + self.hits.len() as u32);
         self.hits.push((end, offset as u32, len as u32));
     }
 
+    /// Can a match of `expr_id` begin at `token_idx`? `false` is certain;
+    /// `true` means it has to be tried.
+    #[inline]
+    fn can_start(&self, expr_id: ExprId, token_idx: usize) -> bool {
+        let set = FIRST_OF[expr_id.0 as usize] as usize;
+        let flags = FIRST_FLAGS[set];
+        if flags & FIRST_NULLABLE != 0 {
+            return true;
+        }
+        let Some(&(class, literal)) = self.starts.get(token_idx) else {
+            return false; // end of input, and the expression needs a token
+        };
+        flags & class != 0
+            || (literal != NO_LITERAL
+                && FIRST_LITERALS[set][literal as usize >> 6] >> (literal & 63) & 1 != 0)
+    }
+
     fn evaluate(&mut self, expr_id: ExprId, token_idx: usize) -> Option<usize> {
+        if !self.can_start(expr_id, token_idx) {
+            return None;
+        }
         let expr = &EXPRESSIONS[expr_id.0 as usize];
         match expr {
             Expr::Literal(lit) => {
@@ -416,7 +707,8 @@ impl<'a> Matcher<'a> {
             Expr::Identifier(category) => {
                 if token_idx < self.match_tokens.len() {
                     let t = self.match_tokens[token_idx].0;
-                    if t.kind == TokenKind::QuotedIdent {
+                    // `""` is a zero-length delimited identifier: an error.
+                    if t.kind == TokenKind::QuotedIdent && t.span.end - t.span.start > 2 {
                         let next = token_idx + 1;
                         if next > self.far {
                             self.far = next;
@@ -471,6 +763,28 @@ impl<'a> Matcher<'a> {
                 while curr < self.match_tokens.len() {
                     if top {
                         self.start_statement(curr);
+                        if self.build_nodes && !self.one_pass {
+                            // Two passes over one statement: match it
+                            // without nodes, which fills the memo table,
+                            // then walk the match once to emit its nodes.
+                            self.build_nodes = false;
+                            let matched = self.evaluate(*item, curr);
+                            let next = match matched {
+                                Some(next) if next != curr => {
+                                    self.build(*item, curr);
+                                    Some(next)
+                                }
+                                _ => None,
+                            };
+                            self.build_nodes = true;
+                            match next {
+                                Some(next) => {
+                                    curr = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
                     }
                     let start_nodes = self.nodes.len();
                     if let Some(next) = self.evaluate(*item, curr) {
@@ -536,7 +850,12 @@ pub fn parse(src: &str) -> Option<Tree> {
     let tokens = tokenize(src);
     let mut matcher = Matcher::new(src, &tokens, true);
 
-    let end_idx = matcher.evaluate_rule(RULE_PROGRAM, 0)?;
+    let mut end_idx = matcher.evaluate_rule(RULE_PROGRAM, 0)?;
+    if matcher.build_failed {
+        matcher = Matcher::new(src, &tokens, true);
+        matcher.one_pass = true;
+        end_idx = matcher.evaluate_rule(RULE_PROGRAM, 0)?;
+    }
     if end_idx != matcher.match_tokens.len() || matcher.nodes.is_empty() {
         return None;
     }

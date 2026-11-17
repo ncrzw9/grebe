@@ -3,7 +3,7 @@
 //! `build.rs` reads `vendor/grammar/**` and emits static tables that this module
 //! re-exports. No `.gram` text is read at runtime.
 //!
-//! # Meta-syntax of the `.gram` files (snapshot `ce512b8`)
+//! # Meta-syntax of the `.gram` files (v2.0.0, `d54cbbe`)
 //!
 //! Small enough to state completely:
 //!
@@ -32,7 +32,7 @@
 //! # Invariants `build.rs` enforces at compile time
 //!
 //! DuckDB's own `scripts/parser/inline_grammar.py` validates the same set, and
-//! builds the vendored grammar (1,071 rules + 2 macros) with zero errors. Each
+//! builds the vendored grammar (1,123 rules + 2 macros) with zero errors. Each
 //! is a hard build failure here:
 //!
 //! - no duplicate rule or macro names
