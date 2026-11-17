@@ -118,6 +118,14 @@ fn select_clause_of(tree: &Tree, simple_select: NodeId) -> Option<NodeId> {
 /// regenerated from a DuckDB build.
 static AGGREGATES: &str = include_str!("../vendor/aggregates.list");
 
+/// The vendored aggregate names, lowercase, for completion.
+pub fn aggregate_names() -> impl Iterator<Item = &'static str> {
+    AGGREGATES
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
 fn is_aggregate(lowercase_name: &str) -> bool {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     let set = SET.get_or_init(|| {

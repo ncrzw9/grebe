@@ -255,12 +255,13 @@ live("checkCli: a broken ~/.duckdbrc is reported by --version already", async ()
   try {
     const r = await checkCli(CLI);
     assert.equal(r.text, null);
-    assert.match(r.error, /Parser Error: syntax error at or near "SELEC"/);
+    // 1.5 points at the misspelt word, 2.0's parser at the token after it.
+    assert.match(r.error, /Parser Error: syntax error at or near "(SELEC|1)"/);
     assert.match(r.error, /Encountered errors while executing init file/);
     assert.doesNotMatch(r.error, /Loading resources|\x1b\[/);
     // The session's start fails the same way, in the same words.
     const s = new Session({ cli: CLI, database: ":memory:", cwd: home });
-    await assert.rejects(s.start(), (e) => /^Parser Error: syntax error at or near "SELEC"/.test(e.message));
+    await assert.rejects(s.start(), (e) => /^Parser Error: syntax error at or near "(SELEC|1)"/.test(e.message));
     s.dispose();
   } finally {
     process.env.HOME = prevHome;

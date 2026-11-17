@@ -397,3 +397,246 @@ fn a_file_that_is_not_utf8_fails_the_run() {
         assert!(stderr(&out).contains("bad.sql"), "{}", stderr(&out));
     }
 }
+
+// ------------------------------------------------------------- catalog --
+
+const SHOP: &str = r#"[
+{"database":"shop","schema":"main","table":"orders","column":"id","type":"BIGINT"},
+{"database":"shop","schema":"main","table":"orders","column":"total","type":"DECIMAL(10,2)"}
+]"#;
+
+#[test]
+fn check_without_a_catalog_reports_no_cat_findings() {
+    let dir = TempDir::new("no-catalog");
+    dir.write("q.sql", "SELECT o.totl FROM ordrs o;\n");
+    let out = grebe(dir.path(), &["check", "q.sql"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn check_catalog_flag_reports_unknown_names_with_suggestions() {
+    let dir = TempDir::new("catalog-flag");
+    dir.write("catalog.json", SHOP);
+    dir.write(
+        "q.sql",
+        "SELECT o.totl FROM orders o;\nSELECT * FROM ordrs;\nSELECT * FROM nothing_like_it;\n",
+    );
+    let out = grebe(dir.path(), &["check", "--catalog", "catalog.json", "q.sql"]);
+    // Warnings: reported, and not a failing exit code.
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "q.sql:1:10: CAT002 unknown-column (did you mean total?)\n\
+         q.sql:2:15: CAT001 unknown-table (did you mean orders?)\n\
+         q.sql:3:15: CAT001 unknown-table\n"
+    );
+
+    // --fix never applies a suggestion, with or without --unsafe.
+    let out = grebe(
+        dir.path(),
+        &[
+            "check",
+            "--catalog=catalog.json",
+            "--fix",
+            "--unsafe",
+            "q.sql",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(dir.read("q.sql").contains("ordrs"));
+
+    // --json carries the suggestion as a field of its own.
+    let out = grebe(
+        dir.path(),
+        &["check", "--catalog", "catalog.json", "--json", "q.sql"],
+    );
+    let doc = grebe_lsp::json::parse(&stdout(&out)).expect("valid JSON");
+    let findings = doc.get("findings").and_then(|f| f.as_array()).unwrap();
+    assert_eq!(findings.len(), 3);
+    assert_eq!(
+        findings[0].get("suggestion").and_then(|s| s.as_str()),
+        Some("total")
+    );
+    assert!(findings[2].get("suggestion").is_none());
+}
+
+#[test]
+fn check_reads_the_catalog_a_config_names_and_the_flag_wins() {
+    let dir = TempDir::new("catalog-config");
+    dir.write("grebe.toml", "catalog = \"snap/catalog.json\"\n");
+    std::fs::create_dir(dir.path().join("snap")).unwrap();
+    dir.write("snap/catalog.json", SHOP);
+    dir.write("other.json", "[]");
+    dir.write("q.sql", "SELECT * FROM orders;\nSELECT * FROM ordrs;\n");
+    let out = grebe(dir.path(), &["check", "q.sql"]);
+    assert_eq!(
+        stdout(&out),
+        "q.sql:2:15: CAT001 unknown-table (did you mean orders?)\n"
+    );
+    // An empty catalog has no `orders` either.
+    let out = grebe(dir.path(), &["check", "--catalog", "other.json", "q.sql"]);
+    assert_eq!(stdout(&out).lines().count(), 2, "{}", stdout(&out));
+    // --no-config: no catalog, no CAT.
+    let out = grebe(dir.path(), &["check", "--no-config", "q.sql"]);
+    assert_eq!(stdout(&out), "");
+    // Severity is configurable like any rule's.
+    dir.write(
+        "grebe.toml",
+        "catalog = \"snap/catalog.json\"\n[severity]\nCAT001 = \"error\"\n",
+    );
+    let out = grebe(dir.path(), &["check", "q.sql"]);
+    assert_eq!(out.status.code(), Some(1));
+    dir.write(
+        "grebe.toml",
+        "catalog = \"snap/catalog.json\"\n[severity]\nCAT001 = \"off\"\n",
+    );
+    let out = grebe(dir.path(), &["check", "q.sql"]);
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), ""));
+}
+
+#[test]
+fn a_catalog_that_cannot_be_read_is_a_usage_error() {
+    let dir = TempDir::new("catalog-bad");
+    dir.write("q.sql", "SELECT 1;\n");
+    let out = grebe(dir.path(), &["check", "--catalog", "missing.json", "q.sql"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("could not read catalog missing.json"),
+        "{}",
+        stderr(&out)
+    );
+    dir.write("bad.json", "{\"tables\": []}");
+    let out = grebe(dir.path(), &["check", "--catalog", "bad.json", "q.sql"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("is not a catalog snapshot"),
+        "{}",
+        stderr(&out)
+    );
+    let out = grebe(dir.path(), &["check", "--catalog"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn rules_lists_the_cat_rules() {
+    let dir = TempDir::new("rules-cat");
+    let out = grebe(dir.path(), &["rules"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("CAT001") && text.contains("unknown-table"),
+        "{text}"
+    );
+    assert!(
+        text.contains("CAT002") && text.contains("unknown-column"),
+        "{text}"
+    );
+}
+
+/// `grebe catalog` runs the duckdb it is pointed at, read-only, without the
+/// user's rc file, asking for JSON with agent mode off, and passes the
+/// snapshot through. A stand-in script plays duckdb so the test needs no
+/// engine; with `DUCKDB_CLI` set, a second test below runs the real one.
+#[cfg(unix)]
+#[test]
+fn catalog_runs_the_given_duckdb_and_prints_its_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("catalog-cmd");
+    dir.write("shop.duckdb", "");
+    let fake = dir.write(
+        "duckdb",
+        "#!/bin/sh\n\
+         echo \"$DUCKDB_AGENT_MODE|$1|$2|$3|$4|$5\" > args.txt\n\
+         printf '%s' \"$6\" > query.txt\n\
+         cat snapshot.json\n",
+    );
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir.write("snapshot.json", SHOP);
+    let out = grebe(
+        dir.path(),
+        &["catalog", "--duckdb", "./duckdb", "shop.duckdb"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), SHOP);
+    assert_eq!(stderr(&out).trim(), "1 table(s) and view(s), 2 column(s)");
+    assert_eq!(
+        dir.read("args.txt").trim(),
+        "0|-no-init|-readonly|shop.duckdb|-json|-c"
+    );
+    assert!(
+        dir.read("query.txt")
+            .contains("FROM duckdb_columns() WHERE NOT internal")
+    );
+
+    // What it prints is not a snapshot: say so, exit 2, print nothing.
+    dir.write("snapshot.json", "duckdb agent mode on\n| a |\n");
+    let out = grebe(
+        dir.path(),
+        &["catalog", "--duckdb", "./duckdb", "shop.duckdb"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains("did not print a snapshot"),
+        "{}",
+        stderr(&out)
+    );
+
+    // No such database, no such duckdb, bad flags.
+    let out = grebe(
+        dir.path(),
+        &["catalog", "--duckdb", "./duckdb", "nope.duckdb"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let out = grebe(
+        dir.path(),
+        &["catalog", "--duckdb", "./no-such-duckdb", "shop.duckdb"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("could not run"), "{}", stderr(&out));
+    let out = grebe(dir.path(), &["catalog", "--what"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = grebe(dir.path(), &["catalog", "--help"]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The same against a real DuckDB CLI, when one is given (`DUCKDB_CLI`, as
+/// the VS Code extension's tests take it): the snapshot of a real database
+/// is one `grebe check --catalog` reads.
+#[test]
+fn catalog_snapshot_of_a_real_database_round_trips() {
+    let Some(cli) = std::env::var_os("DUCKDB_CLI") else {
+        return;
+    };
+    let cli = cli.to_string_lossy().to_string();
+    let dir = TempDir::new("catalog-real");
+    let made = Command::new(&cli)
+        .current_dir(dir.path())
+        .env("DUCKDB_AGENT_MODE", "0")
+        .args([
+            "-no-init",
+            "shop.duckdb",
+            "-c",
+            "CREATE TABLE orders (id BIGINT, \"Order Date\" DATE); CREATE VIEW recent AS SELECT id FROM orders;",
+        ])
+        .output()
+        .expect("run duckdb");
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let out = grebe(dir.path(), &["catalog", "--duckdb", &cli, "shop.duckdb"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), "2 table(s) and view(s), 3 column(s)");
+    dir.write("catalog.json", &stdout(&out));
+    dir.write(
+        "q.sql",
+        "SELECT o.\"Order Date\", o.id, r.id FROM orders o, recent r;\nSELECT o.\"Order Dat\" FROM orders o;\n",
+    );
+    let out = grebe(dir.path(), &["check", "--catalog", "catalog.json", "q.sql"]);
+    assert_eq!(
+        stdout(&out),
+        "q.sql:2:10: CAT002 unknown-column (did you mean \"Order Date\"?)\n"
+    );
+}

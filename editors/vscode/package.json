@@ -86,6 +86,11 @@
         "category": "grebe"
       },
       {
+        "command": "grebe.duckdb.resetWorkspaceDatabase",
+        "title": "Delete Workspace Database",
+        "category": "grebe"
+      },
+      {
         "command": "grebe.duckdb.runRange",
         "title": "Run This Statement with DuckDB",
         "category": "grebe"
@@ -175,6 +180,12 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "grebe.catalog.forget",
+        "title": "Forget",
+        "category": "grebe: Catalog",
+        "icon": "$(close)"
+      },
+      {
         "command": "grebe.catalog.browseFile",
         "title": "Browse DuckDB File…",
         "category": "grebe: Catalog",
@@ -235,7 +246,17 @@
         "grebe.duckdb.database": {
           "type": "string",
           "default": ":memory:",
-          "description": "Database to run SQL against: `:memory:` or a file path (relative paths resolve against the workspace folder). One session stays open, so TEMP tables and SET options persist between runs until the session restarts."
+          "description": "Database to run SQL against: `:memory:`, `:workspace:` or a file path (relative paths resolve against the workspace folder). `:workspace:` is a database file kept in the editor's own storage for this workspace: tables survive a window reload, a restart or a crash, and nothing is added to your project. One session stays open and every file runs in it, so TEMP tables and SET options persist between runs until the session restarts. A file whose leading comment says `-- grebe: session NAME` runs in a separate session of that name."
+        },
+        "grebe.duckdb.reattach": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a session starts, attach again the databases it had attached when it was last used (from the Catalog or by an ATTACH in your SQL). Passwords are never kept: a server that needs one asks again."
+        },
+        "grebe.duckdb.catalogInEditor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Give the language server the tables and columns of the running session, so the editor completes their names and marks a table or column the session does not have. Off: completion and linting use the SQL text alone."
         },
         "grebe.duckdb.maxRows": {
           "type": "integer",
@@ -348,6 +369,10 @@
         },
         {
           "command": "grebe.catalog.detach",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.forget",
           "when": "false"
         }
       ],
@@ -464,6 +489,16 @@
         {
           "command": "grebe.catalog.detach",
           "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
+          "group": "1_view@1"
+        },
+        {
+          "command": "grebe.catalog.forget",
+          "when": "view == grebe.catalog && viewItem == grebe.lostDb",
+          "group": "inline"
+        },
+        {
+          "command": "grebe.catalog.forget",
+          "when": "view == grebe.catalog && viewItem == grebe.lostDb",
           "group": "1_view@1"
         }
       ]
