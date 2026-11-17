@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the v (e.g. 0.4.2)"
+        description: "Version to release, without the v (e.g. 0.4.2, or 1.0.0-rc.1 for a release candidate)"
         required: true
 
 permissions:
@@ -41,6 +41,7 @@ jobs:
           --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component rustfmt,clippy && rustup default ${{ env.RUST_VERSION }}
@@ -56,7 +57,33 @@ jobs:
             | jq -r '.packages[] | select(.name == "grebe") | .version')
           vscode_version=$(jq -r .version editors/vscode/package.json)
           echo "tag=$tag cargo=$cargo_version vscode=$vscode_version"
-          [ "$version" = "$cargo_version" ] && [ "$version" = "$vscode_version" ]
+          [ "$version" = "$cargo_version" ]
+          # A release candidate (v1.0.0-rc.1) is a pre-release everywhere:
+          # flagged so on GitHub, a semver pre-release on crates.io, and on
+          # the extension marketplaces' pre-release channel. The Marketplace
+          # takes no -rc suffix and no version twice, so the extension's
+          # candidate carries a plain number of its own, below the release
+          # it leads to (0.99.1 for 1.0.0-rc.1), leaving 1.0.0 free.
+          case "$version" in
+            *-*)
+              prerelease=true
+              base="${version%%-*}"
+              if ! echo "$vscode_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "::error::package.json version $vscode_version must be plain x.y.z for a pre-release" >&2
+                exit 1
+              fi
+              lowest=$(printf '%s\n%s\n' "$vscode_version" "$base" | sort -V | head -1)
+              if [ "$vscode_version" = "$base" ] || [ "$lowest" != "$vscode_version" ]; then
+                echo "::error::package.json version $vscode_version must be below $base for the pre-release $version" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              prerelease=false
+              [ "$version" = "$vscode_version" ]
+              ;;
+          esac
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           if [ -n "$INPUT_VERSION" ] && git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
             echo "::error::$tag already exists" >&2
             exit 1
@@ -215,6 +242,10 @@ jobs:
       # One .vsix per platform with that platform's grebe inside, plus a
       # universal one without a binary for every other platform.
       - name: Package the VS Code extension
+        env:
+          # Packaged as a pre-release when the tag is one: the flag is part
+          # of the .vsix, and the marketplaces read it from there.
+          GREBE_PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           set -euo pipefail
           node editors/vscode/build-grammar.js
@@ -231,9 +262,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.verify.outputs.tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" out/* --verify-tag --title "$TAG" --generate-notes
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" out/* --verify-tag --title "$TAG" --generate-notes "${flags[@]}"
 
   # Publishing waits on the `release` environment, which requires a manual
   # approval: every tag builds and tests on its own, nothing reaches a
@@ -254,6 +288,10 @@ jobs:
       id-token: write
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      # --pre-release for a release candidate. vsce refuses the flag on a
+      # package that was not built as one, so a mix-up fails here instead of
+      # reaching everyone's editor.
+      VSCE_FLAGS: ${{ needs.verify.outputs.prerelease == 'true' && '--pre-release' || '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -285,11 +323,11 @@ jobs:
       # without a package, and the platform packages must not wait on it.
       - name: Publish the platform packages to the VS Code Marketplace
         if: ${{ env.VSCE_PAT != '' }}
-        run: npx --yes @vscode/vsce publish --skip-duplicate --packagePath dist/grebe-[a-z]*-*.vsix
+        run: npx --yes @vscode/vsce publish $VSCE_FLAGS --skip-duplicate --packagePath dist/grebe-[a-z]*-*.vsix
 
       - name: Publish the universal package to the VS Code Marketplace
         if: ${{ env.VSCE_PAT != '' }}
-        run: npx --yes @vscode/vsce publish --skip-duplicate --packagePath dist/grebe-[0-9]*.vsix
+        run: npx --yes @vscode/vsce publish $VSCE_FLAGS --skip-duplicate --packagePath dist/grebe-[0-9]*.vsix
 
       # ovsx trades this job's OIDC token (id-token: write above) for a
       # short-lived publishing token.
