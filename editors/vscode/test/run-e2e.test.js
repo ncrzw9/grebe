@@ -197,6 +197,7 @@ function makeVscode(config) {
         shown.commands.set(name, fn);
         return disposable;
       },
+      registered: (name) => shown.commands.get(name),
     },
   };
   return { vscode, shown };
@@ -1353,6 +1354,11 @@ async function startRunner(t, config, context = {}) {
   return { vscode, shown, runner, client, open, run: (doc) => runFileOf(vscode, shown, doc) };
 }
 
+// Bring `doc` to the front, as clicking its tab does.
+function shownEditor(vscode, doc) {
+  vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+}
+
 // workspaceState, as VS Code keeps it: values survive the "window".
 function fakeState(values = new Map()) {
   return { values, get: (k, d) => (values.has(k) ? values.get(k) : d), update: async (k, v) => void values.set(k, v) };
@@ -1469,4 +1475,63 @@ live("the workspace database keeps tables across sessions; attachments come back
     assert.equal(fs.existsSync(path.join(storage, "ws", "session.duckdb")), false);
     assert.equal((await run(read))[0].kind, "error", "kept is gone");
   }
+});
+
+live("the language server is told what each session holds, once per change", async (t) => {
+  const { vscode, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const { CatalogSync } = require("../catalogSync");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const sentTo = [];
+  const sync = new CatalogSync({
+    clientReady: async () => ({ sendNotification: (method, params) => sentTo.push([method, params]) }),
+    liveSessions: runner.liveSessions,
+    sessionNameOf: runner.sessionNameOf,
+  });
+  const shared = open(path.join(dir, "shared.sql"), "CREATE TABLE orders (id INTEGER, total DECIMAL(10,2));\nCREATE MACRO twice(x) AS x * 2;");
+  const own = open(path.join(dir, "own.sql"), "-- grebe: session scratch\nCREATE VIEW v AS SELECT 1 AS one;");
+  vscode.workspace.textDocuments = [shared, own];
+
+  // Nothing is running: nothing to say, and nothing claimed.
+  await sync.sync();
+  assert.deepEqual(sentTo, [["grebe/catalog", { columns: null }], ["grebe/catalog", { uri: own.uri.toString(), columns: null }]]);
+  sentTo.length = 0;
+
+  await run(shared);
+  await sync.sync();
+  assert.equal(sentTo.length, 1, JSON.stringify(sentTo));
+  assert.deepEqual(sentTo[0][1].columns, [
+    { database: "memory", schema: "main", table: "orders", column: "id", type: "INTEGER" },
+    { database: "memory", schema: "main", table: "orders", column: "total", type: "DECIMAL(10,2)" },
+  ]);
+  assert.deepEqual(sentTo[0][1].functions, [{ name: "twice", kind: "macro" }]);
+  assert.equal("uri" in sentTo[0][1], false, "the shared session is every file's default");
+
+  // Unchanged: not sent again.
+  await sync.sync();
+  assert.equal(sentTo.length, 1);
+
+  // The file with a session of its own gets that session's tables, by uri.
+  await run(own);
+  await sync.sync();
+  assert.equal(sentTo.length, 2, JSON.stringify(sentTo.slice(1)));
+  assert.equal(sentTo[1][1].uri, own.uri.toString());
+  assert.deepEqual(sentTo[1][1].columns.map((c) => `${c.table}.${c.column}`), ["v.one"]);
+
+  // Its session ends: it has no catalog, rather than the shared one.
+  shownEditor(vscode, own);
+  await vscode.commands.registered("grebe.duckdb.restart")();
+  await sync.sync();
+  assert.deepEqual(sentTo[2], ["grebe/catalog", { uri: own.uri.toString(), columns: null }]);
+
+  // The comment is taken out: the file uses the default again.
+  const plain = fakeDocument(own.uri.fsPath, "CREATE VIEW v AS SELECT 1 AS one;");
+  vscode.workspace.textDocuments = [shared, plain];
+  await sync.sync();
+  assert.deepEqual(sentTo[3], ["grebe/catalog", { uri: own.uri.toString(), default: true }]);
+
+  // Turned off in settings: the server is told there is no catalog.
+  vscode.workspace.getConfiguration = () => ({ get: (k, d) => (k === "catalogInEditor" ? false : k === "path" ? CLI : d) });
+  await sync.sync();
+  assert.deepEqual(sentTo[4], ["grebe/catalog", { columns: null }]);
+  assert.equal(sentTo.length, 5);
 });
