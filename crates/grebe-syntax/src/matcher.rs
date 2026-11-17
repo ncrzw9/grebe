@@ -88,6 +88,9 @@ pub struct Matcher<'a> {
     /// file took ~4 KB per token (1,000+ rules) and its subtree pool as much
     /// again, ~120 KB per line of typical SQL.
     memo: Vec<u32>,
+    /// The window slots written since the window opened, so the next
+    /// statement can reset those and nothing else.
+    touched: Vec<usize>,
     base: usize,
     width: usize,
     /// Entries outside the window (lookahead past a statement's `;`),
@@ -157,6 +160,26 @@ struct RawNode {
     size: u32,
 }
 
+/// Largest memo table kept for the next parse on the thread: 64 MB.
+const SPARE_MEMO_LIMIT: usize = 1 << 24;
+
+thread_local! {
+    /// A memo table with every slot [`UNSEEN`], left by the last matcher.
+    static SPARE_MEMO: std::cell::Cell<Vec<u32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+impl Drop for Matcher<'_> {
+    fn drop(&mut self) {
+        if self.memo.len() > SPARE_MEMO_LIMIT {
+            return;
+        }
+        for &i in &self.touched {
+            self.memo[i] = UNSEEN;
+        }
+        SPARE_MEMO.with(|m| m.set(std::mem::take(&mut self.memo)));
+    }
+}
+
 impl<'a> Matcher<'a> {
     fn new(src: &'a str, tokens: &[Token], build_nodes: bool) -> Self {
         let match_tokens: Vec<(Token, usize)> = tokens
@@ -183,7 +206,11 @@ impl<'a> Matcher<'a> {
             src: src.as_bytes(),
             match_tokens,
             keywords,
-            memo: Vec::new(),
+            // The last parse on this thread left its table behind, all
+            // slots unseen again: a file of one query would otherwise zero
+            // a table of its own.
+            memo: SPARE_MEMO.with(|m| m.take()),
+            touched: Vec::new(),
             base: 0,
             width: 0,
             overflow: HashMap::new(),
@@ -213,11 +240,23 @@ impl<'a> Matcher<'a> {
             .map_or(self.match_tokens.len(), |i| at + i + 1);
         self.base = at;
         self.width = end - at + 1;
-        // A fresh zeroed table, not a cleared one: the allocator hands out
-        // zeroed pages lazily, so only the slots this statement touches
-        // cost anything. Clearing and resizing would write every byte -- a
-        // file with no `;` is one window over the whole file.
-        self.memo = vec![UNSEEN; RULES.len() * self.width];
+        let needed = RULES.len() * self.width;
+        if needed > self.memo.len() {
+            // A fresh zeroed table, not a resized one: the allocator hands
+            // out zeroed pages lazily, so only the slots this statement
+            // touches cost anything -- a file with no `;` is one window
+            // over the whole file.
+            self.memo = vec![UNSEEN; needed];
+        } else {
+            // The table is reused: a statement writes a few slots per token
+            // out of a thousand, so undoing those is far cheaper than
+            // zeroing a table per statement, which was an eighth of the
+            // time to lint a file of ordinary queries.
+            for &i in &self.touched {
+                self.memo[i] = UNSEEN;
+            }
+        }
+        self.touched.clear();
         self.overflow.clear();
         self.hits.clear();
         self.pool.clear();
@@ -270,6 +309,9 @@ impl<'a> Matcher<'a> {
         }
         if self.depth >= MAX_DEPTH {
             return None;
+        }
+        if let Slot::Window(i) = slot {
+            self.touched.push(i);
         }
         self.memo_set(slot, ACTIVE);
         self.depth += 1;
