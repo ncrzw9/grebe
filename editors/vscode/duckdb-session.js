@@ -68,8 +68,7 @@ const live = new Set();
 /**
  * The environment the CLI runs in. DuckDB 2.0 switches to an "agent mode"
  * (markdown tables, a start-up line on stderr, capped output) when it sees
- * an AI coding agent's variable -- CLAUDECODE, AI_AGENT and the like -- and
- * stdout is not a terminal. An editor started from such a terminal passes
+ * a coding agent's environment variable and stdout is not a terminal. An editor started from such a terminal passes
  * those on, and here stdout is always a pipe; DUCKDB_AGENT_MODE=0 keeps the
  * CLI answering as it does for a person. 1.5 ignores the variable.
  */
