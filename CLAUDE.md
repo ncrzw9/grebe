@@ -99,4 +99,10 @@ without the owner asking for it in so many words.
 - A release candidate is `X.Y.Z-rc.N` for the crates and the tag, and a
   plain number below `X.Y.Z` for the extension (`0.99.N` for `1.0.0-rc.N`).
   The release workflow does not reuse a tag: after a run that created the
-  tag and then failed, the next attempt takes the next number.
+  tag and then failed before the GitHub release existed, the next attempt
+  takes the next number.
+- If the GitHub release exists and only the publish job failed (a registry
+  refused or was down), do not take a new number and do not re-run the old
+  run. Run the Release workflow again with the same version and
+  `publish_only` ticked: it publishes what each registry does not have yet
+  and skips what it has.
