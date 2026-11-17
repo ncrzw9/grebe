@@ -193,7 +193,9 @@ class Sessions {
       } catch (e) {
         r = { kind: "error", type: "Session", message: String(e.message ?? e) };
       }
-      const error = r.kind === "error" ? `${r.type} Error: ${r.message}` : null;
+      // DuckDB repeats the connection string in its error, password and
+      // all: what is kept (and logged, and shown) has it taken out.
+      const error = r.kind === "error" ? conninfo.redact(`${r.type} Error: ${r.message}`) : null;
       out.push(error ? { ...rec, error } : { alias: rec.alias, path: rec.path, type: rec.type, readOnly: rec.readOnly });
       this.say(error ? `could not re-attach ${rec.alias}: ${error}` : `re-attached ${rec.alias} (${conninfo.where(rec.path)})`);
       if (this.deps.onReattach) this.deps.onReattach(name, rec, error);

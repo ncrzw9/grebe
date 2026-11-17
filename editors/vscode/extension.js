@@ -75,8 +75,8 @@ exports.activate = function activate(context) {
     liveSession: runner.liveSession,
     liveSessions: runner.liveSessions,
     sessionName: runner.currentSessionName,
-    remember: async () => {
-      await runner.rememberAttachments();
+    remember: async (name) => {
+      await runner.rememberAttachments(name);
       catalogFeed.schedule();
     },
     remembered: runner.rememberedAttachments,

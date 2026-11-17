@@ -509,3 +509,41 @@ interruptible("a cancelled export leaves nothing behind, and an existing file in
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("prosePlace: where DuckDB 2.0's drawn parser error points, as a byte offset", () => {
+  const { prosePlace } = require("../duckdb-session");
+  const at = (message, sql) => prosePlace(message, sql);
+  // One line.
+  assert.deepEqual(at('syntax error at or near "1"\n\nLINE 1: SELEC 1;\n              ^', "SELEC 1;"), {
+    position: 6,
+    message: 'syntax error at or near "1"',
+  });
+  // A later line, with its indentation; several carets.
+  assert.equal(at('syntax error at or near "t"\n\nLINE 2:   2 FRM t;\n                ^', "SELECT 1,\n  2 FRM t;").position, 18);
+  // Bytes, not characters: é is two.
+  assert.equal(at('syntax error at or near "FROM"\n\nLINE 1: SELECT \'é\', 3 +* FROM t\n                         ^^^^', "SELECT 'é', 3 +* FROM t").position, 18);
+  // A long line is cut on the left.
+  const long = `SELECT ${"1 + ".repeat(60)} FRM x y z`;
+  const shown = `... ${long.slice(-63)}`;
+  const caret = " ".repeat("LINE 1: ".length + shown.length - 3);
+  assert.equal(at(`syntax error at or near "y"\n\nLINE 1: ${shown}\n${caret}^`, long).position, long.length - 3);
+  // No drawing, a line that is not in the statement, or one that is there twice: no guess.
+  assert.equal(at("Table with name t does not exist!", "SELECT 1"), null);
+  assert.equal(at('syntax error\n\nLINE 3: x\n        ^', "SELECT 1"), null);
+  assert.equal(at('syntax error\n\nLINE 1: ... a b\n            ^', "a b c a b"), null);
+});
+
+live("a parser error says where it is, on 1.5 and on 2.0 alike", async () => {
+  const s = session();
+  await s.start();
+  try {
+    const r = await s.run("SELECT 1,\n  2 FRM t;");
+    assert.equal(r.kind, "error");
+    assert.equal(r.type, "Parser");
+    assert.equal(r.subtype, "SYNTAX_ERROR");
+    assert.equal(r.position, 18);
+    assert.doesNotMatch(r.message, /LINE|\^/);
+  } finally {
+    s.dispose();
+  }
+});

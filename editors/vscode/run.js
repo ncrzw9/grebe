@@ -182,6 +182,14 @@ function specFor(uri, text) {
     name,
     storageDir,
   });
+  // Two DuckDB processes cannot both write one file: a named session may
+  // not name the database the shared session is for.
+  if (name !== DEFAULT && database !== MEMORY) {
+    const shared = resolveDatabase(s.database, { cwd: cwd || homeDir(), storageDir });
+    if (shared !== MEMORY && path.resolve(shared) === path.resolve(database)) {
+      throw new Error(`the session "${name}" names ${database}, the database the shared session uses. Give it a database of its own, or none for an in-memory one.`);
+    }
+  }
   return { name, cli: s.cli, database, cwd: cwd || (manager.live(name) ? null : homeDir()) };
 }
 
@@ -614,7 +622,7 @@ const currentSessionName = () => currentName;
 
 /** Note what the current session has attached, to attach it again when the
  *  session next starts. */
-const rememberAttachments = () => manager.remember(currentName);
+const rememberAttachments = (name = currentName) => manager.remember(name);
 
 /** What the current session attaches when it starts. */
 const rememberedAttachments = () => manager.remembered(currentName);

@@ -463,13 +463,14 @@ class Explorer {
       return;
     }
     log.info("catalog", `DETACH ${ident(n.db)}`);
-    await this.remember();
+    // The session it was detached from: not always the one in front.
+    await this.remember(n.source === "session" ? undefined : n.source.slice("session:".length));
     this.refresh();
   }
 
   /** Note what the session has attached now, so it comes back with it. */
-  async remember() {
-    if (this.deps.remember) await this.deps.remember();
+  async remember(name) {
+    if (this.deps.remember) await this.deps.remember(name);
   }
 
   /** Stop trying to bring back an attachment that is gone. */

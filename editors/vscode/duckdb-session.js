@@ -186,6 +186,46 @@ function errorOf(text) {
   };
 }
 
+// How 2.0 ends a parser error: the line of the statement, and carets under
+// the place. A long line is cut to its surroundings, with `...` at the cut.
+const PROSE_PLACE = /\n\nLINE (\d+): (.*)\n( *)\^+\s*$/;
+
+/**
+ * Where a prose error points, as the byte offset into `sql` that 1.5 gives
+ * in its JSON: 2.0's parser reports "syntax error at or near ..." as text
+ * even with errors_as_json on, with the place drawn under the line.
+ * Resolves `{ position, message }` with the drawing taken off the message,
+ * or null when there is none or the line shown cannot be found in `sql`
+ * exactly once.
+ */
+function prosePlace(message, sql) {
+  const m = PROSE_PLACE.exec(message);
+  if (!m) return null;
+  const lines = sql.split("\n");
+  const line = lines[Number(m[1]) - 1];
+  if (line === undefined) return null;
+  let shown = m[2];
+  let caret = m[3].length - `LINE ${m[1]}: `.length; // into `shown`
+  if (caret < 0) return null;
+  let column;
+  if (shown === line.replace(/\s+$/, "") || shown === line) {
+    column = caret;
+  } else {
+    // Cut at one end or both: place what is left in the line.
+    let lead = 0;
+    if (shown.startsWith("... ")) lead = 4;
+    else if (shown.startsWith("...")) lead = 3;
+    let core = shown.slice(lead);
+    if (core.endsWith("...")) core = core.slice(0, -3).replace(/ $/, "");
+    const at = core === "" ? -1 : line.indexOf(core);
+    if (at < 0 || at !== line.lastIndexOf(core) || caret < lead) return null;
+    column = at + caret - lead;
+  }
+  if (column > line.length) return null;
+  const before = lines.slice(0, Number(m[1]) - 1).map((l) => `${l}\n`).join("") + line.slice(0, column);
+  return { position: Buffer.byteLength(before, "utf8"), message: message.slice(0, m.index) };
+}
+
 /** A statement as a query body: trailing whitespace and one final `;`
  *  removed. Callers wrap it on lines of its own, so a trailing `-- comment`
  *  cannot swallow the closing parenthesis. */
@@ -304,6 +344,15 @@ class Session {
       }
       const { out, err, cancelled } = reply;
       let result = classify(err.trim() ? `${err}\n${out}` : out);
+      // 2.0 draws where a parser error is instead of giving its offset.
+      if (result.kind === "error" && result.position === null) {
+        const place = prosePlace(result.message, trimmed);
+        if (place) {
+          result.position = place.position;
+          result.message = place.message;
+          if (result.type === "Parser" && /^syntax error/.test(place.message)) result.subtype = "SYNTAX_ERROR";
+        }
+      }
       // A cancelled query prints nothing. If it printed rows or an error
       // anyway, it finished before the interrupt reached it: that result is
       // real and is kept.
@@ -536,4 +585,4 @@ class Session {
   }
 }
 
-module.exports = { Session, INTERRUPTIBLE, cliEnv, classify, checkCli, cliVersion, parseVersion, plain, queryBody };
+module.exports = { Session, INTERRUPTIBLE, cliEnv, prosePlace, classify, checkCli, cliVersion, parseVersion, plain, queryBody };
