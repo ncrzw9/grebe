@@ -1157,7 +1157,9 @@ live("cancel: a long statement stops, the rest of the run does not run, the sess
   await shown.commands.get("grebe.duckdb.runFile")();
   const timed = shown.posted.findLast((m) => m.type === "result").entry.result;
   assert.deepEqual([timed.kind, timed.reason], ["cancelled", "timeout"]);
-  assert.ok(timed.ms >= 1000 && timed.ms < 3000, `${timed.ms} ms`);
+  // The timeout is a timer, and a timer may fire a fraction of a millisecond
+  // before the clock the result is timed with says so (999.97 ms was seen).
+  assert.ok(timed.ms >= 990 && timed.ms < 3000, `${timed.ms} ms`);
   assert.equal(shown.posted.findLast((m) => m.type === "end").summary, "Timed out: 0 succeeded.");
   assert.deepEqual(shown.errors, []);
 });
