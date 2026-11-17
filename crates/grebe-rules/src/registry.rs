@@ -6,13 +6,16 @@
 //! # Categories
 //!
 //! grebe does no binding, so there are no semantic (`SEM`) rules and no
-//! `SRC001 unverifiable-source`. The categories:
+//! `SRC001 unverifiable-source`. The nearest thing is `CAT`: name lookups
+//! against a catalog snapshot the caller hands in, which run only then (see
+//! [`crate::catalog`]). The categories:
 //!
 //! | category | meaning | source |
 //! |---|---|---|
 //! | [`Category::Prs`] | statement does not parse | our PEG matcher |
 //! | [`Category::Src`] | statement deliberately not analyzed | head match + parse failure |
 //! | [`Category::Mod`] | opinionated rule on valid SQL | our CST |
+//! | [`Category::Cat`] | a name the given catalog does not have | our CST + a snapshot |
 //!
 //! There is no `PRS900 unclassified-parse-error` either: our PEG matcher's
 //! reject IS `PRS001` — there is no second engine underneath it to disagree
@@ -33,6 +36,9 @@ pub enum Category {
     Src,
     /// An opinionated rule over valid SQL, read off our own CST.
     Mod,
+    /// A table or column the catalog snapshot a caller supplied does not
+    /// have. Silent unless a catalog is given.
+    Cat,
 }
 
 /// Default severity a rule ships at, absent a `[severity]` override.
@@ -74,7 +80,7 @@ pub enum FixSafety {
 /// code path.
 #[derive(Clone, Copy, Debug)]
 pub struct Rule {
-    /// e.g. `"MOD001"`. Matches `^(PRS|SRC|MOD)\d{3}$` — asserted in tests,
+    /// e.g. `"MOD001"`. Matches `^(PRS|SRC|MOD|CAT)\d{3}$` — asserted in tests,
     /// not just documented, because [`lookup`] and every diagnostic
     /// downstream key on this string.
     pub code: &'static str,
@@ -89,7 +95,7 @@ pub struct Rule {
 
 /// The full rule table.
 ///
-/// Ordered `PRS`, `SRC`, `MOD`. Within `MOD`, the default-on rules come
+/// Ordered `PRS`, `SRC`, `CAT`, `MOD`. Within `MOD`, the default-on rules come
 /// first in code order (with the opt-in MOD010 among them, marked at its
 /// row), then the rest of the opt-in band. Each detector's doc comment
 /// carries the full guard list and the reasoning behind its fix.
@@ -119,6 +125,26 @@ pub static RULES: &[Rule] = &[
         default_severity: Severity::Info,
         fix_safety: FixSafety::None,
         message: "File contains statements from another SQL dialect; skipped.",
+    },
+    // CAT: only ever emitted when the caller supplies a catalog snapshot.
+    // Warning: by the catalog, the statement fails when it runs. `None` for
+    // the fix: the nearest name is a guess, offered in the editor one
+    // finding at a time and never applied by `--fix`.
+    Rule {
+        code: "CAT001",
+        name: "unknown-table",
+        category: Category::Cat,
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "Table or view is not in the catalog.",
+    },
+    Rule {
+        code: "CAT002",
+        name: "unknown-column",
+        category: Category::Cat,
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "Column is not in the table it is qualified with.",
     },
     // --- MOD, default-on (MOD010 aside) ---
     Rule {
@@ -580,7 +606,7 @@ mod tests {
         }
     }
 
-    /// `^(PRS|SRC|MOD)\d{3}$`, spelled out by hand since this crate has no
+    /// `^(PRS|SRC|MOD|CAT)\d{3}$`, spelled out by hand since this crate has no
     /// regex dependency to spell it with (and none should be added just for
     /// a test).
     #[test]
@@ -590,7 +616,7 @@ mod tests {
             assert_eq!(bytes.len(), 6, "{} is not 6 bytes", rule.code);
             let prefix = &rule.code[..3];
             assert!(
-                prefix == "PRS" || prefix == "SRC" || prefix == "MOD",
+                matches!(prefix, "PRS" | "SRC" | "MOD" | "CAT"),
                 "{} has an unrecognized prefix",
                 rule.code
             );
@@ -609,6 +635,7 @@ mod tests {
                 Category::Prs => "PRS",
                 Category::Src => "SRC",
                 Category::Mod => "MOD",
+                Category::Cat => "CAT",
             };
             assert_eq!(&rule.code[..3], expected, "{} category mismatch", rule.code);
         }
@@ -666,7 +693,7 @@ mod tests {
         );
     }
 
-    /// Category counts: 1 PRS, 3 SRC, 29 MOD (MOD001-029, no gaps).
+    /// Category counts.
     #[test]
     fn category_counts() {
         let prs = RULES.iter().filter(|r| r.category == Category::Prs).count();
@@ -674,8 +701,10 @@ mod tests {
         let mods = RULES.iter().filter(|r| r.category == Category::Mod).count();
         assert_eq!(prs, 1);
         assert_eq!(src, 2);
+        let cat = RULES.iter().filter(|r| r.category == Category::Cat).count();
         assert_eq!(mods, 39);
-        assert_eq!(RULES.len(), 42);
+        assert_eq!(cat, 2);
+        assert_eq!(RULES.len(), 44);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,

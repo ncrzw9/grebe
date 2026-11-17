@@ -1,0 +1,20 @@
+[
+{"database":"shop","schema":"main","table":"orders","column":"id","type":"BIGINT"},
+{"database":"shop","schema":"main","table":"orders","column":"customer_id","type":"BIGINT"},
+{"database":"shop","schema":"main","table":"orders","column":"total","type":"DECIMAL(10,2)"},
+{"database":"shop","schema":"main","table":"orders","column":"placed","type":"DATE"},
+{"database":"shop","schema":"main","table":"orders","column":"meta","type":"STRUCT(src VARCHAR)"},
+{"database":"shop","schema":"main","table":"customers","column":"id","type":"BIGINT"},
+{"database":"shop","schema":"main","table":"customers","column":"name","type":"VARCHAR"},
+{"database":"shop","schema":"main","table":"customers","column":"Sign Up","type":"DATE"},
+{"database":"shop","schema":"main","table":"big_orders","column":"id","type":"BIGINT","kind":"view"},
+{"database":"shop","schema":"main","table":"big_orders","column":"total","type":"DECIMAL(10,2)","kind":"view"},
+{"database":"shop","schema":"main","table":"audit","column":"o","type":"STRUCT(id BIGINT)"},
+{"database":"shop","schema":"main","table":"audit","column":"note","type":"VARCHAR"},
+{"database":"shop","schema":"main","table":"notes","column":"id","type":"BIGINT"},
+{"database":"shop","schema":"main","table":"notes","column":"body","type":"VARCHAR"},
+{"database":"shop","schema":"raw","table":"events","column":"ts","type":"TIMESTAMP"},
+{"database":"shop","schema":"raw","table":"events","column":"payload","type":"JSON"},
+{"database":"lake","schema":"main","table":"clicks","column":"user_id","type":"BIGINT"},
+{"database":"lake","schema":"main","table":"clicks","column":"url","type":"VARCHAR"}
+]

@@ -12,11 +12,16 @@
 //!
 //! `setup.sql` is the data the fixtures query. It is not a fixture; it lets a
 //! rule's fix be executed against the original and the results compared.
+//!
+//! `catalog.json` is the catalog snapshot the `CAT` fixtures are checked
+//! against: those rules only run when a catalog is given, so theirs is the
+//! one fixture pair that needs a third file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use grebe_rules::analysis::analyze_source;
+use grebe_rules::analysis::{Selection, analyze};
+use grebe_rules::catalog::Catalog;
 
 fn is_rule_code(stem: &str) -> bool {
     stem.len() == 6
@@ -34,7 +39,20 @@ fn line_col(src: &str, byte: usize) -> (usize, usize) {
 /// Every finding for `code` in `src`, in the `.expected` format. A fixture
 /// that fails to parse is a broken fixture, not a silent rule.
 fn render(path: &Path, src: &str, code: &str) -> String {
-    let findings = analyze_source(src, Some(&[code.to_string()]));
+    let catalog = code.starts_with("CAT").then(|| {
+        let file = path.with_file_name("catalog.json");
+        let text = fs::read_to_string(&file).expect("fixtures/rules/catalog.json");
+        Catalog::from_json_text(&text).expect("catalog.json is a snapshot")
+    });
+    let select = [code.to_string()];
+    let findings = analyze(
+        src,
+        &Selection {
+            select: Some(&select),
+            catalog: catalog.as_ref(),
+            ..Selection::default()
+        },
+    );
     if let Some(prs) = findings.iter().find(|f| f.code.starts_with("PRS")) {
         let (line, col) = line_col(src, prs.span.start as usize);
         panic!("{}:{line}:{col}: fixture does not parse", path.display());

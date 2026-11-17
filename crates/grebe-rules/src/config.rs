@@ -75,6 +75,10 @@ pub struct Config {
     /// order.
     pub severity: Vec<(String, Severity)>,
     pub format: FormatConfig,
+    /// A catalog snapshot file for the `CAT` rules (see `crate::catalog`),
+    /// resolved against the config file's directory. `None`: no catalog,
+    /// and those rules do not run.
+    pub catalog: Option<PathBuf>,
 }
 
 /// A problem found while parsing a config file: where, and in plain English.
@@ -590,6 +594,7 @@ fn apply_top(
         "exclude" => "exclude",
         "select" => "select",
         "foreign-heads" | "foreign_heads" => "foreign-heads",
+        "catalog" => "catalog",
         other => return Err(err(path, line, format!("unknown key `{other}`"))),
     };
     if !seen.insert(canonical.to_string()) {
@@ -615,6 +620,16 @@ fn apply_top(
             let arr = expect_array(value, "foreign-heads", line, path)?;
             config.foreign_heads = arr.iter().map(|h| normalize_head(h)).collect();
         }
+        "catalog" => match value {
+            Value::Str(p) if !p.is_empty() => config.catalog = Some(config.root.join(p)),
+            _ => {
+                return Err(err(
+                    path,
+                    line,
+                    "`catalog` must be a path to a catalog snapshot file",
+                ));
+            }
+        },
         _ => unreachable!("canonical key set is exhaustive above"),
     }
     Ok(())

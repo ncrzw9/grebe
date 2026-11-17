@@ -1,0 +1,15 @@
+6:15 CAT001 => orders
+8:29 CAT001 => customers
+11:19 CAT001 => events
+13:25 CAT001
+15:20 CAT001
+18:13 CAT001 => customers
+20:8 CAT001 => orders
+22:13 CAT001 => big_orders
+24:12 CAT001 => orders
+26:16 CAT001 => customers
+28:6 CAT001 => orders
+30:7 CAT001
+33:59 CAT001 => customers
+35:31 CAT001 => orders
+37:40 CAT001 => events
