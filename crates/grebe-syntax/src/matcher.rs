@@ -114,6 +114,12 @@ pub struct Matcher<'a> {
     /// Accept/reject callers (`parse_check`, the differential gate) do not
     /// need a tree, and building one costs roughly half the throughput.
     build_nodes: bool,
+    /// Set when [`Matcher::build`] could not follow the memo table (see
+    /// there); the caller then matches again the slow way.
+    build_failed: bool,
+    /// Match and build in one pass, copying subtrees through `pool`. The
+    /// fallback for a statement `build` gave up on.
+    one_pass: bool,
 }
 
 /// Recursion ceiling for `evaluate_rule`.
@@ -192,6 +198,8 @@ impl<'a> Matcher<'a> {
             nodes: Vec::new(),
             depth: 0,
             build_nodes,
+            build_failed: false,
+            one_pass: false,
         }
     }
 
@@ -440,6 +448,125 @@ impl<'a> Matcher<'a> {
         res
     }
 
+    /// Emit the nodes of `expr_id` matched at `token_idx`, and return where
+    /// the match ends. Only called for a match the memo table already
+    /// holds: every rule under it was matched while the statement was
+    /// recognised, so each rule is entered once and no alternative is tried
+    /// for longer than a table lookup per rule it names. Nothing is copied.
+    ///
+    /// (Building nodes while matching has to keep each rule's subtree so a
+    /// later memo hit can replay it. A value nested `d` deep is re-entered
+    /// at every precedence level on the way down, and its subtree was copied
+    /// each time: 400 nested parentheses took 460 ms, and one long statement
+    /// held gigabytes of copies.)
+    fn build(&mut self, expr_id: ExprId, token_idx: usize) -> usize {
+        let expr = &EXPRESSIONS[expr_id.0 as usize];
+        match expr {
+            Expr::Literal(_) | Expr::Identifier(_) => token_idx + 1,
+            Expr::Rule(rule_id) => self.build_rule(*rule_id, token_idx),
+            Expr::Seq(items) => {
+                let mut curr = token_idx;
+                for &item in *items {
+                    curr = self.build(item, curr);
+                }
+                curr
+            }
+            Expr::Choice(items) => {
+                for &item in *items {
+                    if self.evaluate(item, token_idx).is_some() {
+                        return self.build(item, token_idx);
+                    }
+                }
+                self.build_failed = true;
+                token_idx
+            }
+            Expr::Optional(item) => {
+                if self.evaluate(*item, token_idx).is_some() {
+                    self.build(*item, token_idx)
+                } else {
+                    token_idx
+                }
+            }
+            Expr::ZeroOrMore(item) | Expr::OneOrMore(item) => {
+                let mut curr = token_idx;
+                if matches!(expr, Expr::OneOrMore(_)) {
+                    curr = self.build(*item, curr);
+                }
+                while curr < self.match_tokens.len() {
+                    match self.evaluate(*item, curr) {
+                        // A zero-width repetition ends the loop and leaves
+                        // no nodes, as in `evaluate`.
+                        Some(next) if next != curr => {
+                            self.build(*item, curr);
+                            curr = next;
+                        }
+                        _ => break,
+                    }
+                }
+                curr
+            }
+            Expr::Not(_) | Expr::And(_) | Expr::EndOfInput => token_idx,
+        }
+    }
+
+    fn build_rule(&mut self, rule_id: RuleId, token_idx: usize) -> usize {
+        let slot = self.slot(rule_id, token_idx);
+        let hit = self.memo_get(slot);
+        if hit < HIT_BASE {
+            self.build_failed = true;
+            return token_idx;
+        }
+        let end_idx = self.hits[(hit - HIT_BASE) as usize].0;
+        let body_start = self.nodes.len();
+        let native = matches!(
+            rule_id,
+            RULE_STRING_LITERAL
+                | RULE_NUMBER_LITERAL
+                | RULE_NEWLINE_BEFORE
+                | RULE_OPERATOR_LITERAL
+                | RULE_ANY_OPERATOR_LITERAL
+                | RULE_END_OF_INPUT
+                | RULE_RESERVED_KEYWORD
+                | RULE_UNRESERVED_KEYWORD
+                | RULE_COLUMN_NAME_KEYWORD
+                | RULE_FUNC_NAME_KEYWORD
+                | RULE_BARE_LABEL_KEYWORD
+                | RULE_TYPE_NAME_KEYWORD
+        );
+        if !native {
+            // While the rule's own body is walked the rule is active, as it
+            // was when the body was matched: a re-entry at this position
+            // fails, which is how left recursion is refused.
+            self.memo_set(slot, ACTIVE);
+            let end = self.build(RULES[rule_id.0 as usize].expr, token_idx);
+            self.memo_set(slot, hit);
+            if end != end_idx {
+                // The walk disagrees with the table. Not seen on any
+                // corpus; the caller starts over in one pass.
+                self.build_failed = true;
+            }
+        }
+        let start_byte = if token_idx < self.match_tokens.len() {
+            self.match_tokens[token_idx].0.span.start
+        } else if !self.match_tokens.is_empty() {
+            self.match_tokens.last().unwrap().0.span.end
+        } else {
+            0
+        };
+        let end_byte = if end_idx > token_idx && end_idx <= self.match_tokens.len() {
+            self.match_tokens[end_idx - 1].0.span.end
+        } else {
+            start_byte
+        };
+        let size = (self.nodes.len() - body_start) as u32;
+        self.nodes.push(RawNode {
+            rule: rule_id,
+            span: Span::new(start_byte, end_byte),
+            size,
+        });
+        end_idx
+    }
+
     fn record_hit(&mut self, slot: Slot, end: usize, offset: usize, len: usize) {
         self.memo_set(slot, HIT_BASE + self.hits.len() as u32);
         self.hits.push((end, offset as u32, len as u32));
@@ -532,6 +659,28 @@ impl<'a> Matcher<'a> {
                 while curr < self.match_tokens.len() {
                     if top {
                         self.start_statement(curr);
+                        if self.build_nodes && !self.one_pass {
+                            // Two passes over one statement: match it
+                            // without nodes, which fills the memo table,
+                            // then walk the match once to emit its nodes.
+                            self.build_nodes = false;
+                            let matched = self.evaluate(*item, curr);
+                            let next = match matched {
+                                Some(next) if next != curr => {
+                                    self.build(*item, curr);
+                                    Some(next)
+                                }
+                                _ => None,
+                            };
+                            self.build_nodes = true;
+                            match next {
+                                Some(next) => {
+                                    curr = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
                     }
                     let start_nodes = self.nodes.len();
                     if let Some(next) = self.evaluate(*item, curr) {
@@ -597,7 +746,12 @@ pub fn parse(src: &str) -> Option<Tree> {
     let tokens = tokenize(src);
     let mut matcher = Matcher::new(src, &tokens, true);
 
-    let end_idx = matcher.evaluate_rule(RULE_PROGRAM, 0)?;
+    let mut end_idx = matcher.evaluate_rule(RULE_PROGRAM, 0)?;
+    if matcher.build_failed {
+        matcher = Matcher::new(src, &tokens, true);
+        matcher.one_pass = true;
+        end_idx = matcher.evaluate_rule(RULE_PROGRAM, 0)?;
+    }
     if end_idx != matcher.match_tokens.len() || matcher.nodes.is_empty() {
         return None;
     }
