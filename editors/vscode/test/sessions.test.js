@@ -133,3 +133,27 @@ live("remember: files and their mode, not in-memory attachments, not the session
   assert.equal((await s.run("SELECT i FROM rw.t")).kind, "error");
   m3.end();
 });
+
+test("a re-attach that fails keeps the reason without the password in it", async () => {
+  const store = new Map([["default", [{ alias: "pg", path: "dbname=ub host=h user=u", type: "postgres", readOnly: true }]]]);
+  const m = new Sessions({
+    store: { get: (n) => store.get(n) || [], set: (n, r) => store.set(n, r) },
+    askPassword: async () => "SECRETPW",
+  });
+  // DuckDB repeats the connection string in its error, password included.
+  const fake = {
+    opts: { database: ":memory:" },
+    run: async (sql) => ({
+      kind: "error",
+      type: "Connection",
+      message: /SECRETPW/.test(sql)
+        ? `Unable to connect to Postgres at "dbname=ub host=h user=u password='SECRETPW'": FATAL: password authentication failed`
+        : "fe_sendauth: no password supplied",
+    }),
+  };
+  await m.reattach("default", fake);
+  const kept = JSON.stringify(store.get("default"));
+  assert.doesNotMatch(kept, /SECRETPW/);
+  assert.match(kept, /password=\*\*\*/);
+  assert.match(kept, /password authentication failed/);
+});

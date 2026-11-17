@@ -116,12 +116,14 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
   otherwise: `-- grebe: session prod warehouse/prod.duckdb` opens that file
   (relative to the workspace folder), `-- grebe: session prod :workspace:`
   keeps it with the workspace. It never opens the file the shared session
-  has open: two DuckDB processes cannot write one file.
+  has open, and naming that file in the comment is an error: two DuckDB
+  processes cannot write one file.
 - **`:workspace:`: tables that outlive the window.** Set
   `grebe.duckdb.database` to `:workspace:` (or choose it from the status
   bar) and the session's database is a file in the editor's own storage for
   this workspace. Tables and views are still there after a window reload,
   an editor restart or a crash, and nothing is added to your project.
+  It needs a folder or workspace to be open; without one it is `:memory:`.
   `TEMP` tables and `SET` options still end with the session. **grebe:
   Delete Workspace Database** starts over. A file written by DuckDB 2.0
   cannot be opened by 1.5: after switching back to an older CLI, delete it.
