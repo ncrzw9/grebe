@@ -134,6 +134,11 @@ function makeVscode(config) {
     },
     window: {
       activeTextEditor: null,
+      onDidChangeActiveTextEditor: (h) => {
+        shown.editorChanged = h;
+        return disposable;
+      },
+      showInputBox: async () => shown.typed,
       showInformationMessage: async (m) => {
         shown.infos.push(m);
         return undefined; // no button clicked
@@ -192,6 +197,7 @@ function makeVscode(config) {
         shown.commands.set(name, fn);
         return disposable;
       },
+      registered: (name) => shown.commands.get(name),
     },
   };
   return { vscode, shown };
@@ -204,6 +210,7 @@ function lspClient(bin) {
   let buf = Buffer.alloc(0);
   let id = 0;
   const pending = new Map();
+  const diagnostics = new Map(); // uri -> the diagnostics last published
   proc.stdout.on("data", (d) => {
     buf = Buffer.concat([buf, d]);
     for (;;) {
@@ -216,6 +223,8 @@ function lspClient(bin) {
       if (msg.id !== undefined && pending.has(msg.id)) {
         pending.get(msg.id)(msg.result);
         pending.delete(msg.id);
+      } else if (msg.method === "textDocument/publishDiagnostics") {
+        diagnostics.set(msg.params.uri, msg.params.diagnostics);
       }
     }
   });
@@ -233,6 +242,8 @@ function lspClient(bin) {
       });
     },
     notify: (method, params) => send({ method, params }),
+    sendNotification: (method, params) => send({ method, params }),
+    diagnostics,
     // The shape run.js uses from vscode-languageclient.
     sendRequest(method, params) {
       return this.request(method, params);
@@ -1302,4 +1313,273 @@ live("file commands given a tree item (not a file) ask for a file instead of fai
   await shown.commands.get("grebe.catalog.useAsDatabase")(treeItem);
   assert.deepEqual(shown.errors, [], "no command failed");
   assert.equal(dialogs.length, 3, "browse, attach and open-in-grid each asked for a file");
+});
+
+// A run of `doc` through the fake editor: the results it posted.
+async function runFileOf(vscode, shown, doc) {
+  const before = shown.posted.length;
+  vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+  await shown.commands.get("grebe.duckdb.runFile")();
+  return shown.posted.slice(before).filter((m) => m.type === "result").map((m) => m.entry.result);
+}
+
+// The run module against the fake editor and a real language server.
+async function startRunner(t, config, context = {}) {
+  const { vscode, shown } = makeVscode(config);
+  const origLoad = Module._load;
+  Module._load = function (request, ...rest) {
+    return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
+  };
+  t.after(() => {
+    Module._load = origLoad;
+  });
+  for (const m of ["../run", "../results", "../log", "../catalog", "../catalogSync"]) {
+    try {
+      delete require.cache[require.resolve(m)];
+    } catch {
+      // not a module yet
+    }
+  }
+  const runner = require("../run");
+  const client = lspClient(GREBE);
+  t.after(() => client.stop());
+  await client.request("initialize", { capabilities: {} });
+  const subs = [];
+  runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") }, ...context }, () => Promise.resolve(client));
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+  resolveResultsView(vscode, shown);
+  const open = (file, sql) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, sql);
+    const doc = fakeDocument(file, sql);
+    shown.docs.set(doc.uri.toString(), doc);
+    client.notify("textDocument/didOpen", { textDocument: { uri: doc.uri.toString(), languageId: "sql", version: 1, text: sql } });
+    return doc;
+  };
+  return { vscode, shown, runner, client, open, run: (doc) => runFileOf(vscode, shown, doc) };
+}
+
+// Bring `doc` to the front, as clicking its tab does.
+function shownEditor(vscode, doc) {
+  vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+}
+
+// workspaceState, as VS Code keeps it: values survive the "window".
+function fakeState(values = new Map()) {
+  return { values, get: (k, d) => (values.has(k) ? values.get(k) : d), update: async (k, v) => void values.set(k, v) };
+}
+
+live("one session serves files in different folders, each with its own relative paths", async (t) => {
+  const config = { path: CLI, database: ":memory:", maxRows: 100 };
+  const { shown, open, run } = await startRunner(t, config);
+  // Two files in two folders: with no workspace folder, each file's own
+  // directory is its working directory, which used to mean a new session.
+  const a = fs.mkdtempSync(path.join(os.tmpdir(), "grebe e2e's a-"));
+  const b = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-b-"));
+  fs.writeFileSync(path.join(a, "data.csv"), "n\n1\n2\n");
+  fs.writeFileSync(path.join(b, "data.csv"), "n\n10\n20\n30\n");
+  const load = open(path.join(a, "load.sql"), "CREATE TABLE shared AS SELECT 42 AS answer;\nCREATE TEMP TABLE scratch AS SELECT 7 AS n;\nSELECT count(*) AS rows FROM 'data.csv';");
+  const read = open(path.join(b, "read.sql"), "SELECT answer, n FROM shared, scratch;\nSELECT count(*) AS rows FROM 'data.csv';");
+
+  let got = await run(load);
+  assert.deepEqual(got.map((r) => r.kind), ["ok", "ok", "rows"]);
+  assert.deepEqual(got[2].data, [["2"]], "data.csv beside load.sql");
+  got = await run(read);
+  assert.equal(got[0].kind, "rows", JSON.stringify(got[0]));
+  assert.deepEqual(got[0].data, [["42"], ["7"]], "the other file's tables are here");
+  assert.deepEqual(got[1].data, [["3"]], "data.csv beside read.sql, not the first file's");
+  // And back again: the working directory follows the file each time.
+  got = await run(load);
+  assert.equal(got[0].kind, "error", "shared exists already: the same session");
+  assert.equal(shown.log.filter((l) => /\bstarting /.test(l)).length, 1, `one session was started: ${shown.log.join("")}`);
+
+  // maxRows is read per run: changing it does not throw the session away.
+  config.maxRows = 50;
+  await shown.configChanged({ affectsConfiguration: (k) => k === "grebe.duckdb.maxRows" });
+  got = await run(read);
+  assert.equal(got[0].kind, "rows", JSON.stringify(got[0]));
+});
+
+live("a file can ask for a session of its own", async (t) => {
+  const { shown, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const shared = open(path.join(dir, "shared.sql"), "CREATE TABLE t AS SELECT 1 AS i;");
+  const own = open(path.join(dir, "own.sql"), "-- a scratch area\n-- grebe: session scratch\nCREATE TABLE t AS SELECT 2 AS i;\nSELECT i FROM t;");
+  const back = open(path.join(dir, "back.sql"), "SELECT i FROM t;");
+  // The words further down a file are not the comment at its head.
+  const not = open(path.join(dir, "not.sql"), "SELECT i FROM t;\n-- grebe: session scratch\n");
+
+  assert.deepEqual((await run(shared)).map((r) => r.kind), ["ok"]);
+  let got = await run(own);
+  assert.deepEqual(got.map((r) => r.kind), ["ok", "rows"], "its own t: no clash with the shared one");
+  assert.deepEqual(got[1].data, [["2"]]);
+  assert.equal(runner.currentSessionName(), "scratch");
+  assert.deepEqual(runner.liveSessions().map((x) => x.name).sort(), ["default", "scratch"]);
+  got = await run(back);
+  assert.deepEqual(got[0].data, [["1"]], "the shared session still has its own");
+  assert.equal(runner.currentSessionName(), "default");
+  assert.deepEqual((await run(not))[0].data, [["1"]]);
+  assert.equal(shown.log.filter((l) => /\bstarting /.test(l)).length, 2, shown.log.join(""));
+
+  // The file in front decides which session the Catalog and status bar show.
+  shown.editorChanged({ document: own });
+  assert.equal(runner.currentSessionName(), "scratch");
+  // Restart ends that one only.
+  await shown.commands.get("grebe.duckdb.restart")();
+  assert.deepEqual(runner.liveSessions().map((x) => x.name), ["default"]);
+});
+
+live("the workspace database keeps tables across sessions; attachments come back", async (t) => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const other = path.join(dir, "other.duckdb");
+  const state = fakeState();
+  const context = { storageUri: { fsPath: path.join(storage, "ws") }, workspaceState: state };
+  const config = { path: CLI, database: ":workspace:", maxRows: 100 };
+  {
+    const { runner, open, run } = await startRunner(t, config, context);
+    const make = open(
+      path.join(dir, "make.sql"),
+      `CREATE TABLE kept AS SELECT 99 AS n;\nATTACH '${other}' AS other;\nCREATE TABLE other.o AS SELECT 5 AS five;\nATTACH ':memory:' AS mem2;`,
+    );
+    assert.deepEqual((await run(make)).map((r) => r.kind), ["ok", "ok", "ok", "ok"]);
+    assert.ok(fs.existsSync(path.join(storage, "ws", "session.duckdb")), "the database is in the editor's storage, not the project");
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => !f.endsWith(".wal")).sort(), ["make.sql", "other.duckdb"]);
+    // What is remembered: the file, not the in-memory attachment.
+    assert.deepEqual(runner.rememberedAttachments(), [{ alias: "other", path: other, type: "duckdb", readOnly: false }]);
+    // The window closes.
+    runner.liveSession().dispose();
+    await until(() => runner.liveSession() === null, "the session to end");
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  {
+    // A new window on the same workspace.
+    const { vscode, shown, runner, open, run } = await startRunner(t, config, context);
+    const read = open(path.join(dir, "read.sql"), "SELECT n FROM kept;\nSELECT five FROM other.o;");
+    const got = await run(read);
+    assert.deepEqual(got.map((r) => r.kind), ["rows", "rows"], JSON.stringify(got));
+    assert.deepEqual(got[0].data, [["99"]]);
+    assert.deepEqual(got[1].data, [["5"]], "other.duckdb was attached again");
+    assert.match(shown.log.join(""), /re-attached other/);
+
+    // An attachment whose file is gone is reported, kept, and can be forgotten.
+    runner.liveSession().dispose();
+    await until(() => runner.liveSession() === null, "the session to end");
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(other);
+    fs.mkdirSync(other); // a directory: cannot be attached
+    assert.deepEqual((await run(read)).map((r) => r.kind), ["rows", "error"]);
+    assert.equal(shown.warnings.filter((w) => /could not re-attach other/.test(w)).length, 1, shown.warnings.join("\n"));
+    assert.match(runner.rememberedAttachments()[0].error, /Error/);
+    runner.forgetAttachment("other");
+    assert.deepEqual(runner.rememberedAttachments(), []);
+
+    // Deleting the workspace database asks first, then starts clean.
+    vscode.window.showWarningMessage = async (m, ...rest) => (rest.includes("Delete") ? "Delete" : undefined);
+    await shown.commands.get("grebe.duckdb.resetWorkspaceDatabase")();
+    assert.equal(fs.existsSync(path.join(storage, "ws", "session.duckdb")), false);
+    assert.equal((await run(read))[0].kind, "error", "kept is gone");
+  }
+});
+
+live("the language server is told what each session holds, once per change", async (t) => {
+  const { vscode, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const { CatalogSync } = require("../catalogSync");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const sentTo = [];
+  const sync = new CatalogSync({
+    clientReady: async () => ({ sendNotification: (method, params) => sentTo.push([method, params]) }),
+    liveSessions: runner.liveSessions,
+    sessionNameOf: runner.sessionNameOf,
+  });
+  const shared = open(path.join(dir, "shared.sql"), "CREATE TABLE orders (id INTEGER, total DECIMAL(10,2));\nCREATE MACRO twice(x) AS x * 2;");
+  const own = open(path.join(dir, "own.sql"), "-- grebe: session scratch\nCREATE VIEW v AS SELECT 1 AS one;");
+  vscode.workspace.textDocuments = [shared, own];
+
+  // Nothing is running: nothing to say, and nothing claimed.
+  await sync.sync();
+  assert.deepEqual(sentTo, [["grebe/catalog", { columns: null }], ["grebe/catalog", { uri: own.uri.toString(), columns: null }]]);
+  sentTo.length = 0;
+
+  await run(shared);
+  await sync.sync();
+  assert.equal(sentTo.length, 1, JSON.stringify(sentTo));
+  assert.deepEqual(sentTo[0][1].columns, [
+    { database: "memory", schema: "main", table: "orders", column: "id", type: "INTEGER" },
+    { database: "memory", schema: "main", table: "orders", column: "total", type: "DECIMAL(10,2)" },
+  ]);
+  assert.deepEqual(sentTo[0][1].functions, [{ name: "twice", kind: "macro" }]);
+  assert.equal("uri" in sentTo[0][1], false, "the shared session is every file's default");
+
+  // Unchanged: not sent again.
+  await sync.sync();
+  assert.equal(sentTo.length, 1);
+
+  // The file with a session of its own gets that session's tables, by uri.
+  await run(own);
+  await sync.sync();
+  assert.equal(sentTo.length, 2, JSON.stringify(sentTo.slice(1)));
+  assert.equal(sentTo[1][1].uri, own.uri.toString());
+  assert.deepEqual(sentTo[1][1].columns.map((c) => `${c.table}.${c.column}`), ["v.one"]);
+
+  // Its session ends: it has no catalog, rather than the shared one.
+  shownEditor(vscode, own);
+  await vscode.commands.registered("grebe.duckdb.restart")();
+  await sync.sync();
+  assert.deepEqual(sentTo[2], ["grebe/catalog", { uri: own.uri.toString(), columns: null }]);
+
+  // The comment is taken out: the file uses the default again.
+  const plain = fakeDocument(own.uri.fsPath, "CREATE VIEW v AS SELECT 1 AS one;");
+  vscode.workspace.textDocuments = [shared, plain];
+  await sync.sync();
+  assert.deepEqual(sentTo[3], ["grebe/catalog", { uri: own.uri.toString(), default: true }]);
+
+  // Turned off in settings: the server is told there is no catalog.
+  vscode.workspace.getConfiguration = () => ({ get: (k, d) => (k === "catalogInEditor" ? false : k === "path" ? CLI : d) });
+  await sync.sync();
+  assert.deepEqual(sentTo[4], ["grebe/catalog", { columns: null }]);
+  assert.equal(sentTo.length, 5);
+});
+
+live("the editor marks what the session does not have, and completes what it has", async (t) => {
+  const { vscode, runner, client, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const { CatalogSync } = require("../catalogSync");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const sync = new CatalogSync({ clientReady: async () => client, liveSessions: runner.liveSessions, sessionNameOf: runner.sessionNameOf });
+  const load = open(path.join(dir, "load.sql"), "CREATE TABLE orders (id INTEGER, total DECIMAL(10,2));\nCREATE TABLE customers (id INTEGER, name VARCHAR);");
+  const querySql = "SELECT o.id, o.totl\nFROM ordrs o;\nSELECT o.totl FROM orders o;\nSELECT c.name FROM customers c;\nSELECT o. FROM orders o;";
+  const query = open(path.join(dir, "query.sql"), querySql);
+  vscode.workspace.textDocuments = [load, query];
+  const cat = () => (client.diagnostics.get(query.uri.toString()) || []).filter((d) => /^CAT/.test(d.code));
+
+  // No session yet: nothing is known, so nothing is marked.
+  await sync.sync();
+  await client.request("grebe/statements", { textDocument: { uri: query.uri.toString() } });
+  assert.deepEqual(cat(), []);
+
+  await run(load);
+  await sync.sync();
+  await until(() => cat().length === 2, "the catalog findings");
+  const found = cat().map((d) => [d.code, d.range.start.line, d.message]);
+  assert.equal(found[0][0], "CAT001");
+  assert.equal(found[0][1], 1);
+  assert.match(found[0][2], /ordrs.*orders/);
+  assert.equal(found[1][0], "CAT002");
+  assert.equal(found[1][1], 2);
+  assert.match(found[1][2], /totl.*total/);
+
+  // `o.` offers the columns of orders.
+  const at = { line: 4, character: "SELECT o.".length };
+  const completion = await client.request("textDocument/completion", { textDocument: { uri: query.uri.toString() }, position: at });
+  const labels = (completion.items || completion).map((i) => i.label);
+  assert.deepEqual(labels.sort(), ["id", "total"]);
+
+  // The table arrives in the session: the mark goes.
+  const fix = open(path.join(dir, "fix.sql"), "CREATE VIEW ordrs AS FROM orders;");
+  vscode.workspace.textDocuments = [load, query, fix];
+  await run(fix);
+  await sync.sync();
+  await until(() => cat().every((d) => d.code === "CAT002"), "CAT001 to clear");
+  // ordrs is known now, so its misspelt column is what is marked there.
+  assert.deepEqual(cat().map((d) => d.range.start.line), [0, 2]);
 });

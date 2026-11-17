@@ -17,6 +17,7 @@ const runner = require("./run");
 const inspect = require("./inspect");
 const catalog = require("./catalog");
 const dataEditor = require("./dataEditor");
+const catalogSync = require("./catalogSync");
 const { Session } = require("./duckdb-session");
 
 // A server that has not answered `initialize` by then is not going to: a
@@ -31,6 +32,8 @@ let generation = 0;
 // every (re)start; run.js awaits whichever is current.
 let ready = Promise.resolve(null);
 let settle = () => {};
+// Keeps the language server told of what the running sessions hold.
+let catalogFeed = null;
 
 exports.activate = function activate(context) {
   // Created up front, not on the client's first log line, so "grebe" is in
@@ -61,9 +64,24 @@ exports.activate = function activate(context) {
   runner.activate(context, () => ready);
   inspect.activate(context);
   dataEditor.activate(context);
+  catalogFeed = catalogSync.activate(context, {
+    clientReady: () => ready,
+    liveSessions: runner.liveSessions,
+    sessionNameOf: runner.sessionNameOf,
+    onDidRun: runner.onDidRun,
+  });
   const catalogView = catalog.activate(context, {
     currentSession: runner.currentSession,
     liveSession: runner.liveSession,
+    liveSessions: runner.liveSessions,
+    sessionName: runner.currentSessionName,
+    remember: async () => {
+      await runner.rememberAttachments();
+      catalogFeed.schedule();
+    },
+    remembered: runner.rememberedAttachments,
+    forget: runner.forgetAttachment,
+    state: context.workspaceState,
     onDidRun: runner.onDidRun,
     settings: runner.settings,
     cli: () => runner.settings().cli,
@@ -167,6 +185,7 @@ async function start(context) {
     log("server running");
     settle(next);
     runner.clientChanged();
+    if (catalogFeed) catalogFeed.reset();
   } catch (err) {
     if (client !== next) return;
     server?.kill();
