@@ -37,7 +37,7 @@ jobs:
       - name: Playwright for the results page tests
         run: |
           set -euo pipefail
-          npm install --prefix "$RUNNER_TEMP/pw" --no-save --no-audit --no-fund playwright@1.56.1
+          npm install --prefix "$RUNNER_TEMP/pw" --no-save --no-audit --no-fund playwright@1.63.0
           "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps --only-shell chromium
       # Against the grebe just built and a real DuckDB CLI, so running SQL,
       # the catalog and data files are tested end to end.
