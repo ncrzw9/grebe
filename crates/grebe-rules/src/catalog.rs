@@ -1056,22 +1056,36 @@ fn check_statement(
 /// The candidate closest to `name`, if exactly one is close: within one
 /// edit for a short name, two for a longer one.
 fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let limit = match name.chars().count() {
+    let wanted: Vec<char> = name.chars().collect();
+    let limit = match wanted.len() {
         0..=2 => return None,
         3..=5 => 1,
         _ => 2,
     };
     let mut best: Option<(usize, &str)> = None;
     let mut tie = false;
+    // Names already counted, lowercased: a table that is in two schemas is
+    // one suggestion, not a tie with itself.
     let mut seen: HashSet<String> = HashSet::new();
+    // A large catalog is thousands of candidates per finding, nearly all of
+    // them nowhere near: those are turned away on length alone, and the rest
+    // are compared in buffers that are reused.
+    let mut lower: Vec<char> = Vec::new();
+    let (mut prev, mut row) = (Vec::new(), Vec::new());
     for c in candidates {
-        let lc = c.to_ascii_lowercase();
-        if !seen.insert(lc.clone()) {
+        // A name has at most as many characters as bytes, and exactly as
+        // many when it is ASCII.
+        if c.len() + limit < wanted.len() || (c.is_ascii() && c.len() > wanted.len() + limit) {
             continue;
         }
-        let d = edit_distance(name, &lc, limit);
+        lower.clear();
+        lower.extend(c.chars().map(|ch| ch.to_ascii_lowercase()));
+        let d = distance(&wanted, &lower, limit, &mut prev, &mut row);
         // The name itself, somewhere else in the catalog, is no suggestion.
         if d == 0 || d > limit {
+            continue;
+        }
+        if !seen.insert(lower.iter().collect()) {
             continue;
         }
         match best {
@@ -1086,25 +1100,35 @@ fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
     if tie { None } else { best.map(|(_, c)| c) }
 }
 
-/// Levenshtein distance, giving up (returning `limit + 1`) once it is
-/// certain to exceed `limit`.
-fn edit_distance(a: &str, b: &str, limit: usize) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
+/// Levenshtein distance over characters, giving up (returning `limit + 1`)
+/// once it is certain to exceed `limit`. The two rows of the table are lent by
+/// the caller so that a run over many candidates allocates them once.
+fn distance(
+    a: &[char],
+    b: &[char],
+    limit: usize,
+    prev: &mut Vec<usize>,
+    row: &mut Vec<usize>,
+) -> usize {
     if a.len().abs_diff(b.len()) > limit {
         return limit + 1;
     }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    prev.clear();
+    prev.extend(0..=b.len());
     for (i, ca) in a.iter().enumerate() {
-        let mut row = vec![i + 1];
+        row.clear();
+        row.push(i + 1);
+        let mut least = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = usize::from(ca != cb);
-            row.push((prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1));
+            let v = (prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1);
+            least = least.min(v);
+            row.push(v);
         }
-        if row.iter().min().is_some_and(|&m| m > limit) {
+        if least > limit {
             return limit + 1;
         }
-        prev = row;
+        std::mem::swap(prev, row);
     }
     prev[b.len()]
 }
