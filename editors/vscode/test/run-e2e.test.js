@@ -134,6 +134,11 @@ function makeVscode(config) {
     },
     window: {
       activeTextEditor: null,
+      onDidChangeActiveTextEditor: (h) => {
+        shown.editorChanged = h;
+        return disposable;
+      },
+      showInputBox: async () => shown.typed,
       showInformationMessage: async (m) => {
         shown.infos.push(m);
         return undefined; // no button clicked
@@ -1304,8 +1309,16 @@ live("file commands given a tree item (not a file) ask for a file instead of fai
   assert.equal(dialogs.length, 3, "browse, attach and open-in-grid each asked for a file");
 });
 
-live("one session serves files in different folders, and outlives a maxRows change", async (t) => {
-  const config = { path: CLI, database: ":memory:", maxRows: 100 };
+// A run of `doc` through the fake editor: the results it posted.
+async function runFileOf(vscode, shown, doc) {
+  const before = shown.posted.length;
+  vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
+  await shown.commands.get("grebe.duckdb.runFile")();
+  return shown.posted.slice(before).filter((m) => m.type === "result").map((m) => m.entry.result);
+}
+
+// The run module against the fake editor and a real language server.
+async function startRunner(t, config, context = {}) {
   const { vscode, shown } = makeVscode(config);
   const origLoad = Module._load;
   Module._load = function (request, ...rest) {
@@ -1314,53 +1327,146 @@ live("one session serves files in different folders, and outlives a maxRows chan
   t.after(() => {
     Module._load = origLoad;
   });
-  for (const m of ["../run", "../results", "../log"]) delete require.cache[require.resolve(m)];
+  for (const m of ["../run", "../results", "../log", "../catalog", "../catalogSync"]) {
+    try {
+      delete require.cache[require.resolve(m)];
+    } catch {
+      // not a module yet
+    }
+  }
   const runner = require("../run");
-
   const client = lspClient(GREBE);
   t.after(() => client.stop());
   await client.request("initialize", { capabilities: {} });
-
-  // Two files in two folders: with no workspace folder, each file's own
-  // directory is its working directory, which used to mean a new session.
-  const open = (name, sql) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
-    const file = path.join(dir, name);
+  const subs = [];
+  runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") }, ...context }, () => Promise.resolve(client));
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+  resolveResultsView(vscode, shown);
+  const open = (file, sql) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, sql);
     const doc = fakeDocument(file, sql);
     shown.docs.set(doc.uri.toString(), doc);
     client.notify("textDocument/didOpen", { textDocument: { uri: doc.uri.toString(), languageId: "sql", version: 1, text: sql } });
     return doc;
   };
-  const load = open("load.sql", "CREATE TABLE shared AS SELECT 42 AS answer;\nCREATE TEMP TABLE scratch AS SELECT 7 AS n;");
-  const read = open("read.sql", "SELECT answer, n FROM shared, scratch;");
+  return { vscode, shown, runner, client, open, run: (doc) => runFileOf(vscode, shown, doc) };
+}
 
-  const subs = [];
-  runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") } }, () => Promise.resolve(client));
-  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
-  resolveResultsView(vscode, shown);
+// workspaceState, as VS Code keeps it: values survive the "window".
+function fakeState(values = new Map()) {
+  return { values, get: (k, d) => (values.has(k) ? values.get(k) : d), update: async (k, v) => void values.set(k, v) };
+}
 
-  const runFile = async (doc) => {
-    const before = shown.posted.length;
-    vscode.window.activeTextEditor = { document: doc, selection: new Selection(new Position(0, 0), new Position(0, 0)) };
-    await shown.commands.get("grebe.duckdb.runFile")();
-    return shown.posted.slice(before).filter((m) => m.type === "result").map((m) => m.entry.result);
-  };
+live("one session serves files in different folders, each with its own relative paths", async (t) => {
+  const config = { path: CLI, database: ":memory:", maxRows: 100 };
+  const { shown, open, run } = await startRunner(t, config);
+  // Two files in two folders: with no workspace folder, each file's own
+  // directory is its working directory, which used to mean a new session.
+  const a = fs.mkdtempSync(path.join(os.tmpdir(), "grebe e2e's a-"));
+  const b = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-b-"));
+  fs.writeFileSync(path.join(a, "data.csv"), "n\n1\n2\n");
+  fs.writeFileSync(path.join(b, "data.csv"), "n\n10\n20\n30\n");
+  const load = open(path.join(a, "load.sql"), "CREATE TABLE shared AS SELECT 42 AS answer;\nCREATE TEMP TABLE scratch AS SELECT 7 AS n;\nSELECT count(*) AS rows FROM 'data.csv';");
+  const read = open(path.join(b, "read.sql"), "SELECT answer, n FROM shared, scratch;\nSELECT count(*) AS rows FROM 'data.csv';");
 
-  assert.deepEqual((await runFile(load)).map((r) => r.kind), ["ok", "ok"]);
-  let got = await runFile(read);
-  assert.equal(got.length, 1);
+  let got = await run(load);
+  assert.deepEqual(got.map((r) => r.kind), ["ok", "ok", "rows"]);
+  assert.deepEqual(got[2].data, [["2"]], "data.csv beside load.sql");
+  got = await run(read);
   assert.equal(got[0].kind, "rows", JSON.stringify(got[0]));
-
-  // The other folder is named in the log once, not on every run.
-  await runFile(read);
-  const said = shown.log.filter((l) => /sharing the session/.test(l));
-  assert.equal(said.length, 1, shown.log.join(""));
+  assert.deepEqual(got[0].data, [["42"], ["7"]], "the other file's tables are here");
+  assert.deepEqual(got[1].data, [["3"]], "data.csv beside read.sql, not the first file's");
+  // And back again: the working directory follows the file each time.
+  got = await run(load);
+  assert.equal(got[0].kind, "error", "shared exists already: the same session");
   assert.equal(shown.log.filter((l) => /\bstarting /.test(l)).length, 1, `one session was started: ${shown.log.join("")}`);
 
   // maxRows is read per run: changing it does not throw the session away.
   config.maxRows = 50;
   await shown.configChanged({ affectsConfiguration: (k) => k === "grebe.duckdb.maxRows" });
-  got = await runFile(read);
+  got = await run(read);
   assert.equal(got[0].kind, "rows", JSON.stringify(got[0]));
+});
+
+live("a file can ask for a session of its own", async (t) => {
+  const { shown, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const shared = open(path.join(dir, "shared.sql"), "CREATE TABLE t AS SELECT 1 AS i;");
+  const own = open(path.join(dir, "own.sql"), "-- a scratch area\n-- grebe: session scratch\nCREATE TABLE t AS SELECT 2 AS i;\nSELECT i FROM t;");
+  const back = open(path.join(dir, "back.sql"), "SELECT i FROM t;");
+  // The words further down a file are not the comment at its head.
+  const not = open(path.join(dir, "not.sql"), "SELECT i FROM t;\n-- grebe: session scratch\n");
+
+  assert.deepEqual((await run(shared)).map((r) => r.kind), ["ok"]);
+  let got = await run(own);
+  assert.deepEqual(got.map((r) => r.kind), ["ok", "rows"], "its own t: no clash with the shared one");
+  assert.deepEqual(got[1].data, [["2"]]);
+  assert.equal(runner.currentSessionName(), "scratch");
+  assert.deepEqual(runner.liveSessions().map((x) => x.name).sort(), ["default", "scratch"]);
+  got = await run(back);
+  assert.deepEqual(got[0].data, [["1"]], "the shared session still has its own");
+  assert.equal(runner.currentSessionName(), "default");
+  assert.deepEqual((await run(not))[0].data, [["1"]]);
+  assert.equal(shown.log.filter((l) => /\bstarting /.test(l)).length, 2, shown.log.join(""));
+
+  // The file in front decides which session the Catalog and status bar show.
+  shown.editorChanged({ document: own });
+  assert.equal(runner.currentSessionName(), "scratch");
+  // Restart ends that one only.
+  await shown.commands.get("grebe.duckdb.restart")();
+  assert.deepEqual(runner.liveSessions().map((x) => x.name), ["default"]);
+});
+
+live("the workspace database keeps tables across sessions; attachments come back", async (t) => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const other = path.join(dir, "other.duckdb");
+  const state = fakeState();
+  const context = { storageUri: { fsPath: path.join(storage, "ws") }, workspaceState: state };
+  const config = { path: CLI, database: ":workspace:", maxRows: 100 };
+  {
+    const { runner, open, run } = await startRunner(t, config, context);
+    const make = open(
+      path.join(dir, "make.sql"),
+      `CREATE TABLE kept AS SELECT 99 AS n;\nATTACH '${other}' AS other;\nCREATE TABLE other.o AS SELECT 5 AS five;\nATTACH ':memory:' AS mem2;`,
+    );
+    assert.deepEqual((await run(make)).map((r) => r.kind), ["ok", "ok", "ok", "ok"]);
+    assert.ok(fs.existsSync(path.join(storage, "ws", "session.duckdb")), "the database is in the editor's storage, not the project");
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => !f.endsWith(".wal")).sort(), ["make.sql", "other.duckdb"]);
+    // What is remembered: the file, not the in-memory attachment.
+    assert.deepEqual(runner.rememberedAttachments(), [{ alias: "other", path: other, type: "duckdb", readOnly: false }]);
+    // The window closes.
+    runner.liveSession().dispose();
+    await until(() => runner.liveSession() === null, "the session to end");
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  {
+    // A new window on the same workspace.
+    const { vscode, shown, runner, open, run } = await startRunner(t, config, context);
+    const read = open(path.join(dir, "read.sql"), "SELECT n FROM kept;\nSELECT five FROM other.o;");
+    const got = await run(read);
+    assert.deepEqual(got.map((r) => r.kind), ["rows", "rows"], JSON.stringify(got));
+    assert.deepEqual(got[0].data, [["99"]]);
+    assert.deepEqual(got[1].data, [["5"]], "other.duckdb was attached again");
+    assert.match(shown.log.join(""), /re-attached other/);
+
+    // An attachment whose file is gone is reported, kept, and can be forgotten.
+    runner.liveSession().dispose();
+    await until(() => runner.liveSession() === null, "the session to end");
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(other);
+    fs.mkdirSync(other); // a directory: cannot be attached
+    assert.deepEqual((await run(read)).map((r) => r.kind), ["rows", "error"]);
+    assert.equal(shown.warnings.filter((w) => /could not re-attach other/.test(w)).length, 1, shown.warnings.join("\n"));
+    assert.match(runner.rememberedAttachments()[0].error, /Error/);
+    runner.forgetAttachment("other");
+    assert.deepEqual(runner.rememberedAttachments(), []);
+
+    // Deleting the workspace database asks first, then starts clean.
+    vscode.window.showWarningMessage = async (m, ...rest) => (rest.includes("Delete") ? "Delete" : undefined);
+    await shown.commands.get("grebe.duckdb.resetWorkspaceDatabase")();
+    assert.equal(fs.existsSync(path.join(storage, "ws", "session.duckdb")), false);
+    assert.equal((await run(read))[0].kind, "error", "kept is gone");
+  }
 });

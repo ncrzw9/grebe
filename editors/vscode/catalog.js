@@ -10,6 +10,13 @@
 // waits behind a query running in the session. Levels with one child are
 // collapsed (one database shows its schemas; a lone `main` shows its
 // tables) to keep the tree short.
+//
+// The catalog is kept from one window to the next: what is attached to a
+// session is attached again when the session restarts (sessions.js), an
+// attachment that could not be brought back stays listed with the reason,
+// and the files being browsed are browsed again. When files run in sessions
+// of their own (`-- grebe: session NAME`), every running session has a root
+// here; the one the file in front uses is the open one.
 
 "use strict";
 
@@ -84,8 +91,15 @@ class Explorer {
     this.deps = deps;
     this.changed = new vscode.EventEmitter();
     this.onDidChangeTreeData = this.changed.event;
-    this.files = new Map(); // alias -> { file, error }
+    // alias -> { file, error }: the files being browsed, kept with the
+    // workspace so they are still here after a reload.
+    this.state = deps.state || null;
+    this.files = new Map((this.state ? this.state.get(FILES_KEY, []) : []).map((f) => [f.alias, { file: f.file, error: null }]));
     this.fileSession = null;
+  }
+
+  saveFiles() {
+    if (this.state) this.state.update(FILES_KEY, [...this.files].map(([alias, f]) => ({ alias, file: f.file })));
   }
 
   refresh() {
@@ -113,20 +127,42 @@ class Explorer {
 
   async roots() {
     const s = this.deps.settings();
-    const label = s.database === ":memory:" ? ":memory:" : path.basename(s.database);
-    // How much memory the session holds, when it is running. Asked here,
+    const current = this.deps.sessionName ? this.deps.sessionName() : "default";
+    const labelOf = (database) => (database === ":memory:" || database === ":workspace:" ? database : path.basename(database));
+    // How much memory a session holds, when it is running. Asked here,
     // not with the children: the root's own line is drawn before them.
+    const memoryOf = async (sess) => (sess ? (objects(await sess.run(MEMORY).catch(() => ({ kind: "error" }))) || [])[0] : null);
     const live = this.deps.liveSession();
-    const mem = live ? (objects(await live.run(MEMORY).catch(() => ({ kind: "error" }))) || [])[0] : null;
+    const mem = await memoryOf(live);
+    // The running session knows what it opened; before it starts, the
+    // setting is what it will open.
+    const database = live ? this.shownDatabase(live, s) : s.database;
+    const named = current === "default" ? "" : ` ${current}`;
     const roots = [
-      node("root", `Session · ${label}`, vscode.TreeItemCollapsibleState.Expanded, {
+      node("root", `Session${named} · ${labelOf(database)}`, vscode.TreeItemCollapsibleState.Expanded, {
         source: "session",
         icon: "database",
         description: mem ? `${mem.used} of ${mem.limit} in use` : undefined,
-        tooltip: `The database your runs use: ${s.database}` + (mem ? `\nMemory in use: ${mem.used} (limit ${mem.limit})` : ""),
+        tooltip: `The database your runs use: ${database}` + (mem ? `\nMemory in use: ${mem.used} (limit ${mem.limit})` : ""),
         contextValue: "grebe.sessionRoot",
       }),
     ];
+    // Every other session that is running: files that asked for one of
+    // their own (`-- grebe: session NAME`).
+    for (const { name, session } of this.deps.liveSessions ? this.deps.liveSessions() : []) {
+      if (name === current) continue;
+      const m = await memoryOf(session);
+      const db = this.shownDatabase(session, s);
+      roots.push(
+        node("root", `Session${name === "default" ? "" : ` ${name}`} · ${labelOf(db)}`, vscode.TreeItemCollapsibleState.Collapsed, {
+          source: `session:${name}`,
+          icon: "database",
+          description: m ? `${m.used} of ${m.limit} in use` : undefined,
+          tooltip: `Another running session: ${db}`,
+          contextValue: "grebe.otherSessionRoot",
+        }),
+      );
+    }
     for (const [alias, f] of this.files) {
       roots.push(
         node("root", path.basename(f.file), vscode.TreeItemCollapsibleState.Expanded, {
@@ -142,8 +178,21 @@ class Explorer {
     return roots;
   }
 
+  /** A running session's database as the setting names it: the workspace
+   *  database is `:workspace:`, not a path into the editor's storage. */
+  shownDatabase(sess, s) {
+    const d = sess.opts.database;
+    return s.database === ":workspace:" && /[\\/]session(-[^\\/]*)?\.duckdb$/.test(d) ? ":workspace:" : d;
+  }
+
   async sessionFor(source) {
     if (source === "session") return this.deps.currentSession();
+    if (isSession(source)) {
+      const name = source.slice("session:".length);
+      const found = (this.deps.liveSessions ? this.deps.liveSessions() : []).find((x) => x.name === name);
+      if (!found) throw new Error(`the session ${name} is not running`);
+      return found.session;
+    }
     if (!this.fileSession || !this.fileSession.alive) {
       this.fileSession = new Session({ cli: this.deps.cli(), database: ":memory:", cwd: process.cwd() });
       await this.fileSession.start();
@@ -183,7 +232,7 @@ class Explorer {
       dbs.sort((a, b) => rank(a) - rank(b) || a.db.localeCompare(b.db));
     }
     const nodes = dbs.map((d) => {
-      const attached = root.source === "session" && !d.current && d.db !== "temp";
+      const attached = isSession(root.source) && !d.current && d.db !== "temp";
       // PostgreSQL, SQLite, ...: DuckDB estimates no rows for their tables
       // (it says 0), and lists each table's row type as a type of its own.
       const foreign = d.type && d.type !== "duckdb";
@@ -198,10 +247,26 @@ class Explorer {
         contextValue: attached ? "grebe.attachedDb" : "grebe.db",
       });
     });
-    const session = root.source === "session" ? await this.sessionGroups(sess) : [];
+    const session = isSession(root.source) ? await this.sessionGroups(sess) : [];
+    // What should be attached and is not: it could not be brought back
+    // when the session started (a file that moved, a server that is down).
+    if (root.source === "session" && this.deps.remembered) {
+      for (const rec of this.deps.remembered()) {
+        if (!rec.error || dbs.some((d) => d.db === rec.alias)) continue;
+        nodes.push(
+          node("lost", rec.alias, vscode.TreeItemCollapsibleState.None, {
+            icon: "warning",
+            alias: rec.alias,
+            description: `not attached · ${conninfo.where(rec.path)}`,
+            tooltip: `Could not be attached again when the session started:\n${conninfo.redact(rec.error)}\n\nRestart the session to try again, or forget it.`,
+            contextValue: "grebe.lostDb",
+          }),
+        );
+      }
+    }
     if (nodes.length === 0) return [message("No tables yet"), ...session];
     // One database: show its contents directly.
-    return nodes.length === 1 ? [...this.dbChildren(nodes[0]), ...session] : [...nodes, ...session];
+    return nodes.length === 1 && nodes[0].kind === "db" ? [...this.dbChildren(nodes[0]), ...session] : [...nodes, ...session];
   }
 
   /** Variables, secrets and extensions: what the session holds outside any
@@ -325,6 +390,7 @@ class Explorer {
       return;
     }
     log.info("catalog", sql);
+    await this.remember();
     this.refresh();
     vscode.window.setStatusBarMessage(`grebe: attached as ${alias}; query it as ${alias}.<table>`, 5000);
   }
@@ -382,6 +448,7 @@ class Explorer {
       return;
     }
     log.info("catalog", attachSql(conn));
+    await this.remember();
     this.refresh();
     vscode.window.setStatusBarMessage(`grebe: attached ${where} as ${alias}; query it as ${alias}.<schema>.<table>`, 5000);
   }
@@ -389,13 +456,26 @@ class Explorer {
   /** DETACH an attached database from the session. */
   async detach(n) {
     if (!n || n.kind !== "db") return;
-    const sess = await this.deps.currentSession();
+    const sess = await this.sessionFor(n.source);
     const r = await sess.run(`DETACH ${ident(n.db)}`);
     if (r.kind === "error") {
       log.report("catalog", `could not detach ${n.db}: ${r.type} Error: ${r.message}`);
       return;
     }
     log.info("catalog", `DETACH ${ident(n.db)}`);
+    await this.remember();
+    this.refresh();
+  }
+
+  /** Note what the session has attached now, so it comes back with it. */
+  async remember() {
+    if (this.deps.remember) await this.deps.remember();
+  }
+
+  /** Stop trying to bring back an attachment that is gone. */
+  forget(n) {
+    if (!n || n.kind !== "lost" || !this.deps.forget) return;
+    this.deps.forget(n.alias);
     this.refresh();
   }
 
@@ -464,6 +544,7 @@ class Explorer {
     let alias = path.basename(file).replace(/\.[^.]+$/, "").replace(/[^A-Za-z0-9_]/g, "_") || "db";
     while (this.files.has(alias) && this.files.get(alias).file !== file) alias += "_";
     this.files.set(alias, { file, error: null });
+    this.saveFiles();
     const sess = await this.sessionFor("file");
     const r = await sess.run(`ATTACH ${lit(file)} AS ${ident(alias)} (READ_ONLY)`);
     // Already attached by an earlier browse: fine.
@@ -475,6 +556,7 @@ class Explorer {
     if (!n || n.source !== "file") return;
     const f = this.files.get(n.alias);
     this.files.delete(n.alias);
+    this.saveFiles();
     if (f && this.fileSession && this.fileSession.alive) await this.fileSession.run(`DETACH ${ident(n.alias)}`);
     this.refresh();
   }
@@ -486,6 +568,11 @@ class Explorer {
 }
 
 let nextId = 2e9;
+
+const FILES_KEY = "grebe.catalog.files";
+
+/** A root that is a session: the current one, or another by name. */
+const isSession = (source) => source === "session" || String(source).startsWith("session:");
 
 /** `wanted` made into an identifier no database in `sess` already uses. */
 async function freeAlias(sess, wanted) {
@@ -572,6 +659,7 @@ function activate(context, deps) {
     on("attach", (uri) => explorer.attach(uri)),
     on("attachPostgres", () => explorer.attachPostgres()),
     on("detach", (n) => explorer.detach(n)),
+    on("forget", (n) => explorer.forget(n)),
     on("closeFile", (n) => explorer.closeFile(n)),
     on("useAsDatabase", async (arg) => {
       const uri = fileArg(arg);
