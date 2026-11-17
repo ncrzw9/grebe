@@ -31,7 +31,20 @@ parallelises across files; DuckDB dialect selected for every tool.
 
 Versions: sqruff 0.40.0, sqlfmt 0.32.0, SQLFluff 4.3.0. The tools differ in
 rule sets and formatting style, so this compares the time to check a
-project, not identical work.
+project, not identical work. The grebe columns above are 0.6.4's.
+
+Since 0.6.4 the parser builds its tree in a second pass, reuses its memo
+table, and skips grammar alternatives that cannot start with the token at
+hand. Measured before and after on one 4-core Linux machine (a different
+one from the table above), median of 3 runs, wall time and peak memory:
+
+| Input                                    | check before | check after | format --check before | format --check after |
+|------------------------------------------|-------------:|------------:|----------------------:|---------------------:|
+| TPC-H + TPC-DS, 121 files                | 0.19 s, 64 MB | 0.12 s, 21 MB | 0.13 s, 52 MB | 0.11 s, 21 MB |
+| 1,000 model files                        | 1.02 s, 84 MB | 0.61 s, 31 MB | 0.68 s, 86 MB | 0.48 s, 35 MB |
+| DuckDB's SQL tests, 5,516 files, 24 MB   | 13.1 s, 2.8 GB | 4.1 s, 192 MB | 9.6 s, 2.9 GB | 3.1 s, 228 MB |
+| One statement, 400 nested parentheses    | 0.44 s, 603 MB | 0.04 s, 14 MB | | |
+| One statement, an `IN` list of 50,000    | 1.84 s, 860 MB | 0.89 s, 222 MB | 1.76 s, 860 MB | 1.30 s, 318 MB |
 
 ## Install
 
