@@ -96,6 +96,10 @@ class Explorer {
     this.state = deps.state || null;
     this.files = new Map((this.state ? this.state.get(FILES_KEY, []) : []).map((f) => [f.alias, { file: f.file, error: null }]));
     this.fileSession = null;
+    // Each running session's last memory figures, { used, limit }, and the
+    // sessions that have been asked for newer ones.
+    this.mem = new WeakMap();
+    this.memAsking = new WeakSet();
   }
 
   saveFiles() {
@@ -129,11 +133,12 @@ class Explorer {
     const s = this.deps.settings();
     const current = this.deps.sessionName ? this.deps.sessionName() : "default";
     const labelOf = (database) => (database === ":memory:" || database === ":workspace:" ? database : path.basename(database));
-    // How much memory a session holds, when it is running. Asked here,
-    // not with the children: the root's own line is drawn before them.
-    const memoryOf = async (sess) => (sess ? (objects(await sess.run(MEMORY).catch(() => ({ kind: "error" }))) || [])[0] : null);
+    // How much memory a session holds, when it is running. Not awaited:
+    // the question waits behind whatever the session is running, and the
+    // tree must not stay empty until a long query ends. The last figure is
+    // drawn now; a different one redraws the tree when it arrives.
     const live = this.deps.liveSession();
-    const mem = await memoryOf(live);
+    const mem = this.memoryOf(live);
     // The running session knows what it opened; before it starts, the
     // setting is what it will open.
     const database = live ? this.shownDatabase(live, s) : s.database;
@@ -151,7 +156,7 @@ class Explorer {
     // their own (`-- grebe: session NAME`).
     for (const { name, session } of this.deps.liveSessions ? this.deps.liveSessions() : []) {
       if (name === current) continue;
-      const m = await memoryOf(session);
+      const m = this.memoryOf(session);
       const db = this.shownDatabase(session, s);
       roots.push(
         node("root", `Session${name === "default" ? "" : ` ${name}`} · ${labelOf(db)}`, vscode.TreeItemCollapsibleState.Collapsed, {
@@ -181,8 +186,37 @@ class Explorer {
   /** A running session's database as the setting names it: the workspace
    *  database is `:workspace:`, not a path into the editor's storage. */
   shownDatabase(sess, s) {
-    const d = sess.opts.database;
+    const d = sess.opts ? sess.opts.database : s.database;
     return s.database === ":workspace:" && /[\\/]session(-[^\\/]*)?\.duckdb$/.test(d) ? ":workspace:" : d;
+  }
+
+  /** The last memory figures heard from `sess` (null until it answers), and
+   *  a question for newer ones. */
+  memoryOf(sess) {
+    if (!sess) return null;
+    this.askMemory(sess);
+    return this.mem.get(sess) || null;
+  }
+
+  /** Ask `sess` for its memory figures, one question at a time; redraw if
+   *  they changed. An unchanged answer redraws nothing, so a redraw never
+   *  asks again forever. */
+  askMemory(sess) {
+    if (this.memAsking.has(sess)) return;
+    this.memAsking.add(sess);
+    sess
+      .run(MEMORY)
+      .then((r) => {
+        const m = (objects(r) || [])[0];
+        if (!m || !sess.alive) return;
+        const was = this.mem.get(sess);
+        this.mem.set(sess, m);
+        if (!was || was.used !== m.used || was.limit !== m.limit) this.refresh();
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.memAsking.delete(sess);
+      });
   }
 
   async sessionFor(source) {

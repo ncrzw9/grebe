@@ -625,11 +625,11 @@ const currentSessionName = () => currentName;
 const rememberAttachments = (name = currentName) => manager.remember(name);
 
 /** What the current session attaches when it starts. */
-const rememberedAttachments = () => manager.remembered(currentName);
+const rememberedAttachments = () => (manager ? manager.remembered(currentName) : []);
 const forgetAttachment = (alias) => manager.forget(currentName, alias);
 
 /** Every running session: `[{ name, session }]`. */
-const liveSessions = () => manager.names().map((name) => ({ name, session: manager.live(name) }));
+const liveSessions = () => (manager ? manager.names().map((name) => ({ name, session: manager.live(name) })) : []);
 
 /** The name of the session `doc` runs in. */
 const sessionNameOf = (doc) => (directive(doc.getText()) || { name: DEFAULT }).name;
@@ -664,6 +664,25 @@ async function resetWorkspaceDatabase() {
   for (const f of files) fs.rmSync(path.join(storageDir, f), { force: true });
   log.info("duckdb", `deleted the workspace database (${files.join(", ")})`);
   for (const l of runListeners) l();
+}
+
+/** The Restart DuckDB Session command, from the palette or the Catalog: ends
+ *  the duckdb process, which hands back all the memory it held. A running
+ *  session loses what lives only in it, so that asks first. */
+async function restartSession() {
+  const live = liveSession();
+  if (live) {
+    const db = live.opts.database;
+    const kept = settings().database === WORKSPACE && storageDir && path.dirname(db) === storageDir ? "The workspace database" : path.basename(db);
+    const detail =
+      db === MEMORY
+        ? "The in-memory database and every table in it are discarded."
+        : `Temporary tables, settings and secrets are discarded. ${kept} is kept, and attached databases are attached again.`;
+    const which = currentName === DEFAULT ? "the DuckDB session" : `the DuckDB session "${currentName}"`;
+    const pick = await vscode.window.showWarningMessage(`Restart ${which}?`, { modal: true, detail }, "Restart");
+    if (pick !== "Restart") return;
+  }
+  restart();
 }
 
 /**
@@ -798,7 +817,7 @@ function activate(context, clientReady) {
     log.command("grebe.duckdb.runRange", runRange),
     vscode.languages.registerCodeLensProvider({ language: "sql" }, lenses),
     lenses,
-    log.command("grebe.duckdb.restart", restart),
+    log.command("grebe.duckdb.restart", restartSession),
     log.command("grebe.duckdb.cancel", cancel),
     log.command("grebe.duckdb.chooseDatabase", chooseDatabase),
     log.command("grebe.duckdb.resetWorkspaceDatabase", resetWorkspaceDatabase),

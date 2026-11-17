@@ -272,6 +272,7 @@ function html(scriptUri, cspSource) {
   pre.context { margin: 2px 0 2px calc(1ch + 8px); color: var(--vscode-descriptionForeground); font-family: inherit; }
   #tabs { flex: none; display: flex; align-items: center; gap: 12px; padding: 0 10px; border-bottom: 1px solid var(--vscode-panel-border); min-width: 0; }
   #tablist { display: flex; gap: 2px; overflow-x: auto; min-width: 0; }
+  #tabpick { flex: none; width: 9em; font: inherit; font-size: 11px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 1px 4px; }
   #filter { margin-left: auto; display: flex; gap: 4px; align-items: center; flex: none; padding: 2px 0; }
   #filter input, #filter select { font: inherit; font-size: 11px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 1px 4px; }
   #filter input { width: 16em; }
@@ -296,7 +297,7 @@ function html(scriptUri, cspSource) {
 </head>
 <body>
 <header id="bar"><span id="title">No results yet.</span><span id="summary" class="meta">Run a statement, or open a data file.</span></header>
-<nav id="tabs" hidden><div id="tablist"></div><div id="filter" hidden><input id="filter-text" type="text" placeholder="Filter" aria-label="Filter rows" spellcheck="false"><select id="filter-mode" aria-label="How to match"><option value="contains">contains</option><option value="equals">equals</option><option value="starts">starts with</option><option value="regex">regex</option></select><select id="filter-col" aria-label="Which column"></select></div></nav>
+<nav id="tabs" hidden><div id="tablist"></div><select id="tabpick" hidden aria-label="All results"></select><div id="filter" hidden><input id="filter-text" type="text" placeholder="Filter" aria-label="Filter rows" spellcheck="false"><select id="filter-mode" aria-label="How to match"><option value="contains">contains</option><option value="equals">equals</option><option value="starts">starts with</option><option value="regex">regex</option></select><select id="filter-col" aria-label="Which column"></select></div></nav>
 <div id="main"></div>
 <footer id="status" hidden></footer>
 <div id="announce" class="sr-only" role="status"></div>
