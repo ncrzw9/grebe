@@ -221,6 +221,10 @@ fn handle_message<W: Write>(
             let result = handle_completion(&params, state, writer);
             respond(writer, id, result);
         }
+        Some("textDocument/hover") => {
+            let result = handle_hover(&params, state, writer);
+            respond(writer, id, result);
+        }
         Some("grebe/catalog") => handle_catalog(&params, state, writer),
         Some("workspace/didChangeConfiguration") => {
             handle_did_change_configuration(&params, state, writer);
@@ -383,6 +387,8 @@ fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W)
                     Json::Array(vec![
                         Json::str("quickfix"),
                         Json::str(crate::friendly::ACTION_KIND),
+                        // "Expand * to columns", with a catalog.
+                        Json::str(crate::expand::ACTION_KIND),
                     ]),
                 )]),
             ),
@@ -400,6 +406,9 @@ fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W)
                     Json::Array(vec![Json::str(".")]),
                 )]),
             ),
+            // What the catalog knows of the table, alias or column under
+            // the cursor; nothing without a catalog.
+            ("hoverProvider".into(), Json::Bool(true)),
         ]),
     )])
 }
@@ -899,13 +908,23 @@ fn handle_code_action<W: Write>(params: &Json, state: &mut State, writer: &mut W
     let mut actions = crate::code_action::actions(&uri, &text, &findings, range, encoding);
     // The friendly SQL rewrite, only when the client asks for it by kind:
     // it rewrites the whole document, which is not what a lightbulb is for.
-    if crate::friendly::asked_for(params.get("context").and_then(|c| c.get("only"))) {
+    let only = params.get("context").and_then(|c| c.get("only"));
+    if crate::friendly::asked_for(only) {
         let whole = Json::object(vec![(
             "textDocument".into(),
             Json::object(vec![("uri".into(), Json::str(&uri))]),
         )]);
         let edits = friendly_edits(&whole, state, writer);
         actions.extend(crate::friendly::action(&uri, edits));
+    }
+    // A `SELECT *` written out as its columns: a rewrite, offered where
+    // refactorings are, when the catalog knows every table of the query.
+    if let Some(catalog) = resolved
+        .catalog
+        .as_deref()
+        .filter(|_| crate::expand::asked_for(only))
+    {
+        actions.extend(crate::expand::action(&uri, &text, range, catalog, encoding));
     }
     Json::Array(actions)
 }
@@ -1236,26 +1255,20 @@ fn handle_catalog<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
     }
 }
 
-/// `textDocument/completion`: see [`crate::completion`]. A document the
-/// server has not seen answers with an empty list.
-fn handle_completion<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Json {
-    let empty = || {
-        Json::object(vec![
-            ("isIncomplete".into(), Json::Bool(false)),
-            ("items".into(), Json::Array(vec![])),
-        ])
-    };
-    let Some(uri) = params
+/// What a request at a position is about: the document's text, the byte
+/// the position is at, and the catalog the document is read against.
+/// `None` for a document the server has not seen.
+fn at_position<W: Write>(
+    params: &Json,
+    state: &mut State,
+    writer: &mut W,
+) -> Option<(String, u32, Option<Rc<Catalog>>)> {
+    let uri = params
         .get("textDocument")
         .and_then(|d| d.get("uri"))
         .and_then(Json::as_str)
-        .map(str::to_string)
-    else {
-        return empty();
-    };
-    let Some(text) = state.documents.get(&uri).cloned() else {
-        return empty();
-    };
+        .map(str::to_string)?;
+    let text = state.documents.get(&uri).cloned()?;
     let num = |v: Option<&Json>| v.and_then(Json::as_f64).unwrap_or(0.0) as u32;
     let p = params.get("position");
     let offset = position::position_to_byte(
@@ -1275,6 +1288,53 @@ fn handle_completion<W: Write>(params: &Json, state: &mut State, writer: &mut W)
         config_for_uri(&uri, state, writer)
     };
     let catalog = catalog_for_uri(&uri, config.as_ref(), state, writer);
+    Some((text, offset, catalog))
+}
+
+/// `textDocument/hover`: see [`crate::hover`]. `null` when there is
+/// nothing to say: no catalog, or a name it cannot vouch for.
+fn handle_hover<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Json {
+    let Some((text, offset, Some(catalog))) = at_position(params, state, writer) else {
+        return Json::Null;
+    };
+    let Some(found) = crate::hover::hover(&text, offset, &catalog) else {
+        return Json::Null;
+    };
+    let encoding = state.encoding;
+    let at = |byte: u32| {
+        let (line, character) = position::byte_to_position(&text, byte, encoding);
+        pos(line, character)
+    };
+    Json::object(vec![
+        (
+            "contents".into(),
+            Json::object(vec![
+                ("kind".into(), Json::str("markdown")),
+                ("value".into(), Json::str(&found.contents)),
+            ]),
+        ),
+        (
+            "range".into(),
+            Json::object(vec![
+                ("start".into(), at(found.span.start)),
+                ("end".into(), at(found.span.end)),
+            ]),
+        ),
+    ])
+}
+
+/// `textDocument/completion`: see [`crate::completion`]. A document the
+/// server has not seen answers with an empty list.
+fn handle_completion<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Json {
+    let empty = || {
+        Json::object(vec![
+            ("isIncomplete".into(), Json::Bool(false)),
+            ("items".into(), Json::Array(vec![])),
+        ])
+    };
+    let Some((text, offset, catalog)) = at_position(params, state, writer) else {
+        return empty();
+    };
     let found = crate::completion::complete(&text, offset, catalog.as_deref());
     Json::object(vec![
         ("isIncomplete".into(), Json::Bool(found.incomplete)),

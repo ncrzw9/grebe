@@ -188,9 +188,15 @@ FROM duckdb_columns() WHERE NOT internal;
 
 The language server completes from the same catalog: columns after
 `alias.`, tables after `FROM`, what is inside a schema or database after
-`name.`, on statements that do not parse yet. An editor with a database
-open can send its catalog directly (the VS Code extension sends the
-session's); any other LSP client gets the `grebe.toml` one.
+`name.`, the columns of the statement's tables wherever a column goes, on
+statements that do not parse yet. With the metadata `grebe catalog
+--with-metadata` writes (types, NOT NULL, keys, indexes, row estimates) it
+also shows them in completion and on hover over a table, an alias or a
+column, offers the join condition the keys imply right after `ON`, and has
+a code action, **Expand \* to columns** (`refactor.rewrite`), that writes a
+`SELECT *` out as its columns when every table is in the catalog. An editor
+with a database open can send its catalog directly (the VS Code extension
+sends the session's); any other LSP client gets the `grebe.toml` one.
 
 An editor sends it with the `grebe/catalog` notification: the whole
 snapshot (`{ columns: [...] }`), or one database at a time

@@ -1492,3 +1492,266 @@ fn friendly_is_a_source_action_when_asked_for() {
         "{quick:?}"
     );
 }
+
+/// A `grebe/catalog` with what `grebe catalog --with-metadata` adds: types,
+/// NOT NULL, keys, indexes and row estimates.
+const SHOP_META: &str = r#"{"columns": [
+{"database":"shop","schema":"main","table":"orders","column":"id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"orders","column":"customer_id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"orders","column":"total","type":"DECIMAL(10,2)","nullable":true},
+{"database":"shop","schema":"main","table":"customers","column":"id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"customers","column":"email","type":"VARCHAR","nullable":false},
+{"database":"shop","schema":"main","table":"customers","column":"name","type":"VARCHAR","nullable":true},
+{"database":"other","schema":"main","table":"customers","column":"id","type":"INTEGER","nullable":true}],
+"tables": [
+{"database":"shop","schema":"main","table":"orders","kind":"table","rows":1240000,"primary_key":["id"],"unique":[],"indexes":[["customer_id"]]},
+{"database":"shop","schema":"main","table":"customers","kind":"table","rows":2500,"primary_key":["id"],"unique":[["email"]],"indexes":null}]}"#;
+
+fn hover_request(id: i64, uri: &str, line: u32, character: u32) -> String {
+    request(
+        id,
+        "textDocument/hover",
+        Json::object(vec![
+            ("textDocument".into(), text_document(uri, vec![])),
+            ("position".into(), lsp_position(line, character)),
+        ]),
+    )
+}
+
+/// The Markdown of a hover, `None` for a `null` result.
+fn hover_text(messages: &[Json], id: f64) -> Option<String> {
+    let result = result_of(messages, id);
+    if result == Json::Null {
+        return None;
+    }
+    let contents = result.get("contents").expect("hover contents");
+    assert_eq!(
+        contents.get("kind").and_then(Json::as_str),
+        Some("markdown")
+    );
+    contents
+        .get("value")
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+fn initialize_advertises_hover_and_the_expand_action() {
+    let messages = run_session(&[]);
+    let caps = messages[0]
+        .get("result")
+        .and_then(|r| r.get("capabilities"))
+        .unwrap();
+    assert_eq!(caps.get("hoverProvider"), Some(&Json::Bool(true)));
+    let kinds = caps
+        .get("codeActionProvider")
+        .and_then(|p| p.get("codeActionKinds"))
+        .and_then(Json::as_array)
+        .unwrap();
+    assert!(kinds.contains(&Json::str("refactor.rewrite")), "{kinds:?}");
+}
+
+#[test]
+fn hover_describes_tables_aliases_and_columns_from_the_catalog() {
+    let uri = "file:///hover/q.sql";
+    // shop.customers and other.customers: `customers` alone is two tables.
+    let sql = "SELECT o.total, c.email FROM shop.main.orders o JOIN shop.customers c ON true;\n\
+               SELECT id FROM customers;\n\
+               SELECT nope FROM orders;";
+    let messages = run_session(&[
+        catalog_message(SHOP_META),
+        did_open(uri, sql),
+        // `orders` in the FROM.
+        hover_request(2, uri, 0, 41),
+        // `o.total`.
+        hover_request(3, uri, 0, 11),
+        // The alias `c`, where it is used.
+        hover_request(4, uri, 0, 16),
+        // `c.email`.
+        hover_request(5, uri, 0, 19),
+        // `customers` in two databases, and its column.
+        hover_request(6, uri, 1, 17),
+        hover_request(7, uri, 1, 7),
+        // A column the table does not have; a keyword.
+        hover_request(8, uri, 2, 8),
+        hover_request(9, uri, 2, 2),
+        // A document the server has not seen.
+        hover_request(10, "file:///hover/unknown.sql", 0, 0),
+    ]);
+    assert_eq!(
+        hover_text(&messages, 2.0).unwrap(),
+        "`shop.main.orders` — table, about 1.24 million rows\n\n\
+         Primary key: `id`  \n\
+         Indexes: `customer_id`\n\n\
+         ```text\n\
+         id           BIGINT NOT NULL\n\
+         customer_id  BIGINT NOT NULL\n\
+         total        DECIMAL(10,2)\n\
+         ```"
+    );
+    assert_eq!(
+        hover_text(&messages, 3.0).unwrap(),
+        "`orders.total` — `DECIMAL(10,2)`, nullable\n\n\
+         Column of table `shop.main.orders`."
+    );
+    assert!(
+        hover_text(&messages, 4.0)
+            .unwrap()
+            .starts_with("`c` is `shop.main.customers` — table, about 2.5 thousand rows"),
+    );
+    assert_eq!(
+        hover_text(&messages, 5.0).unwrap(),
+        "`customers.email` — `VARCHAR`, NOT NULL\n\n\
+         Column of table `shop.main.customers`. Unique."
+    );
+    for id in [6.0, 7.0, 8.0, 9.0, 10.0] {
+        assert_eq!(hover_text(&messages, id), None, "request {id}");
+    }
+    // The hover's range is the name.
+    let range = result_of(&messages, 3.0).get("range").cloned().unwrap();
+    assert_eq!(range, lsp_range((0, 9), (0, 14)));
+}
+
+#[test]
+fn hover_says_nothing_without_a_catalog() {
+    let uri = "file:///hover/none.sql";
+    let messages = run_session(&[
+        did_open(uri, "SELECT id FROM orders"),
+        hover_request(2, uri, 0, 16),
+        hover_request(3, uri, 0, 8),
+    ]);
+    assert_eq!(hover_text(&messages, 2.0), None);
+    assert_eq!(hover_text(&messages, 3.0), None);
+}
+
+#[test]
+fn completion_shows_types_keys_and_sizes_and_offers_the_join() {
+    let uri = "file:///catalog/meta.sql";
+    let messages = run_session(&[
+        catalog_message(SHOP_META),
+        did_open(
+            uri,
+            "FROM shop.orders o JOIN shop.customers c ON \nSELECT * FROM shop.main.ord",
+        ),
+        completion_request(2, uri, 0, 44),
+        completion_request(3, uri, 1, 27),
+    ]);
+    let items = |id: f64| -> Vec<(String, String)> {
+        result_of(&messages, id)
+            .get("items")
+            .and_then(Json::as_array)
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i.get("label").and_then(Json::as_str).unwrap().to_string(),
+                    i.get("detail")
+                        .and_then(Json::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+    let join = items(2.0);
+    assert_eq!(
+        join[0],
+        (
+            "o.customer_id = c.id".to_string(),
+            "join · primary key of customers".to_string()
+        )
+    );
+    assert!(
+        join.contains(&(
+            "email".to_string(),
+            "VARCHAR NOT NULL · unique · customers".to_string()
+        )),
+        "{join:?}"
+    );
+    assert_eq!(
+        items(3.0),
+        [(
+            "orders".to_string(),
+            "table · shop.main · about 1.24 million rows".to_string()
+        )]
+    );
+}
+
+#[test]
+fn a_star_can_be_expanded_when_every_table_is_known() {
+    let uri = "file:///expand/q.sql";
+    let code_action = |id: i64, uri: &str, line: u32, character: u32, only: Option<&[&str]>| {
+        let mut context = vec![("diagnostics".to_string(), Json::Array(vec![]))];
+        if let Some(kinds) = only {
+            context.push((
+                "only".to_string(),
+                Json::Array(kinds.iter().map(|k| Json::str(*k)).collect()),
+            ));
+        }
+        request(
+            id,
+            "textDocument/codeAction",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                (
+                    "range".into(),
+                    lsp_range((line, character), (line, character)),
+                ),
+                ("context".into(), Json::object(context)),
+            ]),
+        )
+    };
+    let none = "file:///expand/none.sql";
+    let sql = "SELECT * EXCLUDE (name) FROM shop.customers c JOIN shop.orders o ON true;\n\
+               SELECT * FROM shop.orders, nope;\n";
+    let messages = run_session(&[
+        catalog_message(SHOP_META),
+        did_open(uri, sql),
+        did_open(none, sql),
+        catalog_notification(Some(none), "null"),
+        code_action(2, uri, 0, 7, None),
+        code_action(3, uri, 0, 7, Some(&["refactor"])),
+        code_action(4, uri, 0, 7, Some(&["quickfix"])),
+        // A star next to a table the catalog does not have.
+        code_action(5, uri, 1, 7, None),
+        // A document without a catalog.
+        code_action(6, none, 0, 7, None),
+        // Not on a star.
+        code_action(7, uri, 0, 40, None),
+    ]);
+    let expansions = |id: f64| -> Vec<Json> {
+        result_of(&messages, id)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a.get("kind").and_then(Json::as_str) == Some("refactor.rewrite"))
+            .cloned()
+            .collect()
+    };
+    for id in [2.0, 3.0] {
+        let actions = expansions(id);
+        assert_eq!(actions.len(), 1, "request {id}");
+        assert_eq!(
+            actions[0].get("title").and_then(Json::as_str),
+            Some("Expand * to columns")
+        );
+        assert!(actions[0].get("diagnostics").is_none());
+        let edits = text_edits(
+            actions[0]
+                .get("edit")
+                .and_then(|e| e.get("changes"))
+                .and_then(|c| c.get(uri))
+                .unwrap(),
+        );
+        assert_eq!(
+            edits,
+            [(
+                [0, 7, 0, 23],
+                "c.id, c.email, o.id, o.customer_id, o.total".to_string()
+            )]
+        );
+    }
+    for id in [4.0, 5.0, 6.0, 7.0] {
+        assert!(expansions(id).is_empty(), "request {id}");
+    }
+}

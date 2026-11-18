@@ -19,7 +19,10 @@
 //! `source.grebe.friendly`; `textDocument/completion`; and `grebe/catalog`, by which an editor that
 //! has a database open hands over what is in it, for completion and for the
 //! `CAT` rules (a `catalog = "..."` file in `grebe.toml` does the same for
-//! an editor that does not).
+//! an editor that does not). With a catalog it also answers
+//! `textDocument/hover` on a table, an alias or a column, and offers to
+//! write a `SELECT *` out as its columns (the code action
+//! `refactor.rewrite`, see [`expand`]).
 //!
 //! Everything but [`serve`] is `pub(crate)`-shaped in spirit but kept
 //! `pub` where tests in `tests/` need it; [`serve`] is the only API the
@@ -27,7 +30,9 @@
 
 pub mod code_action;
 pub mod completion;
+pub mod expand;
 pub mod friendly;
+pub mod hover;
 pub use grebe_rules::json;
 pub mod position;
 pub mod semantic;
