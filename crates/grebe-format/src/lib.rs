@@ -1139,7 +1139,10 @@ mod tests {
         // A comment that starts on the `;` line and runs on stays whole
         // and stays with its statement.
         let src = "SELEC 1 FRM; /* one\n   two */\nselect 1;\n";
-        assert_eq!(format(src, &o), "SELEC 1 FRM; /* one\n   two */\n\nSELECT 1;\n");
+        assert_eq!(
+            format(src, &o),
+            "SELEC 1 FRM; /* one\n   two */\n\nSELECT 1;\n"
+        );
         // A good statement begun on a bad one's line is still formatted.
         let src = "SELEC 1 FRM; select 'a\n   b';\n";
         assert_eq!(format(src, &o), "SELEC 1 FRM;\n\nSELECT 'a\n   b';\n");
