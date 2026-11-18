@@ -19,7 +19,7 @@ const vscode = {
   TreeItem: class { constructor(label, state) { this.label = label; this.collapsibleState = state; } },
   TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   ThemeIcon: class { constructor(id) { this.id = id; } },
-  window: { createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }) },
+  window: { createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }), setStatusBarMessage() {} },
   workspace: { isTrusted: true, getConfiguration: () => ({ get: (k, d) => d }) },
 };
 const realLoad = Module._load;
@@ -93,4 +93,57 @@ test("no session, no memory figure and no question", async () => {
   const ex = explorer(null);
   const roots = await ex.roots();
   assert.equal(roots[0].item.description, undefined);
+});
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { Sessions } = require("../sessions");
+const { Session } = require("../duckdb-session");
+const CLI = process.env.DUCKDB_CLI;
+
+(CLI && fs.existsSync(CLI) ? test : test.skip)("Detach keeps the connection in the Catalog, and Attach Again brings it back", async (t) => {
+  t.after(() => Session.disposeAll());
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-catalog-detach-"));
+  const m = new Sessions({});
+  const sess = await m.open({ cli: CLI, database: ":memory:", cwd: dir });
+  assert.equal((await sess.run(`ATTACH '${path.join(dir, "side.duckdb")}' AS side`)).kind, "ok");
+  assert.equal((await sess.run("CREATE TABLE side.t AS SELECT 1 AS i")).kind, "ok");
+  await m.remember();
+  const ex = new Explorer({
+    liveSession: () => m.live(),
+    liveSessions: () => [],
+    settings: () => ({ database: ":memory:" }),
+    currentSession: async () => sess,
+    cli: () => CLI,
+    remember: (name) => m.remember(name),
+    remembered: () => m.remembered(),
+    forget: (alias) => m.forget("default", alias),
+    attachAgain: (alias) => m.attach("default", alias),
+  });
+  const under = async () => {
+    const roots = await ex.getChildren();
+    return ex.getChildren(roots.find((r) => r.source === "session"));
+  };
+  const side = (await under()).find((n) => n.item.label === "side");
+  assert.equal(side.contextValue, "grebe.attachedDb");
+
+  await ex.detach(side);
+  const waiting = (await under()).find((n) => n.item.label === "side");
+  assert.equal(waiting.contextValue, "grebe.detachedDb");
+  assert.match(waiting.item.description, /^detached · side\.duckdb$/);
+  // Nothing holds the file now: another process can write it.
+  const other = new Session({ cli: CLI, database: path.join(dir, "side.duckdb"), cwd: dir });
+  await other.start();
+  assert.equal((await other.run("INSERT INTO t VALUES (2)")).kind, "ok");
+  other.dispose();
+  await new Promise((r) => setTimeout(r, 300));
+
+  await ex.reattach(waiting);
+  assert.equal((await under()).find((n) => n.item.label === "side").contextValue, "grebe.attachedDb");
+  assert.equal(Number((await sess.run("SELECT count(*) FROM side.t")).rows[0][0]), 2);
+
+  await ex.detach((await under()).find((n) => n.item.label === "side"));
+  await ex.forget((await under()).find((n) => n.item.label === "side"));
+  assert.equal((await under()).some((n) => n.item.label === "side"), false);
 });

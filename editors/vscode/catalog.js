@@ -282,18 +282,24 @@ class Explorer {
       });
     });
     const session = isSession(root.source) ? await this.sessionGroups(sess) : [];
-    // What should be attached and is not: it could not be brought back
-    // when the session started (a file that moved, a server that is down).
+    // The session's connections that are not attached now: detached (and
+    // waiting to be attached again), or not brought back when the session
+    // started (a file that moved, a server that is down).
     if (root.source === "session" && this.deps.remembered) {
       for (const rec of this.deps.remembered()) {
-        if (!rec.error || dbs.some((d) => d.db === rec.alias)) continue;
+        if (dbs.some((d) => d.db === rec.alias)) continue;
+        const where = conninfo.where(rec.path);
+        const from = rec.declared ? "\n\nDeclared in the grebe.duckdb.connections setting." : "";
         nodes.push(
           node("lost", rec.alias, vscode.TreeItemCollapsibleState.None, {
-            icon: "warning",
+            icon: rec.error ? "warning" : "debug-disconnect",
             alias: rec.alias,
-            description: `not attached · ${conninfo.where(rec.path)}`,
-            tooltip: `Could not be attached again when the session started:\n${conninfo.redact(rec.error)}\n\nRestart the session to try again, or forget it.`,
-            contextValue: "grebe.lostDb",
+            declared: !!rec.declared,
+            description: `${rec.error ? "not attached" : "detached"} · ${where}`,
+            tooltip: rec.error
+              ? `Could not be attached:\n${conninfo.redact(rec.error)}\n\nAttach it again to retry, or forget it.${from}`
+              : `${rec.alias}: ${conninfo.redact(rec.path)}\n\nDetached: nothing here holds it open. Attach it again when you want it back; it stays listed until you forget it.${from}`,
+            contextValue: rec.error ? "grebe.lostDb" : "grebe.detachedDb",
           }),
         );
       }
@@ -507,9 +513,28 @@ class Explorer {
     if (this.deps.remember) await this.deps.remember(name);
   }
 
-  /** Stop trying to bring back an attachment that is gone. */
-  forget(n) {
+  /** Attach a listed connection that is detached, or was not brought back. */
+  async reattach(n) {
+    if (!n || n.kind !== "lost" || !this.deps.attachAgain) return;
+    if (!trust.ok("Attaching a database")) return;
+    await this.sessionFor("session");
+    const error = await this.deps.attachAgain(n.alias);
+    if (error) log.report("catalog", `could not attach ${n.alias}: ${error}`);
+    else vscode.window.setStatusBarMessage(`grebe: attached ${n.alias} again`, 5000);
+    this.refresh();
+  }
+
+  /** Take a connection that is not attached off the list. */
+  async forget(n) {
     if (!n || n.kind !== "lost" || !this.deps.forget) return;
+    if (n.declared) {
+      const pick = await vscode.window.showInformationMessage(
+        `grebe: ${n.alias} is declared in the grebe.duckdb.connections setting. Remove it there to forget it.`,
+        "Open Settings",
+      );
+      if (pick === "Open Settings") vscode.commands.executeCommand("workbench.action.openSettings", "grebe.duckdb.connections");
+      return;
+    }
     this.deps.forget(n.alias);
     this.refresh();
   }
@@ -694,6 +719,7 @@ function activate(context, deps) {
     on("attach", (uri) => explorer.attach(uri)),
     on("attachPostgres", () => explorer.attachPostgres()),
     on("detach", (n) => explorer.detach(n)),
+    on("reattach", (n) => explorer.reattach(n)),
     on("forget", (n) => explorer.forget(n)),
     on("closeFile", (n) => explorer.closeFile(n)),
     on("useAsDatabase", async (arg) => {

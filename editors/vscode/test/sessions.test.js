@@ -120,9 +120,17 @@ live("remember: files and their mode, not in-memory attachments, not the session
   s = await m2.open({ cli: CLI, database: own, cwd: dir });
   assert.deepEqual(seen, [["rw", null]]);
   assert.equal((await s.run("SELECT i FROM rw.t")).kind, "rows");
-  // Detached: no longer remembered.
+  // Detached: still listed, as detached, and attached again when asked.
   await s.run("DETACH rw");
   await m2.remember();
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: false, detached: true }]);
+  assert.equal(await m2.attach("default", "rw"), null);
+  assert.equal((await s.run("SELECT i FROM rw.t")).kind, "rows");
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: false }]);
+  // Forgotten: off the list.
+  await s.run("DETACH rw");
+  await m2.remember();
+  m2.forget("default", "rw");
   assert.deepEqual(store.get("default"), []);
   // grebe.duckdb.reattach off: nothing is attached again.
   store.set("default", [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: true }]);
@@ -156,4 +164,44 @@ test("a re-attach that fails keeps the reason without the password in it", async
   assert.doesNotMatch(kept, /SECRETPW/);
   assert.match(kept, /password=\*\*\*/);
   assert.match(kept, /password authentication failed/);
+});
+
+test("a detached connection waits across a restart; a declared one is always listed", async (t) => {
+  t.after(() => Session.disposeAll());
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-detached-"));
+  const file = (n) => path.join(dir, `${n}.duckdb`);
+  const store = new Map();
+  const deps = {
+    store: { get: (n) => store.get(n) || [], set: (n, r) => store.set(n, r) },
+    declared: () => [{ alias: "decl", path: file("decl"), type: "duckdb", readOnly: false }],
+  };
+  let m = new Sessions(deps);
+  let s = await m.open({ cli: CLI, database: ":memory:", cwd: dir });
+  // Declared in settings: attached with the session, nothing stored yet.
+  assert.equal((await s.run("CREATE TABLE decl.t AS SELECT 1 AS i")).kind, "ok");
+  assert.equal((await s.run(`ATTACH '${file("kept")}' AS kept`)).kind, "ok");
+  await s.run("DETACH decl");
+  await m.remember();
+  assert.deepEqual(m.remembered().map((r) => [r.alias, !!r.detached, !!r.declared]), [["decl", true, true], ["kept", false, false]]);
+  assert.ok(store.get("default").every((r) => !("declared" in r)));
+  m.end();
+  await new Promise((r) => setTimeout(r, 300));
+
+  // A new session: `kept` comes back, `decl` waits, and another program
+  // could have had the file to itself meanwhile.
+  m = new Sessions(deps);
+  s = await m.open({ cli: CLI, database: ":memory:", cwd: dir });
+  const names = async () => (await s.run("SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY 1")).rows.map((r) => r[0]);
+  assert.deepEqual(await names(), ["kept", "memory"]);
+  assert.equal(await m.attach("default", "decl"), null);
+  assert.deepEqual(await names(), ["decl", "kept", "memory"]);
+  assert.equal((await s.run("SELECT i FROM decl.t")).kind, "rows");
+  // Forgetting a declared one does not take it off the list.
+  m.forget("default", "decl");
+  assert.equal(m.remembered().some((r) => r.alias === "decl" && r.declared), true);
+  // One that cannot be attached says why, and stays.
+  store.set("default", [...store.get("default"), { alias: "gone", path: path.join(dir, "no", "such.duckdb"), type: "duckdb", readOnly: true, detached: true }]);
+  assert.match(await m.attach("default", "gone"), /Error/);
+  assert.match(m.remembered().find((r) => r.alias === "gone").error, /Error/);
+  m.end();
 });

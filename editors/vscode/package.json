@@ -181,6 +181,12 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "grebe.catalog.reattach",
+        "title": "Attach Again",
+        "category": "grebe: Catalog",
+        "icon": "$(plug)"
+      },
+      {
         "command": "grebe.catalog.forget",
         "title": "Forget",
         "category": "grebe: Catalog",
@@ -252,7 +258,23 @@
         "grebe.duckdb.reattach": {
           "type": "boolean",
           "default": true,
-          "description": "When a session starts, attach again the databases it had attached when it was last used (from the Catalog or by an ATTACH in your SQL). Passwords are never kept: a server that needs one asks again."
+          "description": "When a session starts, attach again the databases it had attached when it was last used (from the Catalog or by an ATTACH in your SQL). Passwords are never kept: a server that needs one asks again. A connection you detached is not attached again until you ask; it stays in the Catalog, marked detached. Off: every connection stays listed and is attached only when you ask."
+        },
+        "grebe.duckdb.connections": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Connections the shared session always lists in the Catalog: database files and servers, by the name SQL uses for them. Each is attached when the session starts unless you detached it, and stays listed, detached, until you attach it again. Do not put a password here: one in a connection string is ignored, and the server asks when it needs one.\n\n```json\n[\n  { \"alias\": \"sales\", \"path\": \"data/sales.duckdb\" },\n  { \"alias\": \"warehouse\", \"path\": \"postgresql://me@db.example.com/warehouse\", \"type\": \"postgres\", \"readOnly\": true }\n]\n```",
+          "items": {
+            "type": "object",
+            "required": ["alias", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "alias": { "type": "string", "description": "The name SQL uses for it: alias.table." },
+              "path": { "type": "string", "description": "A database file (relative to the workspace folder, or absolute) or a connection string." },
+              "type": { "type": "string", "description": "What it is when it is not a DuckDB file: postgres, sqlite, mysql, ..." },
+              "readOnly": { "type": "boolean", "default": false, "description": "Attach it read-only." }
+            }
+          }
         },
         "grebe.duckdb.catalogInEditor": {
           "type": "boolean",
@@ -370,6 +392,10 @@
         },
         {
           "command": "grebe.catalog.detach",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.reattach",
           "when": "false"
         },
         {
@@ -503,14 +529,24 @@
           "group": "1_view@1"
         },
         {
-          "command": "grebe.catalog.forget",
-          "when": "view == grebe.catalog && viewItem == grebe.lostDb",
-          "group": "inline"
+          "command": "grebe.catalog.reattach",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "grebe.catalog.reattach",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "group": "1_view@1"
         },
         {
           "command": "grebe.catalog.forget",
-          "when": "view == grebe.catalog && viewItem == grebe.lostDb",
-          "group": "1_view@1"
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "grebe.catalog.forget",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "group": "1_view@2"
         }
       ]
     },

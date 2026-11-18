@@ -68,6 +68,7 @@ exports.activate = function activate(context) {
       },
       remembered: runner.rememberedAttachments,
       forget: runner.forgetAttachment,
+      attachAgain: runner.attachAgain,
       state: context.workspaceState,
       onDidRun: runner.onDidRun,
       settings: runner.settings,
