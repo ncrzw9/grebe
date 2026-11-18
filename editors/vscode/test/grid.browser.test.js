@@ -254,6 +254,9 @@ browserTest("screen readers get the active cell, the selection, sorting and filt
     return page.textContent("#announce");
   };
 
+  // The canvas is there before the result is drawn into it: wait for the
+  // grid to describe its rows, not for a moment that is usually enough.
+  await page.waitForFunction(() => document.querySelector('[role="grid"]')?.getAttribute("aria-rowcount") !== null);
   assert.equal(await grid.getAttribute("aria-rowcount"), "11");
   assert.equal(await grid.getAttribute("aria-colcount"), "2");
   assert.deepEqual(await page.locator('[role="columnheader"]').allTextContents(), ["id", "name"]);
