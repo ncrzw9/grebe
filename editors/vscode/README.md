@@ -241,7 +241,7 @@ In the grid:
 ## Catalog
 
 The **DuckDB** icon in the activity bar opens the **Catalog**: everything
-your session holds, refreshed after every run. Like any view, it can be
+your session holds, kept up to date as you run. Like any view, it can be
 dragged to another side bar or the panel.
 
 - **Every running session** has a line of its own when files run in named
@@ -263,6 +263,40 @@ dragged to another side bar or the panel.
 - **Variables** set with `SET VARIABLE`, with their values; **Secrets**, by
   name, type and scope only (never the secret itself); and the
   **Extensions** loaded.
+
+The databases are drawn from the same index the editor completes from
+(see [The catalog in the editor](#the-catalog-in-the-editor)), so the
+Catalog asks DuckDB nothing about them, however many tables are attached:
+
+- **Your own databases** -- the session's, in-memory and TEMP ones,
+  attached DuckDB files -- are read once after a run, for the editor and
+  the Catalog together, and the Catalog shows the result: a new table, a
+  new row estimate. With a foreign database attached, a run of nothing
+  but queries reads nothing. They look as they always did.
+- **A foreign database** -- PostgreSQL, SQLite, MySQL -- is listed
+  closed, with when it was indexed: `indexed 5 min ago`. Open it and its
+  schemas, tables, views and columns come from the index, at once, also
+  right after a restart, from what was kept. A database that has never
+  been indexed says *indexing…* until it has been, a moment after it is
+  attached. What someone else changes on the server appears when the
+  index is read again: **Refresh Connection Index** on the database, or
+  the Catalog's **Refresh** button. A PostgreSQL table shows the server's
+  own row estimate, when it has one. PostgreSQL's system schemas
+  (`pg_catalog`, `information_schema`) are not listed.
+- **A long list** -- more than 500 tables or views in one schema -- is
+  shown as folders of 500, each named by its first and last table:
+  `orders_2019 … orders_2023`. Tables are in name order, so the one you
+  want is two clicks away, and nothing is built for a folder or a
+  database until you open it.
+- After a run the Catalog asks the session only for its variables,
+  secrets, extensions and memory figure, and never while a run is in
+  progress: a run that starts does not wait for the Catalog.
+- A database the index holds nothing of (*not in the editor: too large*,
+  or *not indexed* because it could not be read) is read from the session
+  when you open it. So is everything with `grebe.duckdb.catalogIndex` or
+  `grebe.duckdb.catalogInEditor` off: then the Catalog reads every
+  database after every run, lists foreign databases open, and shows
+  lists whole.
 
 Click a table to preview it in the grid; right-click for **Show Columns**,
 **Show Stats**, **Count Rows**, **Copy Qualified Name** or **Insert Name
