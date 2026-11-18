@@ -96,10 +96,17 @@ jobs:
           cargo build --bin grebe
           exe=""
           if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          # Both versions run even when the first fails, so one run shows
+          # everything that is wrong.
+          failed=""
           for version in $DUCKDB_VERSIONS; do
             echo "::group::DuckDB $version"
             editors/vscode/test/fetch-duckdb.sh "$version" "$RUNNER_TEMP/duckdb-$version"
             GREBE_BIN="$PWD/target/debug/grebe$exe" DUCKDB_CLI="$RUNNER_TEMP/duckdb-$version/duckdb$exe" \
-              node --test --test-timeout=180000 editors/vscode/test/*.test.js
+              node --test --test-timeout=180000 editors/vscode/test/*.test.js || failed="$failed $version"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::extension tests failed with DuckDB$failed"
+            exit 1
+          fi

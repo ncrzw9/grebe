@@ -168,13 +168,17 @@ live("an rc file cannot change the protocol", async () => {
   fs.writeFileSync(path.join(home, ".duckdbrc"), ".mode box\n.timer on\n.echo on\nSELECT 'hello from rc';\n");
   const s = new Session({ cli: CLI, database: ":memory:", cwd: home });
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home; // the child inherits it
+  process.env.USERPROFILE = home;
   try {
     await s.start();
     const r = await s.run("SELECT 7 AS n");
     assert.deepEqual([r.kind, r.rows], ["rows", [[7]]]);
   } finally {
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
     s.dispose();
   }
 });
@@ -251,7 +255,9 @@ live("checkCli: a broken ~/.duckdbrc is reported by --version already", async ()
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-rc-"));
   fs.writeFileSync(path.join(home, ".duckdbrc"), "SELEC 1;\n");
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     const r = await checkCli(CLI);
     assert.equal(r.text, null);
@@ -265,6 +271,8 @@ live("checkCli: a broken ~/.duckdbrc is reported by --version already", async ()
     s.dispose();
   } finally {
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
   }
 });
 
@@ -274,7 +282,9 @@ live("stderr outside a statement is heard; a statement's own is not", async () =
   const heard = [];
   const s = new Session({ cli: CLI, database: ":memory:", cwd: home, onStderr: (t) => heard.push(t) });
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     await s.start();
     assert.match(heard.join(""), /Loading resources from .*\.duckdbrc/);
@@ -284,6 +294,8 @@ live("stderr outside a statement is heard; a statement's own is not", async () =
     assert.deepEqual(heard, []);
   } finally {
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
     s.dispose();
   }
 });
@@ -394,7 +406,9 @@ interruptible("a timeout cancels the statement the same way", async () => {
 interruptible("statements run here stay out of ~/.duckdb_history", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-history-"));
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   const s = new Session({ cli: CLI, database: ":memory:", cwd: home });
   try {
     await s.start();
@@ -402,6 +416,8 @@ interruptible("statements run here stay out of ~/.duckdb_history", async () => {
   } finally {
     s.dispose();
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
   }
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(fs.existsSync(path.join(home, ".duckdb_history")), false);

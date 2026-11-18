@@ -1441,7 +1441,8 @@ live("a file can ask for a session of its own", async (t) => {
 
 live("the workspace database keeps tables across sessions; attachments come back", async (t) => {
   const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  // Where DuckDB will say it is (on macOS the temporary folder is behind a link).
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-")));
   const other = path.join(dir, "other.duckdb");
   const state = fakeState();
   const context = { storageUri: { fsPath: path.join(storage, "ws") }, workspaceState: state };

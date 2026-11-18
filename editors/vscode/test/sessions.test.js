@@ -71,7 +71,8 @@ test("attachSql: the type and mode it had", () => {
 live("two callers opening at once share one session; the working directory follows", async (t) => {
   t.after(() => Session.disposeAll());
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-sessions-"));
-  const sub = path.join(dir, `it's "here"`);
+  // A double quote cannot be in a Windows file name.
+  const sub = path.join(dir, process.platform === "win32" ? "it's here" : `it's "here"`);
   fs.mkdirSync(sub);
   fs.writeFileSync(path.join(sub, "d.csv"), "n\n1\n");
   const said = [];
@@ -98,6 +99,9 @@ live("remember: files and their mode, not in-memory attachments, not the session
   t.after(() => Session.disposeAll());
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-sessions-"));
   const own = path.join(dir, "own.duckdb");
+  // DuckDB reports a database where it really is (on macOS the temporary
+  // folder is behind a link).
+  const real = fs.realpathSync(dir);
   const store = new Map();
   const m = new Sessions({ store: { get: (n) => store.get(n) || [], set: (n, r) => store.set(n, r) } });
   let s = await m.open({ cli: CLI, database: own, cwd: dir });
@@ -111,7 +115,7 @@ live("remember: files and their mode, not in-memory attachments, not the session
   }
   await m.remember();
   // With `rw` in USE the session's own file looks attached; it is not kept.
-  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: false }]);
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(real, "rw.duckdb"), type: "duckdb", readOnly: false }]);
   m.end();
   await new Promise((r) => setTimeout(r, 300));
 
@@ -123,17 +127,17 @@ live("remember: files and their mode, not in-memory attachments, not the session
   // Detached: still listed, as detached, and attached again when asked.
   await s.run("DETACH rw");
   await m2.remember();
-  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: false, detached: true }]);
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(real, "rw.duckdb"), type: "duckdb", readOnly: false, detached: true }]);
   assert.equal(await m2.attach("default", "rw"), null);
   assert.equal((await s.run("SELECT i FROM rw.t")).kind, "rows");
-  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: false }]);
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(real, "rw.duckdb"), type: "duckdb", readOnly: false }]);
   // Forgotten: off the list.
   await s.run("DETACH rw");
   await m2.remember();
   m2.forget("default", "rw");
   assert.deepEqual(store.get("default"), []);
   // grebe.duckdb.reattach off: nothing is attached again.
-  store.set("default", [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: true }]);
+  store.set("default", [{ alias: "rw", path: path.join(real, "rw.duckdb"), type: "duckdb", readOnly: true }]);
   m2.end();
   await new Promise((r) => setTimeout(r, 300));
   const m3 = new Sessions({ store: { get: (n) => store.get(n) || [], set: (n, r) => store.set(n, r) }, reattach: () => false });
@@ -141,7 +145,7 @@ live("remember: files and their mode, not in-memory attachments, not the session
   assert.equal((await s.run("SELECT i FROM rw.t")).kind, "error");
   // It stays listed, unmarked, and can be attached by hand.
   await m3.remember();
-  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: true }]);
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(real, "rw.duckdb"), type: "duckdb", readOnly: true }]);
   assert.equal(await m3.attach("default", "rw"), null);
   assert.equal((await s.run("SELECT i FROM rw.t")).kind, "rows");
   m3.end();

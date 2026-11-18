@@ -32,6 +32,19 @@ const DEFAULT = "default";
 const MEMORY = ":memory:";
 const WORKSPACE = ":workspace:";
 
+/** Where a file really is: DuckDB reports a database by its resolved path
+ *  (on macOS the temporary folder is behind a link), and Windows does not
+ *  tell upper case from lower. */
+function real(file) {
+  let p = path.resolve(file);
+  try {
+    p = fs.realpathSync.native(p);
+  } catch {
+    // Not there (yet): the path as written.
+  }
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
+
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
 
@@ -208,7 +221,7 @@ class Sessions {
     if (this.deps.reattach && !this.deps.reattach()) return;
     const recs = this.recs(name);
     if (!recs.length) return;
-    const own = sess.opts.database === MEMORY ? null : path.resolve(sess.opts.database);
+    const own = sess.opts.database === MEMORY ? null : real(sess.opts.database);
     const out = [];
     for (const rec of recs) {
       // Detached on purpose: it waits to be asked for.
@@ -218,7 +231,7 @@ class Sessions {
       }
       // The session's own file, remembered while another database was in
       // USE: it is open already.
-      if (own && !conninfo.isConnection(rec.path) && path.resolve(rec.path) === own) continue;
+      if (own && !conninfo.isConnection(rec.path) && real(rec.path) === own) continue;
       const error = await this.bring(sess, rec);
       out.push(error ? { ...rec, error } : { alias: rec.alias, path: rec.path, type: rec.type, readOnly: rec.readOnly });
       this.say(error ? `could not re-attach ${rec.alias}: ${error}` : `re-attached ${rec.alias} (${conninfo.where(rec.path)})`);
@@ -283,7 +296,7 @@ class Sessions {
     }
     if (r.kind !== "rows") return;
     const at = (c) => r.columns.indexOf(c);
-    const own = sess.opts.database === MEMORY ? null : path.resolve(sess.opts.database);
+    const own = sess.opts.database === MEMORY ? null : real(sess.opts.database);
     const now = r.rows
       .map((row) => ({
         alias: row[at("alias")],
@@ -291,7 +304,7 @@ class Sessions {
         type: row[at("type")] || "duckdb",
         readOnly: row[at("readonly")] === true || row[at("readonly")] === "true",
       }))
-      .filter((rec) => conninfo.isConnection(rec.path) || !own || path.resolve(rec.path) !== own);
+      .filter((rec) => conninfo.isConnection(rec.path) || !own || real(rec.path) !== own);
     const before = this.recs(name);
     // With re-attaching off nothing was attached when the session started,
     // so a connection that is not attached was not detached by anyone: it

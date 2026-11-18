@@ -518,17 +518,23 @@ class Session {
     if (!w || this.chunks.length === 0) return;
     // The marker is ASCII and at most one chunk boundary can split it, so
     // only the newest chunk plus the tail of the one before need searching.
-    const needle = Buffer.from(`${w.marker}\n`);
+    // The line ends with a newline, which on Windows is "\r\n": the CLI's
+    // stdout is in text mode there.
+    const needle = Buffer.from(w.marker);
     const last = this.chunks[this.chunks.length - 1];
     const prev = this.chunks.length > 1 ? this.chunks[this.chunks.length - 2] : null;
-    const tailLen = prev ? Math.min(prev.length, needle.length - 1) : 0;
+    const tailLen = prev ? Math.min(prev.length, needle.length + 1) : 0;
     const window = tailLen ? Buffer.concat([prev.subarray(prev.length - tailLen), last]) : last;
     const hit = window.indexOf(needle);
     if (hit < 0) return;
+    let end = hit + needle.length;
+    if (window[end] === 0x0d) end++;
+    if (window[end] !== 0x0a) return; // the end of the line has not arrived
+    end++;
     const all = Buffer.concat(this.chunks);
     const at = all.length - window.length + hit;
     const out = all.subarray(0, at).toString("utf8");
-    const rest = all.subarray(at + needle.length);
+    const rest = all.subarray(all.length - window.length + end);
     this.chunks = rest.length ? [rest] : [];
     this.waiting = null;
     this.collecting = true;
