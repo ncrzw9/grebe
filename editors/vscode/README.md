@@ -297,6 +297,50 @@ turns it off. The same check runs from the command line with a snapshot:
 `grebe check --catalog catalog.json` (see the
 [grebe README](https://github.com/ncrzw9/grebe#catalog)).
 
+The editor keeps this **database by database**, so a large connection
+costs its price once and cannot take the rest down with it:
+
+- **Local databases** -- the session's own, in-memory and TEMP ones,
+  attached DuckDB files -- are read again after a run, and only the ones
+  that changed are sent to the language server.
+- **A foreign database** -- PostgreSQL, SQLite, MySQL, anything that is
+  not DuckDB's own -- is read **once**, when it is first attached. It is
+  read again when a statement changes it (`CREATE`, `ALTER`, `DROP`, ...
+  that names it, or any of them while it is the current database), when
+  its index is older than `grebe.duckdb.catalogIndexMaxAge` minutes
+  (default 60), and when you ask: **Refresh Connection Index** on the
+  database in the Catalog, or the Catalog's **Refresh** button. Tables
+  someone else creates on the server appear after one of those. Its
+  system schemas (`pg_catalog`, `information_schema`) are not indexed;
+  names in them are neither completed nor marked.
+- **Between windows** the index of a foreign database is kept in the
+  editor's storage for the workspace, so its names are there as soon as
+  the connection is attached again. The file is named by a hash of the
+  connection and holds table and column names; the connection string and
+  its password are never written. It is deleted when you **Forget** the
+  connection.
+- **A database of more than 500,000 columns** is left out, alone: the
+  Catalog marks it *not in the editor: too large*, the output channel
+  says so once, and every other database still completes and is checked.
+- The index also records what DuckDB (or, for PostgreSQL, the server's
+  own catalog) knows of each table: whether a column may be NULL, the
+  estimated row count, the primary key, unique constraints and indexes.
+  Nothing uses these yet; they are there for rules to come.
+
+Reading a database for the editor happens after a run's results are
+shown, never during a run, and one database at a time. A run that starts
+while one is being read does not wait for it: the reading is interrupted
+and taken up again afterwards. (Not on Windows, where DuckDB cannot be
+interrupted without ending the session: there the run waits for the one
+query in flight. And DuckDB walks every attached database to answer any
+question about its catalog, so with a very large connection attached the
+re-reading after a `CREATE` takes a moment: about 0.2 s with 5,000
+PostgreSQL tables. A run of nothing but queries reads nothing.)
+
+`grebe.duckdb.catalogIndex: false` goes back to reading everything after
+every run and sending it as one snapshot, with a limit of 100,000 columns
+in all, past which the editor gets no catalog.
+
 ### PostgreSQL
 
 From the plug icon choose **PostgreSQL...**, or run **grebe: Attach
@@ -407,6 +451,11 @@ timing, and on a failure the whole statement and where DuckDB stopped),
   as `{ alias, path, type?, readOnly? }` (see [Sessions](#sessions)).
 - `grebe.duckdb.catalogInEditor`: give the language server the session's
   tables and columns for completion and the `CAT` checks (default on).
+- `grebe.duckdb.catalogIndex`: keep that database by database, reading a
+  foreign database once instead of after every run (default on; see
+  [The catalog in the editor](#the-catalog-in-the-editor)).
+- `grebe.duckdb.catalogIndexMaxAge`: minutes after which a foreign
+  database is read again (default 60; 0 never does by age).
 - `grebe.duckdb.maxRows`: most rows a query shows, and read from a data file
   opened in the grid (default 10,000). DuckDB stops producing rows there;
   **Count** gives the full total and Export always writes every row.

@@ -304,14 +304,18 @@ class Explorer {
       // PostgreSQL, SQLite, ...: DuckDB estimates no rows for their tables
       // (it says 0), and lists each table's row type as a type of its own.
       const foreign = d.type && d.type !== "duckdb";
+      // What the editor knows of it (the catalog index): said for a
+      // foreign database, which is read once, and for one left out.
+      const indexed = isSession(root.source) && this.deps.indexStatus ? this.deps.indexStatus(this.sessionNameOf(root.source), d.db) : null;
+      const index = describeIndex(indexed);
       return node("db", d.db, vscode.TreeItemCollapsibleState.Expanded, {
         source: root.source,
         db: d.db,
         objects: objs.filter((o) => o.db === d.db).map((o) => (foreign ? { ...o, est: null } : o)),
         extras: extras.filter((x) => x.db === d.db && !(foreign && x.kind === "type")),
-        icon: d.db === "temp" ? "clock" : "database",
-        description: describeDb(d),
-        tooltip: d.path ? `${d.db}: ${conninfo.redact(d.path)}` : d.db,
+        icon: d.db === "temp" ? "clock" : indexed && indexed.over ? "warning" : "database",
+        description: [describeDb(d), index && index.short].filter(Boolean).join(" · "),
+        tooltip: (d.path ? `${d.db}: ${conninfo.redact(d.path)}` : d.db) + (index ? `\n\n${index.long}` : ""),
         contextValue: attached ? "grebe.attachedDb" : "grebe.db",
       });
     });
@@ -521,6 +525,20 @@ class Explorer {
     this.refresh();
   }
 
+  /** The name of the session a root shows. */
+  sessionNameOf(source) {
+    if (source === "session") return this.deps.sessionName ? this.deps.sessionName() : "default";
+    return String(source).slice("session:".length);
+  }
+
+  /** Read a database again for the editor (completion, the CAT checks):
+   *  the one clicked, or every foreign database of the session in front. */
+  reindex(n) {
+    const one = n && n.kind === "db" && isSession(n.source);
+    if (this.deps.reindex) this.deps.reindex(one ? this.sessionNameOf(n.source) : this.sessionNameOf("session"), one ? n.db : null);
+    this.refresh();
+  }
+
   /** Note what the session has attached now, so it comes back with it. */
   async remember(name) {
     if (this.deps.remember) await this.deps.remember(name);
@@ -681,6 +699,33 @@ function describeDb(d) {
   return parts.join(" · ");
 }
 
+/** What the catalog index says of a database, as a few words for the
+ *  tree and a sentence for the tooltip; null when there is nothing to say
+ *  (a local database that is read after every run). */
+function describeIndex(s) {
+  if (!s) return null;
+  const n = (v) => Number(v).toLocaleString("en-US");
+  if (s.over) {
+    return {
+      short: "not in the editor: too large",
+      long: `${n(s.over)} columns, over the limit of ${n(s.limit)} for one database: the editor does not complete its names or check them. The other databases are not affected.`,
+    };
+  }
+  if (!s.foreign) return null;
+  if (s.indexing) return { short: "indexing…", long: "Reading its tables and columns for the editor." };
+  if (s.error) return { short: "not indexed", long: `Its tables could not be read for the editor:\n${s.error}\n\nRefresh Connection Index tries again.` };
+  if (s.indexedAt === null) return { short: "not indexed yet", long: "Its tables are read for the editor when the session is free." };
+  const min = Math.max(0, Math.round((Date.now() - s.indexedAt) / 60000));
+  const ago = min < 1 ? "just now" : min < 60 ? `${min} min ago` : min < 2880 ? `${Math.round(min / 60)} h ago` : `${Math.round(min / 1440)} d ago`;
+  return {
+    short: `indexed ${ago}`,
+    long:
+      `The editor completes and checks names from an index of this database: ${n(s.tables)} tables, ${n(s.columns)} columns, read ${ago}` +
+      `${s.stale ? " and about to be read again" : ""}. It is read again when a statement changes the database, when it is older than ` +
+      `grebe.duckdb.catalogIndexMaxAge, and when you choose Refresh Connection Index.`,
+  };
+}
+
 /** A folder of `children`, labelled with how many there are. */
 function group(label, icon, children, note) {
   return node("group", label, vscode.TreeItemCollapsibleState.Collapsed, {
@@ -713,7 +758,10 @@ function activate(context, deps) {
   context.subscriptions.push(
     explorer,
     view,
-    on("refresh", () => explorer.refresh()),
+    // The button reads everything again, the foreign databases' index
+    // included.
+    on("refresh", () => explorer.reindex(null)),
+    on("reindex", (n) => explorer.reindex(n)),
     on("start", async () => {
       if (!trust.ok("Starting DuckDB")) return;
       await deps.currentSession();

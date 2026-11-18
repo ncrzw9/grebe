@@ -65,10 +65,18 @@ exports.activate = function activate(context) {
       sessionName: runner.currentSessionName,
       remember: async (name) => {
         await runner.rememberAttachments(name);
-        if (catalogFeed) catalogFeed.schedule();
+        if (catalogFeed) catalogFeed.touched(name || runner.currentSessionName());
       },
+      // The catalog index: what it holds of a database, and reading one
+      // again when asked.
+      indexStatus: (name, db) => (catalogFeed ? catalogFeed.status(name, db) : null),
+      reindex: (name, db) => catalogFeed && catalogFeed.reindex(name, db),
       remembered: runner.rememberedAttachments,
-      forget: runner.forgetAttachment,
+      forget: (alias) => {
+        runner.forgetAttachment(alias);
+        // Its kept index goes with it.
+        if (catalogFeed) catalogFeed.touched(runner.currentSessionName());
+      },
       attachAgain: runner.attachAgain,
       state: context.workspaceState,
       onDidRun: runner.onDidRun,
@@ -82,6 +90,9 @@ exports.activate = function activate(context) {
       liveSessions: runner.liveSessions,
       sessionNameOf: runner.sessionNameOf,
       onDidRun: runner.onDidRun,
+      isRunning: runner.isRunning,
+      connections: runner.allConnections,
+      onDidIndex: () => catalogView && catalogView.refresh(),
     }),
   );
   setUp("the results view", () => {

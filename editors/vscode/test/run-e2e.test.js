@@ -547,11 +547,16 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
   await new Promise((r) => setTimeout(r, 200)); // let the writer release its lock
 
   let sess = null;
+  // What the catalog index says of a database, and what it was asked.
+  const indexSays = {};
+  const reindexed = [];
   const ex = new Explorer({
     currentSession: async () => sess,
     liveSession: () => sess,
     settings: () => ({ cli: CLI, database: ":memory:" }),
     cli: () => CLI,
+    indexStatus: (name, db) => indexSays[db] || null,
+    reindex: (name, db) => reindexed.push([name, db]),
   });
   t.after(() => {
     ex.dispose();
@@ -633,6 +638,32 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
   assert.ok(dbsNow.includes("warehouse (attached · warehouse.duckdb · read-only)"), dbsNow.join(" | "));
   const r = await sess.run("SELECT count(*) AS n FROM warehouse.dim_customer");
   assert.deepEqual(r.rows, [[42]], "queries can use it by its alias");
+  // What the editor's index holds of it is said beside it: a local
+  // database says nothing, a foreign one when it was read, one that is too
+  // large that it is left out.
+  const warehouseNode = async () => (await ex.getChildren(root)).find((n) => n.item.label === "warehouse");
+  indexSays.warehouse = { foreign: false, tables: 1, columns: 1, indexedAt: null, indexing: false, stale: null, over: null, limit: 500000, error: null };
+  assert.equal((await warehouseNode()).item.description, "attached · warehouse.duckdb · read-only");
+  indexSays.warehouse = { ...indexSays.warehouse, foreign: true, indexedAt: Date.now() - 7 * 60000 };
+  assert.equal((await warehouseNode()).item.description, "attached · warehouse.duckdb · read-only · indexed 7 min ago");
+  assert.match((await warehouseNode()).item.tooltip, /1 tables, 1 columns, read 7 min ago\. It is read again when/);
+  indexSays.warehouse = { ...indexSays.warehouse, indexing: true };
+  assert.match((await warehouseNode()).item.description, / · indexing…$/);
+  indexSays.warehouse = { ...indexSays.warehouse, indexing: false, indexedAt: null };
+  assert.match((await warehouseNode()).item.description, / · not indexed yet$/);
+  indexSays.warehouse = { ...indexSays.warehouse, error: "IO Error: connection refused" };
+  assert.match((await warehouseNode()).item.description, / · not indexed$/);
+  assert.match((await warehouseNode()).item.tooltip, /connection refused/);
+  indexSays.warehouse = { ...indexSays.warehouse, error: null, foreign: false, over: 612345 };
+  assert.match((await warehouseNode()).item.description, / · not in the editor: too large$/);
+  assert.match((await warehouseNode()).item.tooltip, /612,345 columns, over the limit of 500,000 for one database/);
+  assert.equal((await warehouseNode()).item.iconPath.id, "warning");
+  delete indexSays.warehouse;
+  // Refresh Connection Index on a database asks for that one; the view's
+  // Refresh button for all of the session's.
+  ex.reindex(await warehouseNode());
+  ex.reindex(null);
+  assert.deepEqual(reindexed, [["default", "warehouse"], ["default", null]]);
   assert.equal((await sess.run("CREATE TABLE warehouse.x AS SELECT 1")).kind, "error", "read-only means read-only");
   // A second attach of another file with a clashing alias gets its own.
   const other2 = path.join(dir, "sub", "warehouse.duckdb");
@@ -776,6 +807,60 @@ livePg("Catalog: attach PostgreSQL by connection string, never showing its passw
   const everything = [...shown.errors, ...shown.log, ...labels(await ex.getChildren(root))].join("\n");
   assert.ok(!everything.includes(password), everything);
   assert.ok(!everything.includes("not-the-password"), everything);
+});
+
+const livePgServer = CLI && GREBE && PG && fs.existsSync(CLI) && fs.existsSync(GREBE) ? test : test.skip;
+
+livePgServer("the catalog index: PostgreSQL names are completed and checked, its system schemas left alone", async (t) => {
+  const { vscode, runner, client, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-pg-"));
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
+  const schema = `grebe_e2e_${process.pid}`;
+  const said = [];
+  const { index, settle } = indexedSync(runner, client, { storageDir: storage, log: (l) => said.push(l) });
+  const conn = PG.replace(/'/g, "''");
+  const setup = open(
+    path.join(dir, "setup.sql"),
+    [
+      `ATTACH '${conn}' AS pgx (TYPE postgres);`,
+      `CALL postgres_execute('pgx', 'DROP SCHEMA IF EXISTS ${schema} CASCADE');`,
+      `CALL postgres_execute('pgx', 'CREATE SCHEMA ${schema}');`,
+      `CALL postgres_execute('pgx', 'CREATE TABLE ${schema}.orders (id int PRIMARY KEY, amount numeric(10,2))');`,
+      `CALL postgres_execute('pgx', 'CREATE TABLE ${schema}.customers (id int PRIMARY KEY, name text)');`,
+    ].join("\n"),
+  );
+  t.after(async () => {
+    const { Session } = require("../duckdb-session");
+    const s = new Session({ cli: CLI, database: ":memory:", cwd: dir });
+    await s.start();
+    await s.run(`ATTACH '${conn}' AS pgx (TYPE postgres)`);
+    await s.run(`CALL postgres_execute('pgx', 'DROP SCHEMA IF EXISTS ${schema} CASCADE')`);
+    s.dispose();
+  });
+  const querySql = [
+    `SELECT o.amont FROM pgx.${schema}.orders o;`,
+    `SELECT * FROM pgx.${schema}.ordrs;`,
+    `SELECT relname FROM pgx.pg_catalog.pg_class;`,
+    `SELECT table_name FROM pgx.information_schema.tables;`,
+    `SELECT * FROM pgx.${schema}.`,
+  ].join("\n");
+  const query = open(path.join(dir, "query.sql"), querySql);
+  vscode.workspace.textDocuments = [setup, query];
+  const cat = () => (client.diagnostics.get(query.uri.toString()) || []).filter((d) => /^CAT/.test(d.code)).map((d) => `${d.code} ${d.range.start.line} ${d.message}`);
+
+  const got = await run(setup);
+  assert.ok(got.every((r) => r.kind !== "error"), JSON.stringify(got));
+  await settle();
+  await until(() => cat().length === 2, "the catalog findings");
+  assert.deepEqual(cat(), [
+    "CAT002 0 Column amont is not in the table it is qualified with. Did you mean amount?",
+    "CAT001 1 Table or view ordrs is not in the catalog. Did you mean orders?",
+  ]);
+  const r = await client.request("textDocument/completion", { textDocument: { uri: query.uri.toString() }, position: { line: 4, character: `SELECT * FROM pgx.${schema}.`.length } });
+  assert.deepEqual((r.items || r).map((i) => i.label).sort(), ["customers", "orders"]);
+  assert.equal(index.status("default", "pgx").foreign, true);
+  const password = require("../conninfo").parse(PG).password;
+  if (password) assert.ok(!said.join("\n").includes(password), said.join("\n"));
 });
 
 /** Wait until `cond()` holds (a notification is shown without awaiting). */
@@ -1493,8 +1578,10 @@ live("the workspace database keeps tables across sessions; attachments come back
   }
 });
 
-live("the language server is told what each session holds, once per change", async (t) => {
-  const { vscode, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+// grebe.duckdb.catalogIndex off: one snapshot of everything, as it was
+// before there was an index.
+live("without the catalog index: the language server is told what each session holds, once per change", async (t) => {
+  const { vscode, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100, catalogIndex: false });
   const { CatalogSync } = require("../catalogSync");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
   const sentTo = [];
@@ -1546,10 +1633,178 @@ live("the language server is told what each session holds, once per change", asy
   assert.deepEqual(sentTo[3], ["grebe/catalog", { uri: own.uri.toString(), default: true }]);
 
   // Turned off in settings: the server is told there is no catalog.
-  vscode.workspace.getConfiguration = () => ({ get: (k, d) => (k === "catalogInEditor" ? false : k === "path" ? CLI : d) });
+  vscode.workspace.getConfiguration = () => ({ get: (k, d) => (k === "catalogInEditor" || k === "catalogIndex" ? false : k === "path" ? CLI : d) });
   await sync.sync();
   assert.deepEqual(sentTo[4], ["grebe/catalog", { columns: null }]);
   assert.equal(sentTo.length, 5);
+});
+
+// The index, and what the server is sent from it. `settle` is a sync and
+// the indexing it starts, as the extension's own wiring runs them.
+function indexedSync(runner, client, deps = {}) {
+  const { CatalogSync } = require("../catalogSync");
+  const { CatalogIndex } = require("../catalogIndex");
+  const index = new CatalogIndex(deps);
+  const sync = new CatalogSync({ clientReady: async () => client, liveSessions: runner.liveSessions, sessionNameOf: runner.sessionNameOf, index });
+  runner.onDidRun((e) => e && e.statements && index.noteRun(e.session, e.statements));
+  const settle = async () => {
+    await sync.sync();
+    for (const { name, session } of runner.liveSessions()) await index.indexPending(name, session);
+    await sync.sync();
+  };
+  return { index, sync, settle };
+}
+
+live("the catalog index: the server is sent a part per database, and only the parts that changed", async (t) => {
+  const { vscode, runner, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const other = path.join(dir, "other.duckdb");
+  const sentTo = [];
+  const { sync, settle } = indexedSync(runner, { sendNotification: (method, params) => sentTo.push(params) });
+  const shared = open(path.join(dir, "shared.sql"), `CREATE TABLE orders (id INTEGER PRIMARY KEY, total DECIMAL(10,2));\nCREATE MACRO twice(x) AS x * 2;\nATTACH '${other}' AS other;\nCREATE TABLE other.facts (n INTEGER NOT NULL);`);
+  const own = open(path.join(dir, "own.sql"), "-- grebe: session scratch\nCREATE VIEW v AS SELECT 1 AS one;");
+  const own2 = open(path.join(dir, "own2.sql"), "-- grebe: session scratch\nSELECT one FROM v;");
+  vscode.workspace.textDocuments = [shared, own, own2];
+  const take = () => sentTo.splice(0);
+
+  // Nothing is running: there is nothing to send, and the files with a
+  // session of their own are told to use it (it has no catalog yet).
+  await settle();
+  assert.deepEqual(take(), [
+    { uri: own.uri.toString(), catalog: "scratch" },
+    { uri: own2.uri.toString(), catalog: "scratch" },
+  ]);
+
+  await run(shared);
+  await settle();
+  let sent = take();
+  assert.deepEqual(sent.map((p) => p.database).sort(), ["memory", "other"]);
+  const memory = sent.find((p) => p.database === "memory");
+  assert.deepEqual(memory, {
+    database: "memory",
+    tables: [{ schema: "main", table: "orders", rows: 0, primary_key: ["id"], columns: ["id", "total"], types: ["INTEGER", "DECIMAL(10,2)"], nullable: [false, true] }],
+    functions: [{ name: "twice", kind: "macro" }],
+  });
+  assert.equal("uri" in memory || "catalog" in memory, false, "the shared session is every file's default");
+  assert.deepEqual(sent.find((p) => p.database === "other").tables, [{ schema: "main", table: "facts", rows: 0, columns: ["n"], types: ["INTEGER"], nullable: [false] }]);
+
+  // Unchanged: nothing is sent. A query: nothing is even asked.
+  await settle();
+  const query = open(path.join(dir, "query.sql"), "SELECT * FROM orders;");
+  vscode.workspace.textDocuments = [shared, own, own2, query];
+  await run(query);
+  await settle();
+  assert.deepEqual(take(), []);
+
+  // One database changes: its part only.
+  const more = open(path.join(dir, "more.sql"), "CREATE TABLE other.more (x INTEGER);");
+  await run(more);
+  await settle();
+  sent = take();
+  assert.deepEqual(sent.map((p) => [p.database, p.tables.map((x) => x.table)]), [["other", ["facts", "more"]]]);
+
+  // A database is detached: its part is dropped.
+  const detach = open(path.join(dir, "detach.sql"), "DETACH other;");
+  await run(detach);
+  await settle();
+  assert.deepEqual(take(), [{ database: "other", columns: null }]);
+  // A session of its own: sent once, under its name, for both its files.
+  await run(own);
+  await settle();
+  sent = take();
+  assert.deepEqual(sent, [{ catalog: "scratch", database: "memory", tables: [{ schema: "main", table: "v", kind: "view", columns: ["one"], types: ["INTEGER"], nullable: [true] }], functions: [] }]);
+
+  // Its session ends: so are its parts.
+  shownEditor(vscode, own);
+  await vscode.commands.registered("grebe.duckdb.restart")();
+  await settle();
+  assert.deepEqual(take(), [{ catalog: "scratch", database: "memory", columns: null }]);
+
+  // The comment is taken out of a file: it uses the default again.
+  const plain = fakeDocument(own.uri.fsPath, "CREATE VIEW v AS SELECT 1 AS one;");
+  vscode.workspace.textDocuments = [shared, plain, own2];
+  await settle();
+  assert.deepEqual(take(), [{ uri: own.uri.toString(), default: true }]);
+
+  // The server restarts: it is told everything again.
+  sync.reset();
+  await settle();
+  sent = take();
+  assert.deepEqual(sent.map((p) => p.database || p.uri), ["memory", own2.uri.toString()]);
+
+  // The index is turned off: the server forgets the parts and gets the
+  // one snapshot; and on again.
+  let indexOn = false;
+  vscode.workspace.getConfiguration = () => ({ get: (k, d) => (k === "catalogIndex" ? indexOn : k === "path" ? CLI : d) });
+  await settle();
+  sent = take();
+  assert.deepEqual(sent.slice(0, 2), [{ uri: own2.uri.toString(), default: true }, { columns: null }]);
+  assert.deepEqual(sent[2].columns.map((c) => `${c.database}.${c.table}.${c.column}`), ["memory.orders.id", "memory.orders.total"]);
+  assert.deepEqual(sent[3], { uri: own2.uri.toString(), columns: null });
+  assert.equal(sent.length, 4);
+  indexOn = true;
+  await settle();
+  sent = take();
+  assert.deepEqual(sent.map((p) => Object.keys(p).join(",")), ["uri,default", "columns", "database,tables,functions", "uri,catalog"]);
+
+  // Turned off altogether: the parts go.
+  vscode.workspace.getConfiguration = () => ({ get: (k, d) => (k === "catalogInEditor" ? false : k === "path" ? CLI : d) });
+  await settle();
+  assert.deepEqual(take(), [{ database: "memory", columns: null }]);
+});
+
+live("the catalog index: a foreign database's names reach the editor once, and stay while it is not read again", async (t) => {
+  const { vscode, runner, client, open, run } = await startRunner(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-"));
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
+  const wh = path.join(dir, "wh.duckdb");
+  // A DuckDB file stands in for a server: the index is told it is foreign.
+  const { index, settle } = indexedSync(runner, client, { storageDir: storage, isForeign: (d) => d.db === "wh" });
+  const load = open(path.join(dir, "load.sql"), `ATTACH '${wh}' AS wh;\nCREATE TABLE wh.facts (id INTEGER, amount DOUBLE);\nCREATE TABLE orders (id INTEGER);`);
+  const querySql = "SELECT f.amont FROM wh.main.facts f JOIN ordrs o ON o.id = f.id;\nSELECT * FROM wh.main.fcts;\nSELECT f. FROM wh.facts f;\nSELECT * FROM wh.";
+  const query = open(path.join(dir, "query.sql"), querySql);
+  vscode.workspace.textDocuments = [load, query];
+  const cat = () => (client.diagnostics.get(query.uri.toString()) || []).filter((d) => /^CAT/.test(d.code)).map((d) => `${d.code} ${d.range.start.line} ${d.message}`);
+  const complete = async (line, character) => {
+    const r = await client.request("textDocument/completion", { textDocument: { uri: query.uri.toString() }, position: { line, character } });
+    return (r.items || r).map((i) => i.label).sort();
+  };
+
+  await run(load);
+  await settle();
+  await until(() => cat().length === 3, "the catalog findings");
+  assert.deepEqual(cat(), [
+    "CAT002 0 Column amont is not in the table it is qualified with. Did you mean amount?",
+    "CAT001 0 Table or view ordrs is not in the catalog. Did you mean orders?",
+    "CAT001 1 Table or view fcts is not in the catalog. Did you mean facts?",
+  ]);
+  assert.deepEqual(await complete(2, "SELECT f.".length), ["amount", "id"]);
+  assert.deepEqual(await complete(3, "SELECT * FROM wh.".length), ["facts", "main"]);
+
+  // Local statements and queries come and go; the foreign names stay, and
+  // the session is not asked for them again.
+  const session = runner.liveSession();
+  const real = session.run.bind(session);
+  const asked = [];
+  session.run = (sql, opts) => (asked.push(sql), real(sql, opts));
+  const fix = open(path.join(dir, "fix.sql"), "CREATE VIEW ordrs AS FROM orders;\nSELECT count(*) FROM wh.facts;");
+  vscode.workspace.textDocuments = [load, query, fix];
+  await run(fix);
+  await settle();
+  await until(() => cat().length === 2, "ordrs to be known");
+  assert.equal(asked.filter((q) => q.includes("database_name IN ('wh')")).length, 0);
+  assert.deepEqual(await complete(2, "SELECT f.".length), ["amount", "id"]);
+
+  // The table arrives in the foreign database: it is read again, and the
+  // mark goes.
+  const add = open(path.join(dir, "add.sql"), "CREATE TABLE wh.fcts (z INTEGER);");
+  vscode.workspace.textDocuments = [load, query, fix, add];
+  await run(add);
+  await settle();
+  await until(() => cat().length === 1, "fcts to be known");
+  assert.equal(asked.filter((q) => q.includes("database_name IN ('wh')")).length, 1);
+  assert.deepEqual(await complete(3, "SELECT * FROM wh.".length), ["facts", "fcts", "main"]);
+  assert.equal(index.status("default", "wh").tables, 2);
 });
 
 live("the editor marks what the session does not have, and completes what it has", async (t) => {

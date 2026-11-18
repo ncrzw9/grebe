@@ -262,6 +262,7 @@ class Session {
     this.waiting = null; // { marker, resolve, reject }
     this.collecting = false; // a statement's marker is in, its stderr may not be
     this.queue = Promise.resolve();
+    this.gaveWay = 0; // how many times giveWay() was called
     this.closedWith = null;
     this.starting = false;
     this.dir = opts.cwd; // the working directory now (see chdir)
@@ -333,13 +334,21 @@ class Session {
    * `timeoutMs` ran out ("timeout"). Rejects when the session ends under it;
    * the error has `ended: true`, and `cancelled` when ending it was how a
    * cancel had to be done.
+   *
+   * `background` marks a statement nobody is waiting to see (the catalog
+   * index reading a database): giveWay() stops it, and one still queued
+   * when giveWay() is called is not run at all. Both resolve as cancelled
+   * with the reason "yield".
    */
-  run(sql, { timeoutMs = 0 } = {}) {
+  run(sql, { timeoutMs = 0, background = false } = {}) {
+    const asked = this.gaveWay;
     const job = this.queue.then(async () => {
+      if (background && asked !== this.gaveWay) return { kind: "cancelled", reason: "yield", ms: 0 };
       const started = process.hrtime.bigint();
       const trimmed = sql.replace(/\s+$/, "");
       const terminated = trimmed.endsWith(";") ? trimmed : `${trimmed}\n;`;
       const sent = this.send(terminated);
+      if (background && this.waiting) this.waiting.background = true;
       const timer = timeoutMs > 0 ? setTimeout(() => this.cancel("timeout"), timeoutMs) : null;
       let reply;
       try {
@@ -429,6 +438,22 @@ class Session {
       if (this.waiting === w) this.end(`cancelled; DuckDB did not stop within ${grace / 1000} s, so the session was ended`);
     }, grace);
     if (timer.unref) timer.unref();
+    return true;
+  }
+
+  /**
+   * A run is about to use the session: background statements make room.
+   * The one in flight, if it is a background one, is interrupted; those
+   * queued are dropped. Unlike cancel() this never ends the session: a
+   * statement that does not stop is waited for, and on Windows, where an
+   * interrupt would end the process, the one in flight is left to finish.
+   */
+  giveWay() {
+    this.gaveWay++;
+    const w = this.waiting;
+    if (!w || !w.background || w.cancelled || this.starting || this.closedWith !== null || !INTERRUPTIBLE) return false;
+    w.cancelled = "yield";
+    this.proc.kill("SIGINT");
     return true;
   }
 

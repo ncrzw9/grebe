@@ -628,16 +628,21 @@ fn cursor(src: &str, offset: u32) -> Option<Cursor<'_>> {
     })
 }
 
-struct Collector<'p> {
-    prefix: &'p str,
+struct Collector {
+    /// What is typed so far, lowercase: only names that start with it are
+    /// kept.
+    prefix: String,
     seen: HashSet<(String, Kind)>,
     items: Vec<Item>,
+    /// Some names were not looked at: there were more than an answer
+    /// carries.
+    incomplete: bool,
 }
 
-impl Collector<'_> {
+impl Collector {
     fn add(&mut self, name: &str, kind: Kind, detail: impl Into<String>, rank: u8) {
         let lname = name.to_ascii_lowercase();
-        if name.is_empty() || !lname.starts_with(&self.prefix.to_ascii_lowercase()) {
+        if name.is_empty() || !lname.starts_with(&self.prefix) {
             return;
         }
         if !self.seen.insert((lname, kind)) {
@@ -671,6 +676,18 @@ impl Collector<'_> {
         );
     }
 
+    /// The catalog's tables that match what is typed, within `within` (see
+    /// [`Catalog::tables_with_prefix`]). The catalog finds them by its
+    /// index and hands over no more than an answer can carry, so a catalog
+    /// of a hundred thousand tables costs what a small one does.
+    fn tables(&mut self, catalog: &Catalog, within: &[String], rank: u8) {
+        let (found, cut) = catalog.tables_with_prefix(&self.prefix, within, LIMIT + 1);
+        for t in found {
+            self.table(t, rank);
+        }
+        self.incomplete |= cut;
+    }
+
     fn columns_of(&mut self, t: &Table, rank: u8) {
         for c in &t.columns {
             self.add(
@@ -692,7 +709,7 @@ impl Collector<'_> {
 /// The columns of whatever `parts` names: a CTE, a table the file creates,
 /// or a catalog table.
 fn columns_named(
-    out: &mut Collector<'_>,
+    out: &mut Collector,
     parts: &[String],
     scope: &Scope,
     file: &FileContext,
@@ -736,9 +753,10 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
     let scope = scope_of(src, t);
     let file = FileContext::scan(src);
     let mut out = Collector {
-        prefix: cur.prefix,
+        prefix: cur.prefix.to_ascii_lowercase(),
         seen: HashSet::new(),
         items: Vec::new(),
+        incomplete: false,
     };
 
     // `a.b.` before the cursor: the qualifier chain, outermost first.
@@ -782,30 +800,19 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
             }
             if let Some(cat) = catalog {
                 // A database's schemas and tables; a schema's tables.
-                for tb in cat.tables() {
-                    if tb.database.eq_ignore_ascii_case(q) {
-                        out.add(
-                            &tb.schema,
-                            Kind::Module,
-                            format!("schema · {}", tb.database),
-                            1,
-                        );
-                        out.table(tb, 2);
-                    } else if tb.schema.eq_ignore_ascii_case(q) {
-                        out.table(tb, 2);
+                for (schema, database) in cat.schemas() {
+                    if database.eq_ignore_ascii_case(q) {
+                        out.add(schema, Kind::Module, format!("schema · {database}"), 1);
                     }
                 }
+                out.tables(cat, &lower, 2);
             }
         } else {
             // `schema.table.` / `db.schema.table.`: columns;
             // `db.schema.`: tables.
             columns_named(&mut out, &chain, &scope, &file, catalog, 0);
-            if let (Some(cat), [d, s]) = (catalog, lower.as_slice()) {
-                for tb in cat.tables() {
-                    if tb.database.eq_ignore_ascii_case(d) && tb.schema.eq_ignore_ascii_case(s) {
-                        out.table(tb, 2);
-                    }
-                }
+            if let (Some(cat), [_, _]) = (catalog, lower.as_slice()) {
+                out.tables(cat, &lower, 2);
             }
         }
         return finish(out);
@@ -889,15 +896,15 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
         out.add(&l.name, Kind::Class, "created in this file", tables_rank);
     }
     if let Some(cat) = catalog {
-        for tb in cat.tables() {
-            out.table(tb, tables_rank);
+        out.tables(cat, &[], tables_rank);
+        for (schema, _) in cat.schemas() {
+            out.add(schema, Kind::Module, "schema", tables_rank + 1);
         }
-        for tb in cat.tables() {
-            out.add(&tb.schema, Kind::Module, "schema", tables_rank + 1);
-            out.add(&tb.database, Kind::Module, "database", tables_rank + 1);
+        for database in cat.databases() {
+            out.add(database, Kind::Module, "database", tables_rank + 1);
         }
         if table_context {
-            for f in cat.functions().iter().filter(|f| f.kind.contains("table")) {
+            for f in cat.functions().filter(|f| f.kind.contains("table")) {
                 out.add(&f.name, Kind::Function, f.kind.as_str(), 2);
             }
         }
@@ -908,12 +915,12 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
     finish(out)
 }
 
-fn finish(out: Collector<'_>) -> Completions {
+fn finish(out: Collector) -> Completions {
     let mut items = out.items;
     items.sort_by(|a, b| {
         (a.rank, a.label.to_ascii_lowercase()).cmp(&(b.rank, b.label.to_ascii_lowercase()))
     });
-    let incomplete = items.len() > LIMIT;
+    let incomplete = out.incomplete || items.len() > LIMIT;
     items.truncate(LIMIT);
     Completions { items, incomplete }
 }

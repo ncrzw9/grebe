@@ -138,6 +138,12 @@
         "category": "grebe: Catalog"
       },
       {
+        "command": "grebe.catalog.reindex",
+        "title": "Refresh Connection Index",
+        "category": "grebe: Catalog",
+        "icon": "$(sync)"
+      },
+      {
         "command": "grebe.catalog.preview",
         "title": "Preview",
         "category": "grebe: Catalog"
@@ -286,6 +292,17 @@
           "default": true,
           "description": "Give the language server the tables and columns of the running session, so the editor completes their names and marks a table or column the session does not have. Off: completion and linting use the SQL text alone."
         },
+        "grebe.duckdb.catalogIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep what the editor knows of the session database by database. Local databases (the session's own, in-memory and TEMP ones, attached DuckDB files) are read again after a run. A foreign database (PostgreSQL, SQLite, MySQL, ...) is read once, when first attached, kept between windows, and read again only when a statement changes it, when its index is older than grebe.duckdb.catalogIndexMaxAge, or when you choose Refresh Connection Index in the Catalog. A database of more than 500,000 columns is left out by itself; the others still complete and are checked. Off: every database is read after every run and sent as one snapshot, and past 100,000 columns in all the editor gets none."
+        },
+        "grebe.duckdb.catalogIndexMaxAge": {
+          "type": "integer",
+          "default": 60,
+          "minimum": 0,
+          "description": "Read a foreign database's tables again once its index is older than this many minutes (default 60), at the next run. 0 never does by age: only a statement that changes the database, or Refresh Connection Index, reads it again. Tables created on the server by someone else show up in completion after this long at most."
+        },
         "grebe.duckdb.maxRows": {
           "type": "integer",
           "default": 10000,
@@ -408,6 +425,10 @@
         },
         {
           "command": "grebe.catalog.reattach",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.reindex",
           "when": "false"
         },
         {
@@ -539,6 +560,11 @@
           "command": "grebe.catalog.detach",
           "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
           "group": "1_view@1"
+        },
+        {
+          "command": "grebe.catalog.reindex",
+          "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
+          "group": "1_view@2"
         },
         {
           "command": "grebe.catalog.reattach",

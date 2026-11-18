@@ -375,6 +375,9 @@ async function run(client, { doc, range }) {
 
   let sess;
   try {
+    // The catalog index may be reading a database: a run does not wait
+    // for that.
+    for (const name of manager.names()) manager.live(name).giveWay();
     sess = await sessionFor(doc.uri, doc.getText());
   } catch (e) {
     const msg = startHint(String(e.message ?? e));
@@ -384,6 +387,7 @@ async function run(client, { doc, range }) {
   }
 
   let ran = 0;
+  const done = []; // what was handed to DuckDB: { text, kind }
   let succeeded = 0;
   let failed = false;
   let stopped = null; // "cancel" | "timeout" when a statement was stopped
@@ -420,6 +424,7 @@ async function run(client, { doc, range }) {
       // The session is gone either way; the next run starts a new one.
     }
     ran++;
+    done.push({ text: st.text, kind: st.kind });
     if (r.kind === "rows") {
       const more = r.rows.length > s.maxRows;
       // What the grid receives: column-major display text (columnar()).
@@ -472,9 +477,10 @@ async function run(client, { doc, range }) {
         ? `Stopped at the error: ${ran - 1} succeeded${skipped ? `, ${skipped} not run` : ""}.`
         : `${ran} statement${ran === 1 ? "" : "s"} succeeded.`,
   );
-  // A run may have created, dropped or attached something.
+  // A run may have created, dropped or attached something. The listeners
+  // are told what ran, so they can tell whether it can have.
   await manager.remember(sess.name);
-  for (const l of runListeners) l();
+  for (const l of runListeners) l({ session: sess.name, statements: done });
 }
 
 // A query runs as `FROM (<query>) LIMIT maxRows + 1`, so DuckDB formats only
@@ -652,6 +658,14 @@ function declaredConnections() {
   return out;
 }
 
+/** Every connection still remembered, of every session: `[{ type, path }]`
+ *  (the path without a password, as it is kept). */
+function allConnections() {
+  if (!manager) return [];
+  const names = new Set([DEFAULT, ...manager.names(), ...(manager.deps.storedNames ? manager.deps.storedNames() : [])]);
+  return [...names].flatMap((name) => manager.remembered(name)).map((r) => ({ type: r.type || "duckdb", path: r.path }));
+}
+
 /** Every running session: `[{ name, session }]`. */
 const liveSessions = () => (manager ? manager.names().map((name) => ({ name, session: manager.live(name) })) : []);
 
@@ -779,6 +793,7 @@ function activate(context, clientReady) {
         else Object.assign(memory, { [name]: recs });
       },
     },
+    storedNames: () => Object.keys(all()),
     reattach: () => settings().reattach,
     declared: declaredConnections,
     askPassword: (rec) =>
@@ -886,6 +901,7 @@ module.exports = {
   currentSessionName,
   liveSession,
   liveSessions,
+  allConnections,
   sessionNameOf,
   rememberAttachments,
   rememberedAttachments,

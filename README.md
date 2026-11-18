@@ -161,6 +161,12 @@ A catalog is a snapshot file: a JSON array with one object per column.
 [{"database": "shop", "schema": "main", "table": "orders", "column": "id", "type": "BIGINT"}]
 ```
 
+`grebe catalog --with-metadata` writes an object instead, which is read
+wherever the array is: the same rows under `"columns"`, each with
+`"nullable"`, and under `"tables"` what DuckDB knows of each table (its
+`kind`, estimated `rows`, `primary_key`, `unique` constraints and
+`indexes`). No rule reads those yet.
+
 `grebe catalog` writes one by running your own `duckdb` CLI, read-only, on
 a database file:
 
@@ -185,6 +191,16 @@ The language server completes from the same catalog: columns after
 `name.`, on statements that do not parse yet. An editor with a database
 open can send its catalog directly (the VS Code extension sends the
 session's); any other LSP client gets the `grebe.toml` one.
+
+An editor sends it with the `grebe/catalog` notification: the whole
+snapshot (`{ columns: [...] }`), or one database at a time
+(`{ database: "pg", columns: [...] }` replaces that database's part and
+leaves the others, `{ database: "pg", columns: null }` drops it), so a
+large attached database is sent once and the small local ones after every
+run. The VS Code extension does that: it reads a PostgreSQL, SQLite or
+MySQL attachment once, keeps it between windows, and leaves out, alone, a
+database of more than 500,000 columns. Looking a name up costs the same in
+a catalog of a million columns as in a small one.
 
 These rules match names; they do not bind. They report only what cannot be
 right, and say nothing when a statement or a file does something they do

@@ -718,4 +718,83 @@ fn catalog_snapshot_of_a_real_database_round_trips() {
         stdout(&out),
         "q.sql:2:10: CAT002 unknown-column (did you mean \"Order Date\"?)\n"
     );
+
+    // --with-metadata: the object form, which reads the same and says more.
+    let out = grebe(
+        dir.path(),
+        &[
+            "catalog",
+            "--with-metadata",
+            "--duckdb",
+            &cli,
+            "shop.duckdb",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), "2 table(s) and view(s), 3 column(s)");
+    let text = stdout(&out);
+    assert!(text.starts_with("{\"columns\": ["), "{text}");
+    assert!(text.contains("\"nullable\":true"), "{text}");
+    assert!(
+        text.contains("\"table\":\"recent\",\"kind\":\"view\""),
+        "{text}"
+    );
+    dir.write("catalog.json", &text);
+    let out = grebe(dir.path(), &["check", "--catalog", "catalog.json", "q.sql"]);
+    assert_eq!(
+        stdout(&out),
+        "q.sql:2:10: CAT002 unknown-column (did you mean \"Order Date\"?)\n"
+    );
+}
+
+/// `--with-metadata` asks duckdb twice and puts the answers together.
+#[cfg(unix)]
+#[test]
+fn catalog_with_metadata_prints_columns_and_tables() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("catalog-meta");
+    dir.write("shop.duckdb", "");
+    let fake = dir.write(
+        "duckdb",
+        "#!/bin/sh\n\
+         case \"$6\" in\n\
+         *duckdb_tables*) cat tables.json ;;\n\
+         *is_nullable*) cat snapshot.json ;;\n\
+         *) echo unexpected ;;\n\
+         esac\n",
+    );
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir.write("snapshot.json", SHOP);
+    dir.write(
+        "tables.json",
+        "[{\"database\":\"shop\",\"schema\":\"main\",\"table\":\"orders\",\"kind\":\"table\",\
+         \"rows\":12,\"primary_key\":[\"id\"],\"unique\":[],\"indexes\":null}]\n",
+    );
+    let out = grebe(
+        dir.path(),
+        &[
+            "catalog",
+            "--duckdb",
+            "./duckdb",
+            "--with-metadata",
+            "shop.duckdb",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), "1 table(s) and view(s), 2 column(s)");
+    let text = stdout(&out);
+    assert!(text.starts_with("{\"columns\": ["), "{text}");
+    assert!(
+        text.contains("\"tables\": [{\"database\":\"shop\""),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with("}]}"), "{text}");
+    // And `check` reads what it wrote.
+    dir.write("catalog.json", &text);
+    dir.write("q.sql", "SELECT * FROM ordrs;\n");
+    let out = grebe(dir.path(), &["check", "--catalog", "catalog.json", "q.sql"]);
+    assert_eq!(
+        stdout(&out),
+        "q.sql:1:15: CAT001 unknown-table (did you mean orders?)\n"
+    );
 }
