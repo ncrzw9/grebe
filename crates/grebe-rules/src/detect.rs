@@ -19,6 +19,12 @@ pub struct Finding {
     /// The edit this finding's rule proposes, when it has one. Whether it is
     /// applied is decided by the rule's registry `fix_safety`, not here.
     pub fix: Option<Fix>,
+    /// What a `CAT` finding found, as a clause: the table and its row
+    /// estimate, the two tables a name is in. The evidence differs from
+    /// finding to finding, so it cannot be the registry's fixed prose;
+    /// [`crate::catalog::message`] makes the sentence. `None` for every
+    /// rule whose message says it all.
+    pub detail: Option<String>,
 }
 
 /// A byte-range edit on the original buffer.
@@ -205,6 +211,7 @@ pub fn count_star(tree: &Tree, src: &str) -> Vec<Finding> {
         }
         let sp = tree.node(star).span;
         out.push(Finding {
+            detail: None,
             code: "MOD001",
             span: sp,
             // Smallest correct edit: delete the star. Collapsing the resulting
@@ -235,6 +242,7 @@ pub fn ifnull_coalesce(tree: &Tree, src: &str) -> Vec<Finding> {
         if name == "ifnull" || name == "nvl" {
             let sp = tree.node(id).span;
             out.push(Finding {
+                detail: None,
                 code: "MOD006",
                 span: sp,
                 fix: Some(Fix {
@@ -256,6 +264,7 @@ pub fn natural_join(tree: &Tree, _src: &str) -> Vec<Finding> {
     tree.find("NaturalJoinPrefix")
         .into_iter()
         .map(|n| Finding {
+            detail: None,
             code: "MOD007",
             span: tree.node(n).span,
             fix: None,
@@ -312,6 +321,7 @@ pub fn self_alias(tree: &Tree, src: &str) -> Vec<Finding> {
         let last = expr_text.trim().rsplit('.').next().unwrap_or("");
         if !last.is_empty() && spelling(last) == alias {
             out.push(Finding {
+                detail: None,
                 code: "MOD009",
                 span: tree.node(n).span,
                 // Delete the alias clause: from the end of the expression's
@@ -344,6 +354,7 @@ pub fn plain_big_number(tree: &Tree, src: &str) -> Vec<Finding> {
             t.len() >= 7 && t.bytes().all(|b| b.is_ascii_digit())
         })
         .map(|n| Finding {
+            detail: None,
             code: "MOD020",
             span: tree.node(n).span,
             fix: None,
@@ -486,6 +497,7 @@ pub fn group_by_all(tree: &Tree, src: &str) -> Vec<Finding> {
 
         let sp = tree.node(group_by).span;
         out.push(Finding {
+            detail: None,
             code: "MOD003",
             span: sp,
             // The explicit list was just proven set-equal to what `ALL`
@@ -531,6 +543,7 @@ pub fn subquery_order_by(tree: &Tree, _src: &str) -> Vec<Finding> {
                 continue;
             }
             out.push(Finding {
+                detail: None,
                 code: "MOD004",
                 span: tree.node(order_by).span,
                 // No safe mechanical edit: the ORDER BY might be
@@ -577,6 +590,7 @@ pub fn distinct_group_by(tree: &Tree, _src: &str) -> Vec<Finding> {
             continue;
         }
         out.push(Finding {
+            detail: None,
             code: "MOD005",
             span: tree.node(distinct_on).span,
             fix: None,

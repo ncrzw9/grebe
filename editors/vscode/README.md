@@ -283,9 +283,26 @@ stop that. The files you browse are kept with the workspace too.
 After every run the language server is told which tables, views, columns
 and macros the session holds, so in a `.sql` file:
 
-- **Completion** offers them: tables and views after `FROM` and `JOIN`,
-  the columns of the tables in the statement, and `alias.` or `table.`
-  their columns.
+- **Completion** offers them: tables and views after `FROM` and `JOIN`
+  (with their kind and row estimate), the columns of the tables in the
+  statement wherever a column goes, SELECT-first or FROM-first, and
+  `alias.` or `table.` their columns. A column shows its type, `NOT NULL`
+  and whether it is in a key or an index. Right after a join's `ON` the
+  condition the keys imply comes first (`o.customer_id = c.id`, when one
+  table's key matches a column of the other named for it). In `* EXCLUDE (`,
+  `USING (` and `INSERT INTO t (` only the columns that can go there are
+  offered.
+- **Hover** on a table or view shows its full name, kind, row estimate,
+  keys, indexes and columns with their types; on an alias, the table it
+  stands for; on a column, its type, whether it may be NULL and its place
+  in the keys. Only for a name that is exactly one thing: a column that two
+  of the query's tables have, or a name next to a subquery or a file, has
+  no hover.
+- **Expand \* to columns** (a refactoring in the lightbulb menu, kind
+  `refactor.rewrite`) writes a `SELECT *` or `alias.*` out as its columns,
+  in table order, qualified when the query reads more than one table, and
+  leaves out the ones an `EXCLUDE` names. It is offered only when every
+  table of the query is one the catalog knows.
 - **A table or column the session does not have** is marked (`CAT001`,
   `CAT002`), with the nearest name when there is one. Tables a file
   creates itself, CTEs, files (`'data.csv'`) and table functions are never
@@ -325,7 +342,7 @@ costs its price once and cannot take the rest down with it:
 - The index also records what DuckDB (or, for PostgreSQL, the server's
   own catalog) knows of each table: whether a column may be NULL, the
   estimated row count, the primary key, unique constraints and indexes.
-  Nothing uses these yet; they are there for rules to come.
+  Hover and completion show them, and the join condition comes from them.
 
 Reading a database for the editor happens after a run's results are
 shown, never during a run, and one database at a time. A run that starts
@@ -598,9 +615,10 @@ editor wins over the file's `select`.
 
 - **No bundled DuckDB.** Running SQL uses the `duckdb` CLI you point it at;
   grebe itself links no database engine.
-- **No completion.** The language server's exchange is `didOpen`,
-  `didChange` (full sync), `didSave`, `didClose`, semantic tokens, code
-  actions, formatting, and the statement boundaries a run uses.
+- **No go-to-definition, rename or references.** The language server's
+  exchange is `didOpen`, `didChange` (full sync), `didSave`, `didClose`,
+  semantic tokens, completion, hover, code actions, formatting, and the
+  statement boundaries a run uses.
 
 Run `grebe rules` for the current rule table.
 

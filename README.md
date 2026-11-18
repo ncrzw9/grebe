@@ -2,8 +2,9 @@
 
 A DuckDB SQL formatter and linter. One static binary with no runtime
 dependencies: no database engine, no catalog, no network. Give it a
-[catalog snapshot](#catalog) and it also checks table and column names and
-completes them in your editor.
+[catalog snapshot](#catalog) and it also checks table and column names,
+checks queries against what the catalog says of each table, and completes
+names in your editor.
 
 The parser is generated from DuckDB's own PEG grammar, vendored verbatim, so
 grebe parses the dialect DuckDB parses instead of approximating it. The
@@ -115,7 +116,8 @@ exclude = ["generated/**"]
 # select = ["MOD001", "MOD010"]  # run only these MOD rules (opt-in ones included)
 # select = ["ALL"]               # every MOD rule, default-on and opt-in alike
 # select = ["FRIENDLY"]          # the safe rewrites into DuckDB's friendly SQL
-# catalog = "catalog.json"       # a catalog snapshot: turns on CAT001 and CAT002
+# catalog = "catalog.json"       # a catalog snapshot: turns on the CAT rules
+# large-table-rows = 1_000_000   # the row estimate at which CAT003 calls a table large
 
 [severity]
 MOD001 = "warning"   # error | warning | info | off; a level turns an opt-in rule on
@@ -165,7 +167,8 @@ A catalog is a snapshot file: a JSON array with one object per column.
 wherever the array is: the same rows under `"columns"`, each with
 `"nullable"`, and under `"tables"` what DuckDB knows of each table (its
 `kind`, estimated `rows`, `primary_key`, `unique` constraints and
-`indexes`). No rule reads those yet.
+`indexes`). CAT003 to CAT010 read those; see
+[What a catalog with metadata adds](#what-a-catalog-with-metadata-adds).
 
 `grebe catalog` writes one by running your own `duckdb` CLI, read-only, on
 a database file:
@@ -188,9 +191,15 @@ FROM duckdb_columns() WHERE NOT internal;
 
 The language server completes from the same catalog: columns after
 `alias.`, tables after `FROM`, what is inside a schema or database after
-`name.`, on statements that do not parse yet. An editor with a database
-open can send its catalog directly (the VS Code extension sends the
-session's); any other LSP client gets the `grebe.toml` one.
+`name.`, the columns of the statement's tables wherever a column goes, on
+statements that do not parse yet. With the metadata `grebe catalog
+--with-metadata` writes (types, NOT NULL, keys, indexes, row estimates) it
+also shows them in completion and on hover over a table, an alias or a
+column, offers the join condition the keys imply right after `ON`, and has
+a code action, **Expand \* to columns** (`refactor.rewrite`), that writes a
+`SELECT *` out as its columns when every table is in the catalog. An editor
+with a database open can send its catalog directly (the VS Code extension
+sends the session's); any other LSP client gets the `grebe.toml` one.
 
 An editor sends it with the `grebe/catalog` notification: the whole
 snapshot (`{ columns: [...] }`), or one database at a time
@@ -222,6 +231,103 @@ tables dropped in turn, every statement DuckDB then rejects is reported
 (560 of 560) and nothing else; with each of the 486 columns dropped in
 turn, 257 of the 1,887 statements DuckDB rejects are reported (the
 qualified ones) and nothing else.
+
+### What a catalog with metadata adds
+
+With `grebe catalog --with-metadata` (or a snapshot with the same
+`"tables"` and `"nullable"`), these rules run too. Each needs a particular
+fact (a row estimate, a key, an index, a nullability, a type) and says
+nothing about a table the snapshot gives no such fact for, so a snapshot of
+columns alone behaves as before. Each fires only where a column can be
+pinned to one catalog table: the query's FROM holds catalog tables and
+nothing else (no subquery, CTE, table function or table the file creates),
+and exactly one of them has the column. The finding names the evidence:
+`CAT003 unbounded-scan (orders holds about 2,400,000 rows)`.
+
+- **CAT003 unbounded-scan** (info): the statement's result reads every row
+  of a table estimated at `large-table-rows` or more (default 1,000,000):
+  no WHERE, QUALIFY, LIMIT, SAMPLE, join, GROUP BY, DISTINCT or aggregate.
+  `SELECT count(*) FROM big` is left alone on purpose: it reads everything
+  because the answer needs it, and returns one row. So are CTEs and
+  subqueries (whatever reads them filters them), `CREATE TABLE AS`,
+  `INSERT ... SELECT`, `COPY` and views.
+
+  ```sql
+  SELECT * FROM orders;      -- orders holds about 2,400,000 rows
+  ```
+
+- **CAT004 index-defeating-filter** (info): a WHERE or ON condition wraps
+  the first column of the primary key, a unique key or an index in
+  `lower`/`upper`/`trim`/`strftime`/`length`, casts it to text (or a
+  fraction to an integer), or matches it with a `LIKE`/`ILIKE` pattern that
+  starts with a wildcard, and compares it with a constant. Run against
+  DuckDB 1.5 and 2.0, each of these filters row by row instead of on the
+  column. What DuckDB rewrites into a filter on the column is not flagged:
+  arithmetic with a constant, widening casts, `date_trunc`, a timestamp
+  cast to DATE, `LIKE 'abc%'`. Where it fires on a predicate MOD035 also
+  flags, it reports in MOD035's place.
+
+  ```sql
+  SELECT id FROM users WHERE lower(email) = 'a@example.com';   -- users.email leads a unique key
+  ```
+
+- **CAT005 nullable-not-in** (warning): `x NOT IN (SELECT c FROM t ...)`
+  where `t` is the subquery's only table and `c` may be NULL. It replaces
+  MOD028 there, with the column named; where the catalog says `c` is NOT
+  NULL, MOD028 is not reported at all. (A NULL `x` drops only its own row,
+  which is not what MOD028 warns about.)
+
+  ```sql
+  SELECT id FROM orders WHERE id NOT IN (SELECT order_id FROM payments);   -- payments.order_id may be NULL
+  ```
+
+- **CAT006 ambiguous-column** (warning): an unqualified column that two or
+  more tables of the same FROM have, which DuckDB rejects. A name in a
+  `USING (...)`, a NATURAL, SEMI or ANTI join, a name only an outer query's
+  tables have, and ORDER BY (which prefers select-list names) are left
+  alone. An ON sees only the tables joined before it.
+
+  ```sql
+  SELECT id FROM orders o JOIN customers c ON c.id = o.customer_id;   -- id is in o and c
+  ```
+
+- **CAT007 insert-mismatch** (warning): `INSERT ... VALUES` that DuckDB
+  rejects: a column list naming a column the table lacks, a row whose width
+  is not the list's, or, without a list, a row wider than the table. A row
+  narrower than the table is not flagged, since a snapshot does not say
+  which columns are generated; `BY NAME`, `DEFAULT VALUES` and `INSERT ...
+  SELECT` are not checked.
+
+  ```sql
+  INSERT INTO customers (id, name) VALUES (1, 'a', DATE '2024-01-01');   -- 2 columns named, 3 values given
+  ```
+
+- **CAT008 type-mismatch** (info): a comparison of two columns whose types
+  are of different kinds (text, number, date or time, boolean). DuckDB
+  either rejects it or casts one side. Literals are never flagged.
+
+  ```sql
+  SELECT 1 FROM users u JOIN teams t ON t.name = u.team_id;   -- teams.name is VARCHAR and users.team_id is BIGINT
+  ```
+
+- **CAT009 fan-out-join** (info): a join of exactly two tables, both with a
+  key in the catalog, on column equalities (or `USING`) that cover a key of
+  neither: rows can multiply on both sides.
+
+  ```sql
+  SELECT * FROM payments p JOIN refunds r ON r.customer_id = p.customer_id;
+  ```
+
+- **CAT010 redundant-distinct** (info): `SELECT DISTINCT` over one table
+  whose select list (bare columns, or `*`) holds the primary key or a
+  unique key with no nullable column.
+
+  ```sql
+  SELECT DISTINCT id, total FROM orders;   -- id is the primary key of orders
+  ```
+
+Turn any of them off with `[severity]` (`CAT003 = "off"`); a MOD028 or
+MOD035 finding a CAT rule took over comes back when that rule is off.
 
 ## Scope
 

@@ -389,6 +389,7 @@ mod tests {
         use grebe_syntax::Span;
         let src = "abcdef";
         let mk = |s: u32, e: u32, r: &str| Finding {
+            detail: None,
             code: "MOD001", // registry Safe
             span: Span::new(s, e),
             fix: Some(Fix {

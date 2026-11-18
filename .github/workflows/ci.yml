@@ -60,14 +60,21 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --bin grebe
+          # Both versions run even when the first fails, so one run shows
+          # everything that is wrong.
+          failed=""
           for version in $DUCKDB_VERSIONS; do
             echo "::group::DuckDB $version"
             editors/vscode/test/fetch-duckdb.sh "$version" "$RUNNER_TEMP/duckdb-$version"
             NODE_PATH="$RUNNER_TEMP/pw/node_modules" \
             GREBE_BIN="$PWD/target/debug/grebe" DUCKDB_CLI="$RUNNER_TEMP/duckdb-$version/duckdb" \
-              node --test editors/vscode/test/*.test.js
+              node --test editors/vscode/test/*.test.js || failed="$failed $version"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::extension tests failed with DuckDB$failed"
+            exit 1
+          fi
       # Verification builds sibling crates as registry dependencies, and cargo
       # never rebuilds a registry crate it has already compiled at the same
       # version. Every crate here keeps one version across many commits, so a

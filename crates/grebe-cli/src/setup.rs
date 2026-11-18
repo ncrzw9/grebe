@@ -97,6 +97,7 @@ pub fn selection<'a>(
         severity: config.map_or(&[][..], |c| c.severity.as_slice()),
         foreign_heads: config.map_or(&[][..], |c| c.foreign_heads.as_slice()),
         catalog,
+        catalog_options: config.map(Config::catalog_options).unwrap_or_default(),
     }
 }
 

@@ -617,10 +617,23 @@ fn run() -> i32 {
                     if let Some(s) = suggestion {
                         pairs.push(("suggestion".to_string(), grebe_lsp::json::Json::str(s)));
                     }
+                    // What the catalog says that makes a CAT003-010 finding.
+                    if let Some(d) = &fnd.detail {
+                        pairs.push(("detail".to_string(), grebe_lsp::json::Json::str(d.clone())));
+                    }
                     json_findings.push(grebe_lsp::json::Json::object(pairs));
                 } else if let Some(s) = suggestion {
                     outln!(
                         "{}:{}:{}: {} {} (did you mean {s}?)",
+                        f.display(),
+                        line,
+                        col,
+                        fnd.code,
+                        name
+                    );
+                } else if let Some(d) = &fnd.detail {
+                    outln!(
+                        "{}:{}:{}: {} {} ({d})",
                         f.display(),
                         line,
                         col,
@@ -858,12 +871,13 @@ fn print_catalog_help() {
     outln!("   \"tables\": [{{\"database\", \"schema\", \"table\", \"kind\", \"rows\",");
     outln!("               \"primary_key\", \"unique\", \"indexes\"}}]}}");
     outln!("Both forms are read wherever a snapshot is. The row count is DuckDB's");
-    outln!("estimate (it does not go down when rows are deleted). No rule reads");
-    outln!("the extra facts yet.");
+    outln!("estimate (it does not go down when rows are deleted). CAT003 to");
+    outln!("CAT010 read these facts and stay silent without them.");
     outln!();
     outln!("Give it to 'grebe check --catalog FILE', or name it in grebe.toml as");
     outln!("catalog = \"catalog.json\", and CAT001 (unknown table) and CAT002");
-    outln!("(unknown column) check names against it. grebe itself embeds no");
+    outln!("(unknown column) check names against it, and CAT003 to CAT010 use");
+    outln!("what it says of each table. grebe itself embeds no");
     outln!("engine: this command is the only one that runs duckdb, and only");
     outln!("when you ask for it.");
     outln!();
@@ -984,7 +998,9 @@ fn print_check_help() {
     outln!("                            of text lines; summaries still go to");
     outln!("                            stderr.");
     outln!("  --catalog FILE            also check table and column names against");
-    outln!("                            this catalog snapshot (CAT001, CAT002);");
+    outln!("                            this catalog snapshot (CAT001, CAT002), and");
+    outln!("                            queries against what it says of each table");
+    outln!("                            (CAT003-CAT010, with --with-metadata);");
     outln!("                            'grebe catalog DATABASE' writes one. Wins");
     outln!("                            over a config file's catalog. Without a");
     outln!("                            catalog those rules do not run.");
@@ -999,7 +1015,9 @@ fn print_check_help() {
     outln!();
     outln!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
     outln!("pyproject.toml) is discovered by walking up from the first path given.");
-    outln!("Its select, [severity], foreign-heads and catalog apply here; a config's own");
+    outln!("Its select, [severity], foreign-heads, catalog and large-table-rows apply");
+    outln!("here (large-table-rows: the row estimate at which CAT003 calls a table");
+    outln!("large, 1000000 by default); a config's own");
     outln!("select only takes effect when --select is absent on the command line.");
     outln!();
     outln!("Exit codes:");
@@ -1019,6 +1037,12 @@ fn print_rules_help() {
     outln!("No flags. Prints one row per rule: code, name, category, default");
     outln!("severity, and fix safety. Rows marked \"off (opt-in)\" are disabled by");
     outln!("default; turn one on with 'grebe check --select CODE,...'.");
+    outln!();
+    outln!("Categories: PRS a statement does not parse; SRC a statement not");
+    outln!("analysed (template markup, another dialect); MOD an opinion on valid");
+    outln!("SQL; CAT what a catalog snapshot shows (run only with --catalog or");
+    outln!("catalog = in grebe.toml: CAT001-002 unknown names, CAT003-010 queries");
+    outln!("its table metadata shows to be wrong or costly).");
     outln!();
     outln!("Exit codes:");
     outln!("  0   always");

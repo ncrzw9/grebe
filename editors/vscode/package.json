@@ -290,7 +290,7 @@
         "grebe.duckdb.catalogInEditor": {
           "type": "boolean",
           "default": true,
-          "description": "Give the language server the tables and columns of the running session, so the editor completes their names and marks a table or column the session does not have. Off: completion and linting use the SQL text alone."
+          "description": "Give the language server the tables and columns of the running session, so the editor completes their names, describes them on hover, can expand a SELECT * to its columns, and marks a table or column the session does not have. Off: completion and linting use the SQL text alone."
         },
         "grebe.duckdb.catalogIndex": {
           "type": "boolean",

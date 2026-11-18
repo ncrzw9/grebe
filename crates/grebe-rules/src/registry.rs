@@ -15,7 +15,7 @@
 //! | [`Category::Prs`] | statement does not parse | our PEG matcher |
 //! | [`Category::Src`] | statement deliberately not analyzed | head match + parse failure |
 //! | [`Category::Mod`] | opinionated rule on valid SQL | our CST |
-//! | [`Category::Cat`] | a name the given catalog does not have | our CST + a snapshot |
+//! | [`Category::Cat`] | what the given catalog says is wrong: a name it does not have, or a query its metadata (types, keys, sizes) shows is mistaken or slow | our CST + a snapshot |
 //!
 //! There is no `PRS900 unclassified-parse-error` either: our PEG matcher's
 //! reject IS `PRS001` — there is no second engine underneath it to disagree
@@ -37,7 +37,8 @@ pub enum Category {
     /// An opinionated rule over valid SQL, read off our own CST.
     Mod,
     /// A table or column the catalog snapshot a caller supplied does not
-    /// have. Silent unless a catalog is given.
+    /// have, or a query that snapshot's table metadata shows to be wrong or
+    /// costly. Silent unless a catalog is given.
     Cat,
 }
 
@@ -145,6 +146,88 @@ pub static RULES: &[Rule] = &[
         default_severity: Severity::Warning,
         fix_safety: FixSafety::None,
         message: "Column is not in the table it is qualified with.",
+    },
+    // CAT003-010 read a table's metadata beyond its columns: types,
+    // nullability, row estimate, keys, indexes. Each is silent when the
+    // snapshot does not carry what it needs, so they are on by default: a
+    // snapshot with columns only behaves as before. The message names the
+    // evidence; see `crate::catalog::message`.
+    Rule {
+        code: "CAT003",
+        name: "unbounded-scan",
+        category: Category::Cat,
+        // Info: reading a whole large table can be the point; the finding
+        // asks whether a WHERE or LIMIT was forgotten.
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "Query returns every row of a large table: nothing filters, limits, samples, \
+                   joins or aggregates it.",
+    },
+    Rule {
+        code: "CAT004",
+        name: "index-defeating-filter",
+        category: Category::Cat,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "Filter wraps an indexed column in a function, a cast or a leading-wildcard \
+                   pattern, so DuckDB filters row by row instead of on the column; compare \
+                   the column itself.",
+    },
+    Rule {
+        code: "CAT005",
+        name: "nullable-not-in",
+        category: Category::Cat,
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "NOT IN (subquery) over a column that may be NULL: one NULL makes this match \
+                   zero rows. Use NOT EXISTS, or filter the column IS NOT NULL.",
+    },
+    Rule {
+        code: "CAT006",
+        name: "ambiguous-column",
+        category: Category::Cat,
+        // Warning: DuckDB rejects the statement.
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "Unqualified column is in more than one table of this FROM; DuckDB rejects it \
+                   as ambiguous. Qualify it.",
+    },
+    Rule {
+        code: "CAT007",
+        name: "insert-mismatch",
+        category: Category::Cat,
+        // Warning: DuckDB rejects the statement.
+        default_severity: Severity::Warning,
+        fix_safety: FixSafety::None,
+        message: "INSERT does not fit the table: DuckDB rejects it.",
+    },
+    Rule {
+        code: "CAT008",
+        name: "type-mismatch",
+        category: Category::Cat,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "Comparison of two columns of different kinds of type: DuckDB either rejects \
+                   it or casts one side to the other's type, which can fail on a value or \
+                   match unexpectedly.",
+    },
+    Rule {
+        code: "CAT009",
+        name: "fan-out-join",
+        category: Category::Cat,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "Join columns are a key of neither table: a row can match many rows, and the \
+                   result can hold more rows than either table.",
+    },
+    Rule {
+        code: "CAT010",
+        name: "redundant-distinct",
+        category: Category::Cat,
+        default_severity: Severity::Info,
+        fix_safety: FixSafety::None,
+        message: "DISTINCT over rows that already differ: the select list holds a key of its \
+                   only table.",
     },
     // --- MOD, default-on (MOD010 aside) ---
     Rule {
@@ -764,8 +847,8 @@ mod tests {
         assert_eq!(src, 2);
         let cat = RULES.iter().filter(|r| r.category == Category::Cat).count();
         assert_eq!(mods, 40);
-        assert_eq!(cat, 2);
-        assert_eq!(RULES.len(), 45);
+        assert_eq!(cat, 10);
+        assert_eq!(RULES.len(), 53);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,

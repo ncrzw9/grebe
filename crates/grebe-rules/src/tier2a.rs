@@ -137,6 +137,7 @@ pub fn null_comparison(tree: &Tree, src: &str) -> Vec<Finding> {
             // Simple splice: operator through NULL's end becomes `IS [NOT] NULL`.
             let sp = Span::new(tree.node(op_node).span.start, tree.node(right).span.end);
             out.push(Finding {
+                detail: None,
                 code: "MOD002",
                 span: sp,
                 fix: Some(Fix {
@@ -154,6 +155,7 @@ pub fn null_comparison(tree: &Tree, src: &str) -> Vec<Finding> {
             let sp = Span::new(tree.node(left).span.start, tree.node(right).span.end);
             let replacement = format!("{} {verb}", text(tree, right, src));
             out.push(Finding {
+                detail: None,
                 code: "MOD002",
                 span: sp,
                 fix: Some(Fix {
@@ -201,6 +203,7 @@ pub fn prefix_alias(tree: &Tree, src: &str) -> Vec<Finding> {
         // Reorder, not splice: `<expr> AS <alias>` -> `<alias>: <expr>`.
         let replacement = format!("{}: {}", text(tree, label, src), text(tree, expr, src));
         out.push(Finding {
+            detail: None,
             code: "MOD023",
             span: sp,
             fix: Some(Fix {
@@ -246,6 +249,7 @@ pub fn bare_union(tree: &Tree, _src: &str) -> Vec<Finding> {
         // No fix: picking ALL vs DISTINCT changes results and the tool can't
         // guess intent (registry fix safety `None`).
         out.push(Finding {
+            detail: None,
             code: "MOD008",
             span: tree.node(setop).span,
             fix: None,
@@ -285,6 +289,7 @@ pub fn large_in_list(tree: &Tree, _src: &str) -> Vec<Finding> {
         // No fix: rewriting to `JOIN (VALUES ...)` needs a synthesized table
         // alias and column name -- a human decision, not mechanical.
         out.push(Finding {
+            detail: None,
             code: "MOD019",
             span: tree.node(list).span,
             fix: None,
@@ -375,6 +380,7 @@ pub fn ordinal_reference(tree: &Tree, _src: &str) -> Vec<Finding> {
             };
             if reduces_to(tree, expr, "NumberLiteral") {
                 out.push(Finding {
+                    detail: None,
                     code: "MOD011",
                     span: tree.node(expr).span,
                     fix: None,
@@ -401,6 +407,7 @@ pub fn ordinal_reference(tree: &Tree, _src: &str) -> Vec<Finding> {
             };
             if reduces_to(tree, expr, "NumberLiteral") {
                 out.push(Finding {
+                    detail: None,
                     code: "MOD011",
                     span: tree.node(expr).span,
                     fix: None,
@@ -448,6 +455,7 @@ pub fn view_order_by(tree: &Tree, _src: &str) -> Vec<Finding> {
             continue;
         }
         out.push(Finding {
+            detail: None,
             code: "MOD012",
             span: tree.node(order_clause).span,
             fix: None,
@@ -637,6 +645,7 @@ pub fn order_by_all(tree: &Tree, src: &str) -> Vec<Finding> {
             tree.node(order_clause).span // defensive: shouldn't happen for valid SQL
         };
         out.push(Finding {
+            detail: None,
             code: "MOD013",
             span: diag_span,
             fix: Some(Fix {

@@ -272,6 +272,7 @@ pub fn constraint_load_cost(tree: &Tree, _src: &str) -> Vec<Finding> {
         });
         if let Some(n) = hit {
             out.push(Finding {
+                detail: None,
                 code: "MOD018",
                 span: tree.node(n).span,
                 fix: None,
@@ -307,6 +308,7 @@ pub fn from_first(tree: &Tree, _src: &str) -> Vec<Finding> {
         }
         let sp = tree.node(select_clause).span;
         out.push(Finding {
+            detail: None,
             code: "MOD022",
             span: sp,
             // Safe: FROM-first `FROM t ...` is defined by DuckDB to mean
@@ -403,6 +405,7 @@ pub fn from_before_select(tree: &Tree, src: &str) -> Vec<Finding> {
             gap => gap,
         };
         out.push(Finding {
+            detail: None,
             code: "MOD041",
             span: select,
             fix: Some(Fix {
@@ -468,6 +471,7 @@ fn check_top_level_star(tree: &Tree, root: NodeId) -> Vec<Finding> {
             if let Some(star) = sole_star(tree, target_list) {
                 if star_not_narrowed(tree, star) {
                     out.push(Finding {
+                        detail: None,
                         code: "MOD017",
                         span: tree.node(select_clause).span,
                         // No fix: naming the actual needed columns requires
@@ -522,6 +526,7 @@ pub fn implicit_cross_join(tree: &Tree, src: &str) -> Vec<Finding> {
         let second_start = tree.node(refs[1]).span.start as usize;
         let start = first_comma(src, first_end, second_start).unwrap_or(first_end) as u32;
         out.push(Finding {
+            detail: None,
             code: "MOD010",
             span: Span::new(start, start + 1),
             // No fix: rewriting into `JOIN ... ON` requires inferring join
@@ -666,6 +671,7 @@ pub fn case_to_function(tree: &Tree, src: &str) -> Vec<Finding> {
         if let Some(replacement) = as_coalesce().or_else(as_nullif) {
             let span = tree.node(case).span;
             out.push(Finding {
+                detail: None,
                 code: "MOD031",
                 span,
                 fix: Some(Fix { span, replacement }),
@@ -758,6 +764,7 @@ pub fn having_without_aggregate(tree: &Tree, src: &str) -> Vec<Finding> {
             .collect();
         if !columns.is_empty() && columns.iter().all(|c| grouped.contains(c)) {
             out.push(Finding {
+                detail: None,
                 code: "MOD033",
                 span: tree.node(having).span,
                 fix: None,
@@ -788,6 +795,7 @@ pub fn redundant_count_default(tree: &Tree, src: &str) -> Vec<Finding> {
         if is_count(first) && is_zero(second) {
             let span = tree.node(whole).span;
             out.push(Finding {
+                detail: None,
                 code: "MOD034",
                 span,
                 fix: Some(Fix {
@@ -890,6 +898,7 @@ pub fn case_to_switch(tree: &Tree, src: &str) -> Vec<Finding> {
 
         let span = tree.node(case_expr).span;
         out.push(Finding {
+            detail: None,
             code: "MOD015",
             span,
             fix: Some(Fix { span, replacement }),
@@ -1004,6 +1013,7 @@ pub fn unused_cte(tree: &Tree, src: &str) -> Vec<Finding> {
             };
 
             out.push(Finding {
+                detail: None,
                 code: "MOD016",
                 span: tree.node(name_node).span,
                 // No separator token found would mean a tree this code does
@@ -1146,6 +1156,7 @@ pub fn case_to_filter(tree: &Tree, src: &str) -> Vec<Finding> {
         {
             let func_span = tree.node(func).span;
             out.push(Finding {
+                detail: None,
                 code: "MOD030",
                 span: func_span,
                 fix: Some(Fix {
@@ -1170,6 +1181,7 @@ pub fn case_to_filter(tree: &Tree, src: &str) -> Vec<Finding> {
             tree.text(condition, src),
         );
         out.push(Finding {
+            detail: None,
             code: "MOD014",
             span: func_span,
             fix: Some(Fix {
