@@ -18,6 +18,7 @@ const inspect = require("./inspect");
 const catalog = require("./catalog");
 const dataEditor = require("./dataEditor");
 const catalogSync = require("./catalogSync");
+const friendly = require("./friendly");
 const { Session } = require("./duckdb-session");
 
 // A server that has not answered `initialize` by then is not going to: a
@@ -94,6 +95,7 @@ exports.activate = function activate(context) {
     });
   });
   setUp("running SQL", () => runner.activate(context, () => ready));
+  setUp("the friendly SQL rewrite", () => friendly.activate(context, () => ready));
   setUp("data file inspection", () => inspect.activate(context));
   setUp("the data grid editor", () => dataEditor.activate(context));
   // Trust granted: the folder's own grebe.path now applies, and DuckDB may

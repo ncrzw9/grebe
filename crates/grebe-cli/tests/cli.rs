@@ -387,6 +387,85 @@ fn select_all_combined_with_another_code_is_unknown() {
 }
 
 #[test]
+fn fix_with_select_friendly_rewrites_conventional_sql() {
+    let dir = TempDir::new("select-friendly");
+    let conventional = "\
+WITH recent AS (SELECT id, region FROM orders WHERE placed > DATE '2024-01-01')
+SELECT region, count(*) AS n FROM recent GROUP BY region ORDER BY region, n;
+SELECT * FROM orders WHERE id = 1;
+SELECT ifnull(a, 0) FROM t WHERE a = NULL;
+SELECT a, b FROM t ORDER BY a, b;
+";
+    dir.write("a.sql", conventional);
+
+    // Without --fix it only reports, and only the friendly rules.
+    let out = grebe(
+        dir.path(),
+        &["check", "--no-config", "--select", "friendly", "a.sql"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for code in ["MOD001", "MOD003", "MOD013", "MOD022", "MOD023", "MOD041"] {
+        assert!(stdout.contains(code), "{code} missing from:\n{stdout}");
+    }
+    for code in ["MOD002", "MOD006"] {
+        assert!(!stdout.contains(code), "{code} is not friendly:\n{stdout}");
+    }
+    assert_eq!(dir.read("a.sql"), conventional);
+
+    let out = grebe(
+        dir.path(),
+        &[
+            "check",
+            "--no-config",
+            "--fix",
+            "--select",
+            "FRIENDLY",
+            "a.sql",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        dir.read("a.sql"),
+        "\
+WITH recent AS (FROM orders SELECT id, region WHERE placed > DATE '2024-01-01')
+FROM recent SELECT region, n: count() GROUP BY ALL ORDER BY region, n;
+ FROM orders WHERE id = 1;
+FROM t SELECT ifnull(a, 0) WHERE a = NULL;
+FROM t SELECT a, b ORDER BY ALL;
+"
+    );
+
+    // Nothing is left for a second run.
+    let out = grebe(
+        dir.path(),
+        &["check", "--no-config", "--select", "FRIENDLY", "a.sql"],
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+
+    // FRIENDLY can stand among other codes; ALL still cannot.
+    let out = grebe(
+        dir.path(),
+        &[
+            "check",
+            "--no-config",
+            "--select",
+            "FRIENDLY,MOD006",
+            "a.sql",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MOD006"), "{stdout}");
+
+    // In a config file too.
+    dir.write("grebe.toml", "select = [\"FRIENDLY\"]\n");
+    dir.write("b.sql", "SELECT a FROM t;\n");
+    let out = grebe(dir.path(), &["check", "--fix", "b.sql"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(dir.read("b.sql"), "FROM t SELECT a;\n");
+}
+
+#[test]
 fn a_file_that_is_not_utf8_fails_the_run() {
     let dir = TempDir::new("not-utf8");
     std::fs::write(dir.path().join("bad.sql"), b"select 1;\n\xff\xfe;\n").expect("write");

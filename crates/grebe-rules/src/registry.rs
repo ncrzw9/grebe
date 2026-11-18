@@ -22,7 +22,7 @@
 //! with, so no parse failure goes unclassified.
 //!
 //! The opt-in band defaults to [`Severity::Off`] (MOD010, MOD017-020,
-//! MOD022-023, MOD025, MOD031, MOD033-034).
+//! MOD022-023, MOD025, MOD031, MOD033-034, MOD041).
 
 /// Which layer of the tool produced the rule.
 ///
@@ -51,7 +51,7 @@ pub enum Category {
 /// `Off` is a real registry entry, not an omission: the rule exists but
 /// fires only once a `grebe.toml` `[severity]` entry or `--select` turns it
 /// on. The opt-in band (MOD010, MOD017-020, MOD022-023, MOD025, MOD031,
-/// MOD033-034) is either too noisy on idiomatic DuckDB SQL to default on,
+/// MOD033-034, MOD041) is either too noisy on idiomatic DuckDB SQL to default on,
 /// unproven on SQL written by others, or house style by nature; each row in
 /// [`RULES`] says which.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -543,6 +543,17 @@ pub static RULES: &[Rule] = &[
         message: "sample_size = -1 reads the whole CSV to guess its types, 15x slower on 5M \
                    rows; declare them with columns = {...} or types = {...} instead.",
     },
+    // Opt-in: pure house style, like MOD022, and it would fire on nearly
+    // every query written the conventional way. Safe: DuckDB reads `FROM t
+    // SELECT a` and `SELECT a FROM t` as the same query.
+    Rule {
+        code: "MOD041",
+        name: "from-before-select",
+        category: Category::Mod,
+        default_severity: Severity::Off,
+        fix_safety: FixSafety::Safe,
+        message: "SELECT ... FROM t can be FROM-first: FROM t SELECT .... Opt-in house style.",
+    },
 ];
 
 /// Looks up a rule by its code, e.g. `lookup("MOD001")`.
@@ -568,6 +579,10 @@ pub const SELECT_ALL: &str = "ALL";
 /// selection only ever restricts which `MOD` rules run (`Selection::enabled`
 /// in `analysis.rs`), and `ALL` keeps that meaning -- it does not also
 /// reach into `[severity]` to turn PRS/SRC back on.
+///
+/// A `FRIENDLY` entry (any case) becomes the codes in [`FRIENDLY`], wherever
+/// it stands in the list, so `FRIENDLY,MOD006` is that set and one more.
+/// A code named twice that way is kept once.
 #[must_use]
 pub fn expand_select(codes: Vec<String>) -> Vec<String> {
     if codes.len() == 1 && codes[0].eq_ignore_ascii_case(SELECT_ALL) {
@@ -577,8 +592,54 @@ pub fn expand_select(codes: Vec<String>) -> Vec<String> {
             .map(|r| r.code.to_string())
             .collect();
     }
-    codes
+    if !codes
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(SELECT_FRIENDLY))
+    {
+        return codes;
+    }
+    let mut out: Vec<String> = Vec::with_capacity(codes.len() + FRIENDLY.len());
+    for code in codes {
+        if code.eq_ignore_ascii_case(SELECT_FRIENDLY) {
+            for friendly in FRIENDLY {
+                if !out.iter().any(|c| c == friendly) {
+                    out.push((*friendly).to_string());
+                }
+            }
+        } else if !out.contains(&code) {
+            out.push(code);
+        }
+    }
+    out
 }
+
+/// The reserved selection value meaning "the rules that rewrite a query
+/// into DuckDB's friendly SQL": see [`FRIENDLY`].
+pub const SELECT_FRIENDLY: &str = "FRIENDLY";
+
+/// The rules `FRIENDLY` selects, in registry order: each rewrites SQL that
+/// is already correct into the spelling DuckDB's friendly SQL offers for
+/// it, and each has a safe fix, so `grebe check --fix --select FRIENDLY`
+/// turns conventional SQL into that style without changing what it
+/// returns.
+///
+/// - MOD001 count-star: `count(*)` to `count()`
+/// - MOD003 group-by-all: a spelled-out list to `GROUP BY ALL`
+/// - MOD013 order-by-all: a spelled-out list to `ORDER BY ALL`
+/// - MOD022 from-first: `SELECT * FROM t` to `FROM t`
+/// - MOD023 prefix-alias: `expr AS x` to `x: expr`
+/// - MOD030 sum-case-to-count-if: `sum(CASE WHEN c THEN 1 ELSE 0 END)` to
+///   `count_if(c)`
+/// - MOD041 from-before-select: `SELECT a FROM t` to `FROM t SELECT a`
+///
+/// Left out, though their fix is safe: MOD006, MOD015 and MOD031 rewrite to
+/// standard SQL, not to something of DuckDB's; MOD009 and MOD034 delete
+/// text that does nothing; MOD016 is a warning about a likely mistake. A
+/// rule whose fix can change results (MOD002, MOD014) is never a member:
+/// the tests below hold every member to a safe fix.
+pub const FRIENDLY: &[&str] = &[
+    "MOD001", "MOD003", "MOD013", "MOD022", "MOD023", "MOD030", "MOD041",
+];
 
 #[cfg(test)]
 mod tests {
@@ -702,18 +763,18 @@ mod tests {
         assert_eq!(prs, 1);
         assert_eq!(src, 2);
         let cat = RULES.iter().filter(|r| r.category == Category::Cat).count();
-        assert_eq!(mods, 39);
+        assert_eq!(mods, 40);
         assert_eq!(cat, 2);
-        assert_eq!(RULES.len(), 44);
+        assert_eq!(RULES.len(), 45);
     }
 
     /// The opt-in band defaults to `Off`: MOD010, MOD017-020, MOD022-023, MOD025,
-    /// MOD031, MOD033-034 — 11 rows.
+    /// MOD031, MOD033-034, MOD041 — 12 rows.
     #[test]
     fn opt_in_band_defaults_off() {
         let off_codes = [
             "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD025",
-            "MOD031", "MOD033", "MOD034",
+            "MOD031", "MOD033", "MOD034", "MOD041",
         ];
         for code in off_codes {
             let rule = lookup(code).unwrap_or_else(|| panic!("{code} missing"));
@@ -737,7 +798,7 @@ mod tests {
     fn default_on_band_is_not_off() {
         let off_codes = [
             "MOD010", "MOD017", "MOD018", "MOD019", "MOD020", "MOD022", "MOD023", "MOD025",
-            "MOD031", "MOD033", "MOD034",
+            "MOD031", "MOD033", "MOD034", "MOD041",
         ];
         for rule in RULES.iter().filter(|r| r.category == Category::Mod) {
             if off_codes.contains(&rule.code) {
@@ -798,6 +859,47 @@ mod tests {
         );
         let mixed = expand_select(vec!["ALL".to_string(), "MOD001".to_string()]);
         assert_eq!(mixed, vec!["ALL".to_string(), "MOD001".to_string()]);
+    }
+
+    /// Every `FRIENDLY` member is a `MOD` rule with a safe fix that is not a
+    /// warning, listed once, in registry order.
+    #[test]
+    fn friendly_members_are_safe_rewrites_in_registry_order() {
+        let in_registry: Vec<&str> = RULES
+            .iter()
+            .map(|r| r.code)
+            .filter(|c| FRIENDLY.contains(c))
+            .collect();
+        assert_eq!(in_registry, FRIENDLY, "unknown, repeated or out of order");
+        for code in FRIENDLY {
+            let rule = lookup(code).unwrap();
+            assert_eq!(rule.category, Category::Mod, "{code}");
+            assert_eq!(rule.fix_safety, FixSafety::Safe, "{code}");
+            assert_ne!(rule.default_severity, Severity::Warning, "{code}");
+        }
+        for code in ["MOD001", "MOD003", "MOD013", "MOD022", "MOD041"] {
+            assert!(FRIENDLY.contains(&code), "{code} is friendly SQL");
+        }
+        for code in ["MOD002", "MOD014", "MOD016"] {
+            assert!(!FRIENDLY.contains(&code), "{code} is not a safe rewrite");
+        }
+    }
+
+    /// `FRIENDLY` expands in any case and next to other codes, without
+    /// repeating a code that is named as well.
+    #[test]
+    fn select_friendly_expands_alone_and_among_other_codes() {
+        let want: Vec<String> = FRIENDLY.iter().map(|c| (*c).to_string()).collect();
+        assert_eq!(expand_select(vec!["FRIENDLY".to_string()]), want);
+        assert_eq!(expand_select(vec!["friendly".to_string()]), want);
+        let mixed = expand_select(vec![
+            "MOD006".to_string(),
+            "FRIENDLY".to_string(),
+            "MOD001".to_string(),
+        ]);
+        let mut with_extra = vec!["MOD006".to_string()];
+        with_extra.extend(want);
+        assert_eq!(mixed, with_extra);
     }
 
     /// An ordinary selection is untouched.

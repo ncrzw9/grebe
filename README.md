@@ -81,6 +81,29 @@ Exit codes: `0` clean, `1` an error-severity finding (or `format --check`
 found work), `2` usage or config error, or a file that could not be read
 (missing, or not UTF-8) or written.
 
+### Friendly SQL
+
+`--select FRIENDLY` names the rules that rewrite conventional SQL into
+DuckDB's friendly SQL, all with a safe fix, so this turns a file into that
+style without changing what its queries return:
+
+```sh
+grebe check --fix --select FRIENDLY query.sql && grebe format query.sql
+```
+
+```sql
+SELECT region, count(*) AS orders FROM sales WHERE year = 2024 GROUP BY region;
+-- becomes
+FROM sales SELECT region, orders: count() WHERE year = 2024 GROUP BY ALL;
+```
+
+The rules: FROM before SELECT (MOD041), a bare `SELECT *` dropped (MOD022),
+`GROUP BY ALL` (MOD003), `ORDER BY ALL` (MOD013), `count()` (MOD001),
+`count_if` (MOD030) and prefix aliases (MOD023). `FRIENDLY` can stand among
+other codes (`--select FRIENDLY,MOD006`) and in a config file's `select`.
+In the editor the same rewrite is the command **grebe: Rewrite as Friendly
+SQL**.
+
 ## Configuration
 
 `grebe.toml`, or `[tool.grebe]` in `pyproject.toml`, found upward from the
@@ -91,6 +114,7 @@ include = ["**/*.sql"]
 exclude = ["generated/**"]
 # select = ["MOD001", "MOD010"]  # run only these MOD rules (opt-in ones included)
 # select = ["ALL"]               # every MOD rule, default-on and opt-in alike
+# select = ["FRIENDLY"]          # the safe rewrites into DuckDB's friendly SQL
 # catalog = "catalog.json"       # a catalog snapshot: turns on CAT001 and CAT002
 
 [severity]

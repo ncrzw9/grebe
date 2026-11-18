@@ -952,7 +952,8 @@ mod tests {
     fn fixes_are_minimal_and_correct() {
         let sql = "SELECT count(*) FROM t";
         let tree = parse(sql).unwrap();
-        let f = &analyze(&tree, sql)[0];
+        let found = analyze(&tree, sql);
+        let f = found.iter().find(|f| f.code == "MOD001").unwrap();
         let fix = f.fix.clone().expect("MOD001 has a safe fix");
         // Deleting just the star yields valid, equivalent SQL.
         let mut fixed = sql.to_string();
@@ -964,6 +965,10 @@ mod tests {
         assert!(parse(&fixed).is_some(), "fixed SQL must still parse");
         // And the rule must not fire on its own output.
         let t2 = parse(&fixed).unwrap();
-        assert!(analyze(&t2, &fixed).is_empty(), "fix is not idempotent");
+        let again = analyze(&t2, &fixed);
+        assert!(
+            again.iter().all(|f| f.code != "MOD001"),
+            "fix is not idempotent"
+        );
     }
 }

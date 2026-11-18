@@ -479,6 +479,41 @@ that call.
 The same fixes are available in bulk from the CLI: `grebe check PATH --fix`,
 plus `--unsafe` for the second band.
 
+## Rewriting as friendly SQL
+
+**grebe: Rewrite as Friendly SQL** (Command Palette, or the editor's context
+menu) turns conventional SQL into DuckDB's friendly SQL and formats the
+result:
+
+```sql
+SELECT region, count(*) AS orders FROM sales WHERE year = 2024 GROUP BY region;
+-- becomes
+FROM sales SELECT region, orders: count() WHERE year = 2024 GROUP BY ALL;
+```
+
+With a selection it rewrites the statements the selection touches and leaves
+the rest of the file alone; with none, the whole file. A statement it has
+nothing to change in is not reformatted. It is one undo step.
+
+It applies the rules the CLI calls `FRIENDLY`, the same as
+`grebe check --fix --select FRIENDLY`: FROM before SELECT (MOD041), a bare
+`SELECT *` dropped (MOD022), `GROUP BY ALL` (MOD003), `ORDER BY ALL`
+(MOD013), `count()` (MOD001), `count_if` (MOD030) and prefix aliases
+(MOD023). Each rewrite returns the same rows as the SQL it replaces. A
+query with a comment between `SELECT` and the end of its `FROM` clause keeps
+its clause order, so the comment stays where you put it, and a statement
+marked `-- grebe: ignore` is not rewritten. `grebe.select` does not change
+what the command applies.
+
+The rewrite is also a code action of kind `source.grebe.friendly`, for the
+whole file. To run it on every save:
+
+```json
+"[sql]": {
+  "editor.codeActionsOnSave": { "source.grebe.friendly": "explicit" }
+}
+```
+
 ## Silencing a finding
 
 Put `-- grebe: ignore[CODE]` on the statement — either on a line before it, or

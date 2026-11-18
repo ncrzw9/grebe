@@ -58,6 +58,11 @@
         "category": "grebe"
       },
       {
+        "command": "grebe.friendly",
+        "title": "Rewrite as Friendly SQL",
+        "category": "grebe"
+      },
+      {
         "command": "grebe.duckdb.runStatement",
         "title": "Run Statement (or Selection) with DuckDB",
         "category": "grebe",
@@ -324,6 +329,13 @@
       }
     ],
     "menus": {
+      "editor/context": [
+        {
+          "command": "grebe.friendly",
+          "when": "editorLangId == sql && resourceScheme == file",
+          "group": "1_modification@90"
+        }
+      ],
       "editor/title/run": [
         {
           "command": "grebe.duckdb.runStatement",

@@ -499,7 +499,7 @@ mod tests {
         assert_eq!(fix_all("SELECT 2 AS y;\n"), "SELECT y: 2;\n");
         assert_eq!(
             fix_all("SELECT a FROM t WHERE x = NULL;\n"),
-            "SELECT a FROM t WHERE x IS NULL;\n"
+            "FROM t SELECT a WHERE x IS NULL;\n"
         );
         let src = "SELECT 1 AS 'x';\nSELECT 2 AS y;\n";
         let applied = apply(

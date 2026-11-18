@@ -917,6 +917,12 @@ fn print_check_help() {
     outln!("                            [severity]. Wins over a config file's select.");
     outln!("  --select ALL              run every MOD rule, default-on and opt-in");
     outln!("                            alike -- the strictest check available.");
+    outln!("  --select FRIENDLY         run the rules that rewrite a query into");
+    outln!("                            DuckDB's friendly SQL (FROM first, GROUP BY");
+    outln!("                            ALL, count(), ...); 'grebe rules' lists them.");
+    outln!("                            All have a safe fix, so with --fix this turns");
+    outln!("                            conventional SQL into that style. Can stand");
+    outln!("                            among other codes: FRIENDLY,MOD006.");
     outln!("  --fix                     rewrite the files in place, applying the");
     outln!("                            fixes marked safe in 'grebe rules'. What is");
     outln!("                            printed afterwards is what is left.");
@@ -1066,6 +1072,10 @@ fn print_rules_table() {
     outln!();
     outln!(
         "Rows marked \"off (opt-in)\" default to Off; enable one with 'grebe check --select CODE,...'."
+    );
+    outln!(
+        "'--select FRIENDLY' is {}: the safe rewrites into DuckDB's friendly SQL.",
+        grebe_rules::FRIENDLY.join(", ")
     );
 
     outln!(

@@ -205,6 +205,10 @@ fn handle_message<W: Write>(
             let result = handle_statements(&params, state);
             respond(writer, id, result);
         }
+        Some("grebe/friendly") => {
+            let result = Json::Array(friendly_edits(&params, state, writer));
+            respond(writer, id, result);
+        }
         Some("textDocument/completion") => {
             let result = handle_completion(&params, state, writer);
             respond(writer, id, result);
@@ -353,10 +357,20 @@ fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W)
                     ("full".into(), Json::Bool(true)),
                 ]),
             ),
-            // Quick fixes. Declared as a plain `true` rather than with a
-            // `codeActionKinds` list: we only ever produce `quickfix`, and
-            // advertising the kinds buys nothing a client acts on.
-            ("codeActionProvider".into(), Json::Bool(true)),
+            // Quick fixes, and one source action: the friendly SQL rewrite
+            // (see `crate::friendly`). Its kind is listed so a client knows
+            // it can be asked for by name, in a "source action" menu or on
+            // save.
+            (
+                "codeActionProvider".into(),
+                Json::object(vec![(
+                    "codeActionKinds".into(),
+                    Json::Array(vec![
+                        Json::str("quickfix"),
+                        Json::str(crate::friendly::ACTION_KIND),
+                    ]),
+                )]),
+            ),
             // Whole-document formatting via `grebe_format::format`. There is
             // no range or on-type variant: the formatter only ever knows how
             // to lay out a complete document.
@@ -849,9 +863,76 @@ fn handle_code_action<W: Write>(params: &Json, state: &mut State, writer: &mut W
     let config = config_for_uri(&uri, state, writer);
     let resolved = resolve_selection(&uri, state, config.as_ref(), writer);
     let findings = grebe_rules::analysis::analyze(&text, &resolved.selection());
-    Json::Array(crate::code_action::actions(
-        &uri, &text, &findings, range, encoding,
-    ))
+    let mut actions = crate::code_action::actions(&uri, &text, &findings, range, encoding);
+    // The friendly SQL rewrite, only when the client asks for it by kind:
+    // it rewrites the whole document, which is not what a lightbulb is for.
+    if crate::friendly::asked_for(params.get("context").and_then(|c| c.get("only"))) {
+        let whole = Json::object(vec![(
+            "textDocument".into(),
+            Json::object(vec![("uri".into(), Json::str(&uri))]),
+        )]);
+        let edits = friendly_edits(&whole, state, writer);
+        actions.extend(crate::friendly::action(&uri, edits));
+    }
+    Json::Array(actions)
+}
+
+/// `grebe/friendly`: the text edits that rewrite a document as friendly
+/// SQL (see [`crate::friendly`]). `params.range` is optional: with one, the
+/// statements it overlaps, picked as `grebe/statements` picks them; absent,
+/// the whole document. `[]` when there is nothing to rewrite, or for a
+/// document the server has never seen. Formatting follows the document's
+/// `grebe.toml`, as `textDocument/formatting` does.
+fn friendly_edits<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Vec<Json> {
+    let Some(uri) = params
+        .get("textDocument")
+        .and_then(|d| d.get("uri"))
+        .and_then(Json::as_str)
+    else {
+        return Vec::new();
+    };
+    let uri = uri.to_string();
+    let Some(text) = state.documents.get(&uri).cloned() else {
+        return Vec::new();
+    };
+    let encoding = state.encoding;
+    let num = |v: Option<&Json>| v.and_then(Json::as_f64).unwrap_or(0.0) as u32;
+    let to_byte = |p: &Json| {
+        position::position_to_byte(&text, num(p.get("line")), num(p.get("character")), encoding)
+    };
+    let statements = params
+        .get("range")
+        .and_then(|r| Some((r.get("start")?, r.get("end")?)))
+        .map(|(start, end)| {
+            crate::statements::select(&text, Span::new(to_byte(start), to_byte(end)))
+        });
+
+    let config = config_for_uri(&uri, state, writer);
+    let foreign_heads = config.as_ref().map_or(&[][..], |c| &c.foreign_heads[..]);
+    let rewrites = crate::friendly::rewrite(
+        &text,
+        statements.as_deref(),
+        foreign_heads,
+        &format_options(config.as_ref()),
+    );
+    let lines = position::LineIndex::new(&text);
+    rewrites
+        .into_iter()
+        .map(|r| {
+            let (sl, sc) = lines.position(&text, r.span.start, encoding);
+            let (el, ec) = lines.position(&text, r.span.end, encoding);
+            Json::object(vec![
+                (
+                    "range".into(),
+                    Json::object(vec![
+                        ("start".into(), pos(sl, sc)),
+                        ("end".into(), pos(el, ec)),
+                    ]),
+                ),
+                ("newText".into(), Json::str(r.text)),
+            ])
+        })
+        .collect()
 }
 
 fn severity_to_lsp(sev: Severity) -> f64 {

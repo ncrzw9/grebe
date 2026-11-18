@@ -1,5 +1,5 @@
-//! Tier 2b CST detectors: MOD010, MOD017, MOD018 and MOD022 (opt-in), and
-//! MOD014, MOD015 and MOD016 (default-on).
+//! Tier 2b CST detectors: MOD010, MOD017, MOD018, MOD022 and MOD041
+//! (opt-in), and MOD014, MOD015 and MOD016 (default-on).
 //!
 //! The four opt-in rules (`off` until `[severity]` enables them) fire too
 //! often on idiomatic DuckDB SQL to default on. Hit counts on a corpus of
@@ -302,25 +302,7 @@ pub fn from_first(tree: &Tree, _src: &str) -> Vec<Finding> {
         if child(tree, sfc, "FromClause").is_none() {
             continue;
         }
-        // `DISTINCT` and `DISTINCT ON` live in the select clause and have no
-        // FROM-first spelling, so deleting the clause would drop them.
-        if child(tree, select_clause, "DistinctClause").is_some() {
-            continue;
-        }
-        let Some(target_list) = child(tree, select_clause, "TargetList") else {
-            continue;
-        };
-        let Some(star) = sole_star(tree, target_list) else {
-            continue;
-        };
-        if !star_not_narrowed(tree, star) {
-            continue;
-        }
-        if tree
-            .children(star)
-            .iter()
-            .any(|&c| tree.rule_name(c) == "RenameList")
-        {
+        if !is_bare_select_star(tree, select_clause) {
             continue;
         }
         let sp = tree.node(select_clause).span;
@@ -333,6 +315,99 @@ pub fn from_first(tree: &Tree, _src: &str) -> Vec<Finding> {
             fix: Some(Fix {
                 span: sp,
                 replacement: String::new(),
+            }),
+        });
+    }
+    out
+}
+
+/// Is `select_clause` exactly `SELECT *`, the clause MOD022 deletes?
+///
+/// `DISTINCT` and `DISTINCT ON` live in the select clause and have no
+/// spelling without it, so a clause carrying one is not bare. The star must
+/// be the only item, with no qualifier and no `EXCLUDE`/`REPLACE`/`RENAME`.
+/// MOD022 fires on exactly this shape and MOD041 on every other, so the two
+/// never want the same clause.
+fn is_bare_select_star(tree: &Tree, select_clause: NodeId) -> bool {
+    if child(tree, select_clause, "DistinctClause").is_some() {
+        return false;
+    }
+    child(tree, select_clause, "TargetList")
+        .and_then(|list| sole_star(tree, list))
+        .is_some_and(|star| star_not_narrowed(tree, star))
+}
+
+/// MOD041 from-before-select: `SELECT a, b FROM t ...` can be written
+/// `FROM t SELECT a, b ...`, the order the query is evaluated in.
+///
+/// Only the two leading clauses trade places. DuckDB accepts `FROM`, then
+/// `SELECT`, then `WHERE`/`GROUP BY`/`HAVING`/`QUALIFY`/`ORDER BY`/`LIMIT`
+/// in their usual order (`FROM t WHERE x SELECT y` is a syntax error), so
+/// everything after the `FROM` clause stays where it is. `DISTINCT` and
+/// `DISTINCT ON` move with the select clause. The same holds in a CTE, a
+/// subquery and each member of a set operation, so every query block is
+/// rewritten on its own.
+///
+/// Silent on:
+/// - a query that is already FROM-first (`FromSelectClause`);
+/// - a select with no `FROM`: there is nothing to put first;
+/// - the bare `SELECT * FROM t` (see [`is_bare_select_star`]): MOD022 owns
+///   that shape and deletes the clause instead of moving it;
+/// - a comment anywhere from `SELECT` to the end of the `FROM` clause. The
+///   comment may describe the line it sits on or the one below, and moving
+///   the clauses around it would attach it to the wrong one;
+/// - a `FROM` clause with something other than whitespace, `)` or `;` right
+///   behind it: the select list would land against that text with no space
+///   between them.
+///
+/// Safe: both spellings are the same query to DuckDB. The fix replaces the
+/// two clauses with themselves in the other order, keeping the whitespace
+/// that stood between them, so a query written over several lines stays
+/// over several lines.
+pub fn from_before_select(tree: &Tree, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for sfc in tree.find("SelectFromClause") {
+        let (Some(select_clause), Some(from_clause)) = (
+            child(tree, sfc, "SelectClause"),
+            child(tree, sfc, "FromClause"),
+        ) else {
+            continue;
+        };
+        if child(tree, select_clause, "TargetList").is_none()
+            || is_bare_select_star(tree, select_clause)
+        {
+            continue;
+        }
+        let select = tree.node(select_clause).span;
+        let from = tree.node(from_clause).span;
+        if from.start < select.end {
+            continue;
+        }
+        let whole = Span::new(select.start, from.end);
+        let text = |sp: Span| &src[sp.start as usize..sp.end as usize];
+        if grebe_syntax::token::tokenize(text(whole))
+            .iter()
+            .any(|t| matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment))
+        {
+            continue;
+        }
+        let follows_cleanly = src[from.end as usize..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == ')' || c == ';');
+        if !follows_cleanly {
+            continue;
+        }
+        let gap = match text(Span::new(select.end, from.start)) {
+            "" => " ",
+            gap => gap,
+        };
+        out.push(Finding {
+            code: "MOD041",
+            span: select,
+            fix: Some(Fix {
+                span: whole,
+                replacement: format!("{}{gap}{}", text(from), text(select)),
             }),
         });
     }
@@ -1111,6 +1186,7 @@ pub fn analyze_tier2b(tree: &Tree, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     out.extend(constraint_load_cost(tree, src));
     out.extend(from_first(tree, src));
+    out.extend(from_before_select(tree, src));
     out.extend(select_star_ctas(tree, src));
     out.extend(implicit_cross_join(tree, src));
     out.extend(case_to_filter(tree, src));
@@ -1208,6 +1284,154 @@ mod tests {
         assert_eq!(fixed, " FROM t WHERE x > 1");
         assert!(parse(&fixed).is_some(), "fixed SQL must still parse");
         assert!(!codes(&fixed).contains(&"MOD022"), "fix is not idempotent");
+    }
+
+    /// `sql` with every MOD041 fix applied, outermost first, until none is
+    /// left. Panics if a step stops parsing.
+    fn from_first_everywhere(sql: &str) -> String {
+        let mut text = sql.to_string();
+        for _ in 0..20 {
+            let tree = parse(&text).unwrap_or_else(|| panic!("did not parse: {text}"));
+            let Some(fix) = from_before_select(&tree, &text)
+                .into_iter()
+                .find_map(|f| f.fix)
+            else {
+                return text;
+            };
+            text.replace_range(
+                fix.span.start as usize..fix.span.end as usize,
+                &fix.replacement,
+            );
+        }
+        panic!("MOD041 never settles on: {sql}");
+    }
+
+    #[test]
+    fn mod041_moves_from_before_select() {
+        for (sql, want) in [
+            ("SELECT a, b FROM t", "FROM t SELECT a, b"),
+            (
+                "SELECT a, b FROM t WHERE a > 1 GROUP BY ALL HAVING b > 2 ORDER BY a LIMIT 3",
+                "FROM t SELECT a, b WHERE a > 1 GROUP BY ALL HAVING b > 2 ORDER BY a LIMIT 3",
+            ),
+            (
+                "SELECT t.a, u.b FROM t JOIN u ON t.id = u.id WHERE u.b > 0;",
+                "FROM t JOIN u ON t.id = u.id SELECT t.a, u.b WHERE u.b > 0;",
+            ),
+            // DISTINCT and DISTINCT ON move with the select clause.
+            ("SELECT DISTINCT a FROM t", "FROM t SELECT DISTINCT a"),
+            ("SELECT DISTINCT * FROM t", "FROM t SELECT DISTINCT *"),
+            (
+                "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
+                "FROM t SELECT DISTINCT ON (a) a, b ORDER BY a, b",
+            ),
+            // A star MOD022 leaves alone is an ordinary select list here.
+            ("SELECT * EXCLUDE (a) FROM t", "FROM t SELECT * EXCLUDE (a)"),
+            ("SELECT t.* FROM t", "FROM t SELECT t.*"),
+            ("SELECT *, a + 1 FROM t", "FROM t SELECT *, a + 1"),
+            // Every query block on its own: CTE, subquery, set operation.
+            (
+                "WITH c AS (SELECT a FROM t WHERE a > 1) SELECT a FROM c",
+                "WITH c AS (FROM t SELECT a WHERE a > 1) FROM c SELECT a",
+            ),
+            (
+                "SELECT s.a FROM (SELECT a FROM t) s WHERE s.a IN (SELECT a FROM u)",
+                "FROM (FROM t SELECT a) s SELECT s.a WHERE s.a IN (FROM u SELECT a)",
+            ),
+            (
+                "SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1",
+                "FROM t SELECT a UNION ALL FROM u SELECT b ORDER BY 1",
+            ),
+            (
+                "SELECT a, row_number() OVER (ORDER BY a) AS rn FROM t QUALIFY rn = 1",
+                "FROM t SELECT a, row_number() OVER (ORDER BY a) AS rn QUALIFY rn = 1",
+            ),
+            (
+                "SELECT x FROM (VALUES (1), (2)) v(x)",
+                "FROM (VALUES (1), (2)) v(x) SELECT x",
+            ),
+            (
+                "INSERT INTO s SELECT a FROM t",
+                "INSERT INTO s FROM t SELECT a",
+            ),
+            (
+                "CREATE TABLE s AS SELECT a FROM t",
+                "CREATE TABLE s AS FROM t SELECT a",
+            ),
+            // The whitespace between the clauses stays between them.
+            (
+                "SELECT\n    a,\n    b\nFROM t\nWHERE a > 1;",
+                "FROM t\nSELECT\n    a,\n    b\nWHERE a > 1;",
+            ),
+            // No whitespace to keep: one space goes in.
+            ("SELECT(a)FROM t", "FROM t SELECT(a)"),
+        ] {
+            let got = from_first_everywhere(sql);
+            assert_eq!(got, want, "from: {sql}");
+            assert!(!fires("MOD041", &got), "not a fixed point: {got}");
+        }
+    }
+
+    #[test]
+    fn mod041_stays_silent() {
+        for sql in [
+            // Already FROM-first.
+            "FROM t SELECT a",
+            "FROM t",
+            // Nothing to put first.
+            "SELECT 1",
+            "SELECT a",
+            // MOD022's shape: that rule deletes the clause.
+            "SELECT * FROM t",
+            "SELECT * FROM t WHERE a > 1",
+            // A comment in the text that would move.
+            "SELECT a, -- the key\n b FROM t",
+            "SELECT a /* key */ FROM t",
+            "SELECT a\n-- the big table\nFROM t",
+            "SELECT a FROM t /* big */ JOIN u USING (a)",
+            // The select list would land against what follows the FROM clause.
+            "SELECT a FROM (SELECT 1 AS a)WHERE a = 1",
+        ] {
+            assert!(!fires("MOD041", sql), "should NOT fire: {sql}");
+        }
+        // A comment before or after the two clauses does not move.
+        for sql in [
+            "/* report */ SELECT a FROM t",
+            "SELECT a FROM t -- recent rows\nWHERE a > 1",
+        ] {
+            assert!(fires("MOD041", sql), "should fire: {sql}");
+        }
+        assert_eq!(
+            from_first_everywhere("SELECT a FROM t -- recent rows\nWHERE a > 1"),
+            "FROM t SELECT a -- recent rows\nWHERE a > 1"
+        );
+    }
+
+    /// MOD022 and MOD041 never fire on the same select clause.
+    #[test]
+    fn mod022_and_mod041_do_not_share_a_clause() {
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT a FROM t",
+            "SELECT DISTINCT * FROM t",
+            "SELECT * EXCLUDE (a) FROM t",
+            "SELECT a FROM (SELECT * FROM t)",
+            "SELECT * FROM (SELECT a FROM t)",
+        ] {
+            let tree = parse(sql).unwrap();
+            let starts =
+                |fs: Vec<Finding>| fs.into_iter().map(|f| f.span.start).collect::<Vec<_>>();
+            let first = starts(from_first(&tree, sql));
+            let before = starts(from_before_select(&tree, sql));
+            assert!(
+                first.iter().all(|s| !before.contains(s)),
+                "both fire on one clause: {sql}"
+            );
+            assert!(
+                !first.is_empty() || !before.is_empty(),
+                "neither fires: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -1352,7 +1576,8 @@ mod tests {
     #[test]
     fn mod030_sum_case_to_count_if() {
         let sql = "SELECT sum(CASE WHEN status = 'shipped' THEN 1 ELSE 0 END) FROM t";
-        assert_eq!(codes(sql), ["MOD030"], "carved out of MOD014, never both");
+        assert!(fires("MOD030", sql));
+        assert!(!fires("MOD014", sql), "carved out of MOD014, never both");
         assert_eq!(
             fix_text("MOD030", sql).as_deref(),
             Some("count_if(status = 'shipped')")

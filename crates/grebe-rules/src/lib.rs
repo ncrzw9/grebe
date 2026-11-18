@@ -9,7 +9,7 @@
 //! - **default-on:** MOD001-009, MOD011-016, MOD021, MOD026-030, MOD032,
 //!   MOD035-040
 //! - **opt-in (`off` until `[severity]` enables them):** MOD010, MOD017-020,
-//!   MOD022-023, MOD025, MOD031, MOD033-034
+//!   MOD022-023, MOD025, MOD031, MOD033-034, MOD041
 //!
 //! And two rules that need something the source does not hold, a catalog
 //! snapshot, and run only when a caller supplies one (see [`catalog`]):
@@ -60,7 +60,7 @@
 
 pub mod registry;
 
-pub use registry::{Category, FixSafety, RULES, Rule, Severity, expand_select, lookup};
+pub use registry::{Category, FRIENDLY, FixSafety, RULES, Rule, Severity, expand_select, lookup};
 pub mod analysis;
 pub mod catalog;
 pub mod config;
@@ -87,7 +87,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "MOD008", "MOD009", "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016",
     "MOD017", "MOD018", "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD025", "MOD026",
     "MOD027", "MOD028", "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "MOD035",
-    "MOD036", "MOD037", "MOD038", "MOD039", "MOD040", "PRS001", "SRC002", "SRC003",
+    "MOD036", "MOD037", "MOD038", "MOD039", "MOD040", "MOD041", "PRS001", "SRC002", "SRC003",
 ];
 
 /// Does `code` have a detector?

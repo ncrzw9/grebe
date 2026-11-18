@@ -1049,3 +1049,237 @@ fn a_cat_suggestion_is_a_quick_fix() {
         Some("orders")
     );
 }
+
+fn lsp_position(line: u32, character: u32) -> Json {
+    Json::object(vec![
+        ("line".into(), Json::num(line)),
+        ("character".into(), Json::num(character)),
+    ])
+}
+
+fn lsp_range(start: (u32, u32), end: (u32, u32)) -> Json {
+    Json::object(vec![
+        ("start".into(), lsp_position(start.0, start.1)),
+        ("end".into(), lsp_position(end.0, end.1)),
+    ])
+}
+
+fn result_of(messages: &[Json], id: f64) -> Json {
+    messages
+        .iter()
+        .find(|m| m.get("id").and_then(Json::as_f64) == Some(id))
+        .and_then(|m| m.get("result").cloned())
+        .unwrap_or_else(|| panic!("no result for request {id}"))
+}
+
+/// `(range, newText)` of each text edit, the range as
+/// `[start line, start character, end line, end character]`.
+fn text_edits(edits: &Json) -> Vec<([u32; 4], String)> {
+    let at = |r: &Json, end: &str, field: &str| {
+        r.get(end)
+            .and_then(|p| p.get(field))
+            .and_then(Json::as_f64)
+            .unwrap() as u32
+    };
+    edits
+        .as_array()
+        .expect("an array of text edits")
+        .iter()
+        .map(|e| {
+            let r = e.get("range").unwrap();
+            (
+                [
+                    at(r, "start", "line"),
+                    at(r, "start", "character"),
+                    at(r, "end", "line"),
+                    at(r, "end", "character"),
+                ],
+                e.get("newText").and_then(Json::as_str).unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The words of `sql`: what a rewrite says, whatever lines it is laid out on.
+fn sql_words(sql: &str) -> Vec<&str> {
+    sql.split_whitespace().collect()
+}
+
+const CONVENTIONAL: &str = "select a, count(*) from t group by a;\n\
+                            select * from u;\n\
+                            from v select b;\n";
+
+/// `grebe/friendly` with no range rewrites the whole document: the friendly
+/// fixes, to a fixed point, then the formatter.
+#[test]
+fn friendly_rewrites_the_whole_document() {
+    let uri = "file:///friendly/whole.sql";
+    let messages = run_session(&[
+        did_open(uri, CONVENTIONAL),
+        request(
+            2,
+            "grebe/friendly",
+            Json::object(vec![("textDocument".into(), text_document(uri, vec![]))]),
+        ),
+    ]);
+    let edits = text_edits(&result_of(&messages, 2.0));
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].0, [0, 0, 3, 0], "the whole document");
+    assert_eq!(
+        sql_words(&edits[0].1),
+        sql_words("FROM t SELECT a, count() GROUP BY ALL; FROM u; FROM v SELECT b;")
+    );
+    assert_eq!(
+        grebe_format::format(&edits[0].1, &grebe_format::Options::default()),
+        edits[0].1,
+        "the result is formatted"
+    );
+}
+
+/// With a range, only the statements it touches are rewritten, each as its
+/// own edit; a statement with nothing to fix gets none.
+#[test]
+fn friendly_rewrites_only_the_selected_statements() {
+    let uri = "file:///friendly/selection.sql";
+    let messages = run_session(&[
+        did_open(uri, CONVENTIONAL),
+        // From inside the second statement to inside the third.
+        request(
+            2,
+            "grebe/friendly",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                ("range".into(), lsp_range((1, 3), (2, 4))),
+            ]),
+        ),
+        // A cursor in the first.
+        request(
+            3,
+            "grebe/friendly",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                ("range".into(), lsp_range((0, 5), (0, 5))),
+            ]),
+        ),
+    ]);
+    let edits = text_edits(&result_of(&messages, 2.0));
+    assert_eq!(edits.len(), 1, "the third is friendly already: {edits:?}");
+    assert_eq!(
+        edits[0].0,
+        [1, 0, 1, 16],
+        "the second statement, `;` included"
+    );
+    assert_eq!(sql_words(&edits[0].1), sql_words("FROM u;"));
+
+    let edits = text_edits(&result_of(&messages, 3.0));
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].0, [0, 0, 0, 37]);
+    assert_eq!(
+        sql_words(&edits[0].1),
+        sql_words("FROM t SELECT a, count() GROUP BY ALL;")
+    );
+}
+
+/// Nothing to rewrite, or a document never opened: no edits.
+#[test]
+fn friendly_has_no_edits_for_friendly_sql() {
+    let uri = "file:///friendly/done.sql";
+    let params =
+        |uri: &str| Json::object(vec![("textDocument".into(), text_document(uri, vec![]))]);
+    let messages = run_session(&[
+        did_open(uri, "from   v select b;\nselect 1;\n"),
+        request(2, "grebe/friendly", params(uri)),
+        request(3, "grebe/friendly", params("file:///friendly/unknown.sql")),
+    ]);
+    assert_eq!(result_of(&messages, 2.0), Json::Array(vec![]));
+    assert_eq!(result_of(&messages, 3.0), Json::Array(vec![]));
+}
+
+/// The rewrite is also a source code action, offered only when asked for by
+/// kind, and advertised in the capabilities.
+#[test]
+fn friendly_is_a_source_action_when_asked_for() {
+    let uri = "file:///friendly/action.sql";
+    let code_action = |id: i64, only: Option<&[&str]>| {
+        let mut context = vec![("diagnostics".to_string(), Json::Array(vec![]))];
+        if let Some(kinds) = only {
+            context.push((
+                "only".to_string(),
+                Json::Array(kinds.iter().map(|k| Json::str(*k)).collect()),
+            ));
+        }
+        request(
+            id,
+            "textDocument/codeAction",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                ("range".into(), lsp_range((0, 0), (3, 0))),
+                ("context".into(), Json::object(context)),
+            ]),
+        )
+    };
+    let messages = run_session(&[
+        did_open(uri, CONVENTIONAL),
+        code_action(2, Some(&["source.grebe.friendly"])),
+        code_action(3, Some(&["source"])),
+        code_action(4, None),
+        code_action(5, Some(&["source.fixAll"])),
+        code_action(6, Some(&["source.grebe.friend"])),
+    ]);
+    let kinds = messages[0]
+        .get("result")
+        .and_then(|r| r.get("capabilities"))
+        .and_then(|c| c.get("codeActionProvider"))
+        .and_then(|p| p.get("codeActionKinds"))
+        .and_then(Json::as_array)
+        .expect("codeActionProvider.codeActionKinds");
+    assert!(kinds.contains(&Json::str("quickfix")), "{kinds:?}");
+    assert!(
+        kinds.contains(&Json::str("source.grebe.friendly")),
+        "{kinds:?}"
+    );
+
+    let friendly = |id: f64| -> Vec<Json> {
+        result_of(&messages, id)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a.get("kind").and_then(Json::as_str) == Some("source.grebe.friendly"))
+            .cloned()
+            .collect()
+    };
+    for id in [2.0, 3.0] {
+        let actions = friendly(id);
+        assert_eq!(actions.len(), 1, "request {id}");
+        assert_eq!(
+            actions[0].get("title").and_then(Json::as_str),
+            Some("Rewrite as friendly SQL")
+        );
+        let edits = actions[0]
+            .get("edit")
+            .and_then(|e| e.get("changes"))
+            .and_then(|c| c.get(uri))
+            .expect("edits for the document");
+        let edits = text_edits(edits);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            sql_words(&edits[0].1),
+            sql_words("FROM t SELECT a, count() GROUP BY ALL; FROM u; FROM v SELECT b;")
+        );
+    }
+    // Not under the lightbulb, not for "fix all", not for a kind that only
+    // starts with the same letters.
+    for id in [4.0, 5.0, 6.0] {
+        assert!(friendly(id).is_empty(), "request {id}");
+    }
+    // The quick fixes are still there without `only`.
+    let quick = result_of(&messages, 4.0);
+    assert!(
+        quick
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a.get("kind").and_then(Json::as_str) == Some("quickfix")),
+        "{quick:?}"
+    );
+}
