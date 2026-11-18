@@ -366,6 +366,7 @@ fn format_code(src: &str, opts: &Options) -> String {
         return finish(whole.text);
     }
     let spans = grebe_syntax::token::split_statements(src);
+    let toks = grebe_syntax::token::tokenize(src);
     let mut pieces: Vec<String> = Vec::new();
     let mut cursor = 0usize;
     // A piece that holds no statement -- a bare `;` with comments around it
@@ -373,12 +374,17 @@ fn format_code(src: &str, opts: &Options) -> String {
     // comments land where the whole-file path (and re-formatting the output)
     // would put them: leading the statement that follows.
     let mut carry = 0usize;
+    // The stretch of source the last piece was copied from, when it was a
+    // statement that does not parse. Another one begun on the same line is
+    // joined to it as written: what the matcher cannot read is not text
+    // this function understands well enough to break a line of.
+    let mut raw_run: Option<(usize, usize)> = None;
     for sp in &spans {
         // A piece runs from the end of the previous one to the end of this
         // statement's line: the trivia before it, so its leading comments
-        // format with it, and the rest of the `;` line, so a comment
-        // trailing the terminator stays with the statement it trails.
-        let end = end_of_line(src, sp.end as usize);
+        // format with it, and what trails the `;` on its line, so a comment
+        // there stays with the statement it trails.
+        let end = piece_end(src, &toks, sp.end as usize);
         let piece = &src[carry..end];
         cursor = end;
         match lower::format_statements(piece, opts) {
@@ -389,13 +395,23 @@ fn format_code(src: &str, opts: &Options) -> String {
                 if !formatted.text.is_empty() {
                     pieces.push(formatted.text);
                 }
+                raw_run = None;
             }
-            None => {
-                let raw = piece.trim();
-                if !raw.is_empty() {
-                    pieces.push(raw.to_string());
+            None => match raw_run {
+                Some((from, to)) if to == carry && !src[..to].ends_with('\n') => {
+                    if let Some(last) = pieces.last_mut() {
+                        *last = src[from..end].trim().to_string();
+                    }
+                    raw_run = Some((from, end));
                 }
-            }
+                _ => {
+                    let raw = piece.trim();
+                    if !raw.is_empty() {
+                        pieces.push(raw.to_string());
+                        raw_run = Some((carry, end));
+                    }
+                }
+            },
         }
         carry = end;
     }
@@ -467,8 +483,29 @@ fn format_around(src: &str, regions: &[(usize, usize)], opts: &Options) -> Strin
 
 /// The offset just past the newline that ends the line containing `at`, or
 /// the end of the buffer.
-fn end_of_line(src: &str, at: usize) -> usize {
-    src[at..].find('\n').map_or(src.len(), |i| at + i + 1)
+/// Where the piece of a statement that ends at `at` ends: after the
+/// comments that trail its `;` and the line break behind them. It stops
+/// short of another statement begun on the same line, and takes a comment
+/// that starts on the line whole. (Cutting at the end of the line instead
+/// split such a statement, or a comment or string that ran over the line
+/// break, in two; an unparseable half was then trimmed and re-joined, which
+/// changed the text inside a string.)
+fn piece_end(src: &str, toks: &[grebe_syntax::token::Token], at: usize) -> usize {
+    use grebe_syntax::token::TokenKind;
+    let first = toks.partition_point(|t| (t.span.start as usize) < at);
+    let mut end = at;
+    for t in &toks[first..] {
+        let (from, to) = (t.span.start as usize, t.span.end as usize);
+        match t.kind {
+            TokenKind::Whitespace => match src[from..to].find('\n') {
+                Some(i) => return from + i + 1,
+                None => end = to,
+            },
+            TokenKind::LineComment | TokenKind::BlockComment => end = to,
+            _ => return end,
+        }
+    }
+    end
 }
 
 fn finish(mut s: String) -> String {
@@ -1085,6 +1122,33 @@ mod tests {
         let once = f(sql);
         assert_eq!(once, "SELECT 1;\n/* tail */\n-- trailing\n");
         assert_eq!(f(&once), once);
+    }
+
+    #[test]
+    fn fallback_never_cuts_a_statement_begun_on_the_line_of_another() {
+        let o = Options::default();
+        // The second statement does not parse and starts on the first's
+        // line; its string runs over the line break and must come out as
+        // written, not trimmed and re-joined.
+        let src = "SELEC 1 FRM; ALSO NOT 'a\n   b' SQL;\nselect 1;\n";
+        assert_eq!(
+            format(src, &o),
+            "SELEC 1 FRM; ALSO NOT 'a\n   b' SQL;\n\nSELECT 1;\n"
+        );
+        assert_eq!(format(&format(src, &o), &o), format(src, &o));
+        // A comment that starts on the `;` line and runs on stays whole
+        // and stays with its statement.
+        let src = "SELEC 1 FRM; /* one\n   two */\nselect 1;\n";
+        assert_eq!(format(src, &o), "SELEC 1 FRM; /* one\n   two */\n\nSELECT 1;\n");
+        // A good statement begun on a bad one's line is still formatted.
+        let src = "SELEC 1 FRM; select 'a\n   b';\n";
+        assert_eq!(format(src, &o), "SELEC 1 FRM;\n\nSELECT 'a\n   b';\n");
+        // Bad statements on lines of their own are set apart as before.
+        let src = "SELEC 1 FRM;\nSELEC 2 FRM;\n";
+        assert_eq!(format(src, &o), "SELEC 1 FRM;\n\nSELEC 2 FRM;\n");
+        // Two good statements on one line beside a bad one.
+        let src = "select 1; select 2;\nSELEC 1 FRM;\n";
+        assert_eq!(format(src, &o), "SELECT 1;\n\nSELECT 2;\n\nSELEC 1 FRM;\n");
     }
 
     #[test]
