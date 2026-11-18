@@ -17,6 +17,22 @@
 // and the files being browsed are browsed again. When files run in sessions
 // of their own (`-- grebe: session NAME`), every running session has a root
 // here; the one the file in front uses is the open one.
+//
+// With the catalog index on (catalogIndex.js; `grebe.duckdb.catalogIndex`)
+// a session's databases are drawn from the index, and the session is asked
+// nothing for them: the index already reads the local ones after a run
+// that can have changed them, and a foreign one (PostgreSQL, SQLite, ...)
+// once. Reading them here as well cost a walk of every attached database
+// after every run. What is still asked of the session, once per refresh
+// and never while a run has it: its variables, secrets and extensions
+// (three small questions that touch no database), its memory figure, and
+// the contents of a database the index holds no part of, when that one is
+// opened. A foreign database starts closed, and nothing is built for a
+// database until it is opened. A list of more than PAGE tables is drawn
+// as folders of PAGE, named by the first and last table in each, so that
+// no level of the tree is thousands of lines long and every table is
+// still two clicks away. With the index off, the tree asks the session
+// for everything after every run, as it always did.
 
 "use strict";
 
@@ -28,6 +44,12 @@ const results = require("./results");
 const log = require("./log");
 const trust = require("./trust");
 const conninfo = require("./conninfo");
+const { EXTRAS } = require("./catalogIndex");
+
+// The most tables and views one list shows before it is split into folders.
+const PAGE = 500;
+// Redraws asked for within this long of one another are drawn together.
+const REDRAW_MS = 50;
 
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
@@ -54,19 +76,6 @@ const OBJECTS = (dbs) => {
 const DATABASES =
   `SELECT database_name AS db, path, readonly, type, database_name = current_database() AS current ` +
   `FROM duckdb_databases() WHERE NOT internal OR database_name = 'temp'`;
-
-/** Macros, sequences and user-defined types in `dbs` (all when null). */
-const EXTRAS = (dbs) => {
-  const where = dbs ? ` AND database_name IN (${dbs.map(lit).join(", ")})` : "";
-  return (
-    `SELECT database_name AS db, schema_name AS sch, function_name AS name, function_type AS kind, ` +
-    `array_to_string(parameters, ', ') AS detail, macro_definition AS def ` +
-    `FROM duckdb_functions() WHERE NOT internal AND function_type IN ('macro', 'table_macro')${where} ` +
-    `UNION ALL SELECT database_name, schema_name, sequence_name, 'sequence', NULL, NULL FROM duckdb_sequences() WHERE true${where} ` +
-    `UNION ALL SELECT database_name, schema_name, type_name, 'type', logical_type, NULL FROM duckdb_types() WHERE NOT internal${where} ` +
-    `ORDER BY 1, 2, 4, 3`
-  );
-};
 
 // What the session holds outside any database. Secrets are listed by name,
 // type and scope only: the secret itself is never read.
@@ -100,14 +109,44 @@ class Explorer {
     // sessions that have been asked for newer ones.
     this.mem = new WeakMap();
     this.memAsking = new WeakSet();
+    // Counts refresh(): what the tree read itself for an earlier one is
+    // read again. Per session, what it was last told: `held` its
+    // variables, secrets and extensions, `lived` the contents of the
+    // databases the index has no part of.
+    this.epoch = 0;
+    this.held = new WeakMap();
+    this.lived = new WeakMap();
+    this.drawing = null;
+    this.drawAgain = false;
   }
 
   saveFiles() {
     if (this.state) this.state.update(FILES_KEY, [...this.files].map(([alias, f]) => ({ alias, file: f.file })));
   }
 
+  /** Something may have changed (a run ended, a database was attached, a
+   *  setting changed): read again what the tree reads itself, and draw. */
   refresh() {
+    this.epoch++;
+    this.redraw();
+  }
+
+  /** Draw the tree from what is known now (the index read something, a
+   *  memory figure arrived). The first of several is drawn at once, the
+   *  rest together a moment later. */
+  redraw() {
+    if (this.drawing) {
+      this.drawAgain = true;
+      return;
+    }
     this.changed.fire();
+    this.drawing = setTimeout(() => {
+      this.drawing = null;
+      if (!this.drawAgain) return;
+      this.drawAgain = false;
+      this.redraw();
+    }, REDRAW_MS);
+    if (this.drawing.unref) this.drawing.unref();
   }
 
   getTreeItem(node) {
@@ -118,8 +157,9 @@ class Explorer {
     try {
       if (!node) return this.roots();
       if (node.kind === "root") return this.sourceChildren(node);
-      if (node.kind === "db") return this.dbChildren(node);
-      if (node.kind === "schema") return this.schemaChildren(node.source, node.objects, node.extras);
+      if (node.kind === "db") return node.indexed ? this.indexedDbChildren(node) : this.dbChildren(node);
+      if (node.kind === "schema") return this.schemaChildren(node.source, node.objects, node.extras, node.paged);
+      if (node.kind === "range") return node.objects.map((o) => this.objectNode(node.source, o));
       if (node.kind === "group") return node.children;
       if (node.kind === "object") return this.columnNodes(node);
     } catch (e) {
@@ -200,18 +240,19 @@ class Explorer {
 
   /** Ask `sess` for its memory figures, one question at a time; redraw if
    *  they changed. An unchanged answer redraws nothing, so a redraw never
-   *  asks again forever. */
+   *  asks again forever. Not asked during a run, which redraws as it ends. */
   askMemory(sess) {
-    if (this.memAsking.has(sess)) return;
+    if (this.memAsking.has(sess) || this.running()) return;
     this.memAsking.add(sess);
+    // A background statement: a run that starts does not wait for it.
     sess
-      .run(MEMORY)
+      .run(MEMORY, { background: true })
       .then((r) => {
         const m = (objects(r) || [])[0];
         if (!m || !sess.alive) return;
         const was = this.mem.get(sess);
         this.mem.set(sess, m);
-        if (!was || was.used !== m.used || was.limit !== m.limit) this.refresh();
+        if (!was || was.used !== m.used || was.limit !== m.limit) this.redraw();
       })
       .catch(() => {})
       .finally(() => {
@@ -286,6 +327,8 @@ class Explorer {
       return [message(this.files.get(root.alias).error)];
     }
     const sess = await this.sessionFor(root.source);
+    const view = this.indexView(root.source, sess);
+    if (view) return this.indexedChildren(root, sess, view);
     const dbFilter = root.source === "file" ? [root.alias] : null;
     const objs = objects(await sess.run(OBJECTS(dbFilter))) || [];
     const extras = objects(await sess.run(EXTRAS(dbFilter))) || [];
@@ -326,12 +369,158 @@ class Explorer {
     return nodes.length === 1 && nodes[0].kind === "db" ? [...this.dbChildren(nodes[0]), ...session] : [...nodes, ...session];
   }
 
+  // --- from the catalog index ------------------------------------------------
+
+  /** A run is in progress: the session is the run's. */
+  running() {
+    return Boolean(this.deps.isRunning && this.deps.isRunning());
+  }
+
+  /** What the catalog index holds of the session `sess` that a root
+   *  shows. Null when the tree asks the session itself: a browsed file,
+   *  or the index is off. */
+  indexView(source, sess) {
+    if (!isSession(source) || !this.deps.indexView) return null;
+    return this.deps.indexView(this.sessionNameOf(source), sess) || null;
+  }
+
+  /** One of the tree's own questions to a session whose databases come
+   *  from the index. Not asked during a run, and dropped when one starts
+   *  (a background statement, like the index's own). Null when it was not
+   *  answered; the refresh as the run ends asks again. */
+  async quietly(sess, sql) {
+    if (!sess.alive || this.running()) return null;
+    try {
+      const r = await sess.run(sql, { background: true });
+      return r.kind === "cancelled" ? null : r;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A session's databases as the index knows them. Nothing is asked of
+   *  the session for them, and nothing is built of what is in one until
+   *  it is opened. */
+  async indexedChildren(root, sess, view) {
+    // The index reads a session as soon as it is free; it says when.
+    if (!view.read) return [message("Reading the catalog…", undefined, "sync")];
+    const holds = (d) => Boolean(d.tables && d.tables.length) || d.extras.length > 0;
+    const dbs = view.dbs.filter((d) => d.db !== "temp" || holds(d));
+    // The session's own database first, then attached ones by name, temp last.
+    const rank = (d) => (d.current ? 0 : d.db === "temp" ? 2 : 1);
+    dbs.sort((a, b) => rank(a) - rank(b) || a.db.localeCompare(b.db));
+    const nodes = dbs.map((d) => {
+      const index = describeIndex(d.status);
+      // A foreign database starts closed: it is the one that can hold
+      // thousands of tables, and the one opened least.
+      return node("db", d.db, d.foreign ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.Expanded, {
+        source: root.source,
+        db: d.db,
+        indexed: d,
+        icon: d.db === "temp" ? "clock" : d.status && d.status.over ? "warning" : "database",
+        description: [describeDb(d), index && index.short].filter(Boolean).join(" · "),
+        tooltip: (d.path ? `${d.db}: ${conninfo.redact(d.path)}` : d.db) + (index ? `\n\n${index.long}` : ""),
+        contextValue: !d.current && d.db !== "temp" ? "grebe.attachedDb" : "grebe.db",
+      });
+    });
+    const session = await this.heldBy(sess);
+    if (root.source === "session") nodes.push(...this.waiting((alias) => dbs.some((d) => d.db === alias)));
+    if (nodes.length === 0) return [message("No tables yet"), ...session];
+    // One database: show its contents directly.
+    return nodes.length === 1 && nodes[0].kind === "db" ? [...(await this.indexedDbChildren(nodes[0])), ...session] : [...nodes, ...session];
+  }
+
+  /** What is in a database drawn from the index. */
+  async indexedDbChildren(n) {
+    const d = n.indexed;
+    const s = d.status || {};
+    let objs = [];
+    let extras = d.extras;
+    if (d.tables) {
+      objs = d.tables.map((t) => ({
+        db: d.db,
+        sch: t.schema,
+        name: t.table,
+        kind: t.kind === "view" ? "view" : "table",
+        // A local table's estimate is DuckDB's, a PostgreSQL table's the
+        // server's own; other foreign tables and views have none.
+        est: t.kind !== "view" && t.rows !== undefined ? t.rows : null,
+        cols: t.columns ? t.columns.length : 0,
+        tmp: d.db === "temp",
+        table: t,
+      }));
+      // Tables before views, by name, schema by schema: the order the
+      // session gives them in.
+      objs.sort((a, b) => before(a.sch, b.sch) || before(a.kind, b.kind) || before(a.name, b.name));
+    } else if (s.over || (d.foreign && s.error)) {
+      // The index holds no part of it (too large for the editor, or it
+      // could not be read): the session is asked, now that it is opened.
+      const read = await this.liveContents(n.source, d);
+      if (!read) return [message("Shown when the running statement ends")];
+      objs = read.objects;
+      extras = read.extras;
+    } else if (d.foreign && s.indexedAt === null) {
+      // Never indexed: the index reads it when the session is free, and
+      // the tree is drawn again then. It is not read here as well.
+      const wait = message("indexing…", undefined, "sync~spin");
+      wait.item.tooltip = "Its tables and columns are being read. They are listed here as soon as they are.";
+      return [wait];
+    }
+    return this.dbChildren({ source: n.source, objects: objs, extras, paged: true });
+  }
+
+  /** The tables, views and the rest of a database the index holds no part
+   *  of, asked of the session once per refresh. Null when the session
+   *  could not be asked and nothing was read before. */
+  async liveContents(source, d) {
+    const sess = await this.sessionFor(source);
+    if (!this.lived.has(sess)) this.lived.set(sess, new Map());
+    const kept = this.lived.get(sess);
+    const had = kept.get(d.db);
+    if (had && had.epoch === this.epoch) return had;
+    const epoch = this.epoch;
+    const objs = await this.quietly(sess, OBJECTS([d.db]));
+    const extras = objs && (await this.quietly(sess, EXTRAS([d.db])));
+    if (!objs || !extras) return had || null;
+    const read = {
+      epoch,
+      objects: (objects(objs) || []).map((o) => (d.foreign ? { ...o, est: null } : o)),
+      extras: (objects(extras) || []).filter((x) => !(d.foreign && x.kind === "type")),
+    };
+    kept.set(d.db, read);
+    return read;
+  }
+
+  /** A session's variables, secrets and extensions, asked once per
+   *  refresh however often the tree is drawn. While they cannot be asked
+   *  for, the last ones known. */
+  heldBy(sess) {
+    const had = this.held.get(sess);
+    if (had && had.epoch === this.epoch) return had.nodes;
+    const now = { epoch: this.epoch, last: had ? had.last : [], nodes: null };
+    now.nodes = this.sessionGroups(sess, (sql) => this.quietly(sess, sql)).then((groups) => {
+      if (groups) now.last = groups;
+      else now.epoch = -1; // not answered: the next drawing asks again
+      return now.last;
+    });
+    this.held.set(sess, now);
+    return now.nodes;
+  }
+
+  // ---------------------------------------------------------------------------
+
   /** Variables, secrets and extensions: what the session holds outside any
-   *  database. */
-  async sessionGroups(sess) {
-    const vars = objects(await sess.run(VARIABLES)) || [];
-    const secrets = objects(await sess.run(SECRETS)) || [];
-    const exts = objects(await sess.run(EXTENSIONS)) || [];
+   *  database. `ask` runs one question; when it gives no answer (null),
+   *  neither does this. */
+  async sessionGroups(sess, ask = (sql) => sess.run(sql)) {
+    const read = async (sql) => {
+      const r = await ask(sql);
+      return r ? objects(r) || [] : null;
+    };
+    const vars = await read(VARIABLES);
+    const secrets = vars && (await read(SECRETS));
+    const exts = secrets && (await read(EXTENSIONS));
+    if (!exts) return null;
     const leaf = (label, icon, description, tooltip) =>
       node("leaf", label, vscode.TreeItemCollapsibleState.None, { icon, description, tooltip });
     const groups = [];
@@ -357,7 +546,10 @@ class Explorer {
       return bySchema.get(sch);
     };
     for (const o of dbNode.objects) {
-      entry(o.sch).objects.push({ db: o.db, schema: o.sch, name: o.name, kind: o.kind, est: o.est, cols: o.cols, tmp: o.tmp });
+      const object = { db: o.db, schema: o.sch, name: o.name, kind: o.kind, est: o.est, cols: o.cols, tmp: o.tmp };
+      // From the index: what it holds of the table, for its columns.
+      if (o.table) object.table = o.table;
+      entry(o.sch).objects.push(object);
     }
     for (const x of dbNode.extras || []) {
       entry(x.sch).extras.push({ db: x.db, schema: x.sch, name: x.name, kind: x.kind, detail: x.detail, def: x.def });
@@ -368,21 +560,23 @@ class Explorer {
         source: dbNode.source,
         objects: objs,
         extras,
+        paged: dbNode.paged,
         icon: "symbol-namespace",
         description: `${objs.length + extras.length}`,
       }),
     );
     // A lone `main` schema: show what is in it directly.
     if (schemas.length === 1 && schemas[0].item.label === "main") {
-      return this.schemaChildren(dbNode.source, schemas[0].objects, schemas[0].extras);
+      return this.schemaChildren(dbNode.source, schemas[0].objects, schemas[0].extras, dbNode.paged);
     }
     return schemas;
   }
 
   /** A schema's tables and views, then a folder each for its macros,
-   *  sequences and types. */
-  schemaChildren(source, objs, extras = []) {
-    const out = objs.map((o) => this.objectNode(source, o));
+   *  sequences and types. `paged`: more tables and views than PAGE are
+   *  put in folders, and built when a folder is opened. */
+  schemaChildren(source, objs, extras = [], paged = false) {
+    const out = paged && objs.length > PAGE ? ranges(source, objs) : objs.map((o) => this.objectNode(source, o));
     const of = (...kinds) => extras.filter((x) => kinds.includes(x.kind));
     const leaf = (x, label, icon, description, tooltip, contextValue) =>
       node("leaf", label, vscode.TreeItemCollapsibleState.None, { icon, description, tooltip, object: x, contextValue });
@@ -570,12 +764,13 @@ class Explorer {
     this.refresh();
   }
 
-  objectNode(source, o) {
+  objectNode(source, { table, ...o }) {
     const est = o.est === null || o.est === undefined ? null : Number(o.est);
     const rows = est === null ? "" : `~${est.toLocaleString()} row${est === 1 ? "" : "s"} · `;
     const n = node("object", o.name, vscode.TreeItemCollapsibleState.Collapsed, {
       source,
       object: o,
+      table,
       icon: o.kind === "view" ? "eye" : "table",
       description: `${rows}${o.cols} col${o.cols === 1 ? "" : "s"}${o.tmp ? " · temp" : ""}`,
       tooltip: `${o.kind} ${qname(o)}`,
@@ -586,16 +781,21 @@ class Explorer {
   }
 
   async columnNodes(n) {
-    const sess = await this.sessionFor(n.source);
-    const cols = objects(await sess.run(COLUMNS(n.object))) || [];
-    return cols.map((c) =>
-      node("column", c.name, vscode.TreeItemCollapsibleState.None, {
+    const column = (name, type, nullable) =>
+      node("column", name, vscode.TreeItemCollapsibleState.None, {
         icon: "symbol-field",
-        description: c.type + (c.nullable ? "" : " NOT NULL"),
+        description: type + (nullable ? "" : " NOT NULL"),
         contextValue: "grebe.column",
         object: n.object,
-      }),
-    );
+      });
+    // From the index: it holds the columns too.
+    if (n.table) {
+      const t = n.table;
+      return (t.columns || []).map((name, i) => column(name, (t.types || [])[i] || "", !(t.nullable && t.nullable[i] === false)));
+    }
+    const sess = await this.sessionFor(n.source);
+    const cols = objects(await sess.run(COLUMNS(n.object))) || [];
+    return cols.map((c) => column(c.name, c.type, c.nullable));
   }
 
   /** Run `sql` for an object and show the result in the grid. */
@@ -653,6 +853,7 @@ class Explorer {
   }
 
   dispose() {
+    clearTimeout(this.drawing);
     this.changed.dispose();
     if (this.fileSession) this.fileSession.dispose();
   }
@@ -724,6 +925,32 @@ function describeIndex(s) {
       `${s.stale ? " and about to be read again" : ""}. It is read again when a statement changes the database, when it is older than ` +
       `grebe.duckdb.catalogIndexMaxAge, and when you choose Refresh Connection Index.`,
   };
+}
+
+const before = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** `objs` (tables, then views, each by name) in folders of no more than
+ *  PAGE of one kind, each named by the first and the last name in it. */
+function ranges(source, objs) {
+  const out = [];
+  for (let i = 0; i < objs.length; ) {
+    let j = i + 1;
+    while (j < objs.length && j - i < PAGE && objs[j].kind === objs[i].kind) j++;
+    const some = objs.slice(i, j);
+    const first = some[0].name;
+    const last = some[some.length - 1].name;
+    out.push(
+      node("range", some.length === 1 ? first : `${first} … ${last}`, vscode.TreeItemCollapsibleState.Collapsed, {
+        source,
+        objects: some,
+        icon: "folder",
+        description: `${some.length.toLocaleString("en-US")} ${some[0].kind}${some.length === 1 ? "" : "s"}`,
+        tooltip: `${some[0].kind === "view" ? "Views" : "Tables"} ${first} to ${last}, by name`,
+      }),
+    );
+    i = j;
+  }
+  return out;
 }
 
 /** A folder of `children`, labelled with how many there are. */

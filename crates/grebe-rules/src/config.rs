@@ -48,18 +48,84 @@ pub enum Semicolon {
     Newline,
 }
 
+/// Where the formatter puts the comma of a list that breaks over lines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Comma {
+    #[default]
+    Trailing,
+    Leading,
+}
+
+/// Where the formatter puts `AND`/`OR` in a condition that breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LogicalOperator {
+    #[default]
+    Leading,
+    Trailing,
+}
+
+/// Casing the formatter should render function names or type names in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum NameCase {
+    #[default]
+    Lower,
+    Upper,
+    Preserve,
+}
+
+/// What the formatter indents with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum IndentStyle {
+    #[default]
+    Space,
+    Tab,
+}
+
+/// Whether a list or a `CASE` goes one item per line only when it does not
+/// fit (`Auto`) or whenever it has more than one (`Expanded`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Layout {
+    #[default]
+    Auto,
+    Expanded,
+}
+
+/// A named bundle of `[format]` options.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Style {
+    #[default]
+    Default,
+    Dbt,
+    Mazur,
+}
+
 /// `[format]` (or `[tool.grebe.format]`) overrides. `None` means "use the
-/// formatter's built-in default": `indent_size` 4, `inline_threshold` 100,
-/// `keyword_case` UPPER, `function_paren_space` false,
-/// `keyword_paren_space` true, `semicolon` attached.
+/// formatter's built-in default", or what `style` sets when it names a
+/// bundle: `indent_size` 4, `inline_threshold` 100, `keyword_case` UPPER,
+/// `function_paren_space` false, `keyword_paren_space` true, `semicolon`
+/// attached, `comma` trailing, `logical_operator` leading, `function_case`
+/// and `type_case` lower, `indent_style` space,
+/// `blank_lines_between_statements` 1, `max_blank_lines_in_statement` 0,
+/// `list_layout` and `case_layout` auto.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormatConfig {
+    /// The bundle the other keys override; `None` is the default style.
+    pub style: Option<Style>,
     pub indent_size: Option<usize>,
     pub inline_threshold: Option<usize>,
     pub keyword_case: Option<KeywordCase>,
     pub function_paren_space: Option<bool>,
     pub keyword_paren_space: Option<bool>,
     pub semicolon: Option<Semicolon>,
+    pub comma: Option<Comma>,
+    pub logical_operator: Option<LogicalOperator>,
+    pub function_case: Option<NameCase>,
+    pub type_case: Option<NameCase>,
+    pub indent_style: Option<IndentStyle>,
+    pub blank_lines_between_statements: Option<usize>,
+    pub max_blank_lines_in_statement: Option<usize>,
+    pub list_layout: Option<Layout>,
+    pub case_layout: Option<Layout>,
 }
 
 /// One discovered/parsed configuration file, resolved to typed fields.
@@ -719,6 +785,16 @@ fn apply_format(
             | "function_paren_space"
             | "keyword_paren_space"
             | "semicolon"
+            | "style"
+            | "comma"
+            | "logical_operator"
+            | "function_case"
+            | "type_case"
+            | "indent_style"
+            | "blank_lines_between_statements"
+            | "max_blank_lines_in_statement"
+            | "list_layout"
+            | "case_layout"
     ) {
         return Err(err(path, line, format!("unknown key `{key}`")));
     }
@@ -821,9 +897,133 @@ fn apply_format(
                 }
             });
         }
+        "style" => {
+            config.format.style = Some(one_of(
+                value,
+                key,
+                &[
+                    ("default", Style::Default),
+                    ("dbt", Style::Dbt),
+                    ("mazur", Style::Mazur),
+                ],
+                line,
+                path,
+            )?);
+        }
+        "comma" => {
+            config.format.comma = Some(one_of(
+                value,
+                key,
+                &[("trailing", Comma::Trailing), ("leading", Comma::Leading)],
+                line,
+                path,
+            )?);
+        }
+        "logical_operator" => {
+            config.format.logical_operator = Some(one_of(
+                value,
+                key,
+                &[
+                    ("leading", LogicalOperator::Leading),
+                    ("trailing", LogicalOperator::Trailing),
+                ],
+                line,
+                path,
+            )?);
+        }
+        "function_case" | "type_case" => {
+            let case = one_of(
+                value,
+                key,
+                &[
+                    ("preserve", NameCase::Preserve),
+                    ("upper", NameCase::Upper),
+                    ("lower", NameCase::Lower),
+                ],
+                line,
+                path,
+            )?;
+            if key == "function_case" {
+                config.format.function_case = Some(case);
+            } else {
+                config.format.type_case = Some(case);
+            }
+        }
+        "indent_style" => {
+            config.format.indent_style = Some(one_of(
+                value,
+                key,
+                &[("space", IndentStyle::Space), ("tab", IndentStyle::Tab)],
+                line,
+                path,
+            )?);
+        }
+        "blank_lines_between_statements" | "max_blank_lines_in_statement" => {
+            let Value::Int(n) = value else {
+                return Err(err(
+                    path,
+                    line,
+                    format!("`{key}` must be an integer, found {}", value.type_name()),
+                ));
+            };
+            if !(0..=10).contains(&n) {
+                return Err(err(path, line, format!("`{key}` must be between 0 and 10")));
+            }
+            if key == "blank_lines_between_statements" {
+                config.format.blank_lines_between_statements = Some(n as usize);
+            } else {
+                config.format.max_blank_lines_in_statement = Some(n as usize);
+            }
+        }
+        "list_layout" | "case_layout" => {
+            let layout = one_of(
+                value,
+                key,
+                &[("auto", Layout::Auto), ("expanded", Layout::Expanded)],
+                line,
+                path,
+            )?;
+            if key == "list_layout" {
+                config.format.list_layout = Some(layout);
+            } else {
+                config.format.case_layout = Some(layout);
+            }
+        }
         _ => unreachable!("key set checked above"),
     }
     Ok(())
+}
+
+/// A `[format]` value that is one of a few words, whatever their letter
+/// case. The error names every word the key takes.
+fn one_of<T: Copy>(
+    value: Value,
+    key: &str,
+    choices: &[(&str, T)],
+    line: usize,
+    path: &Path,
+) -> Result<T, ConfigError> {
+    let Value::Str(s) = value else {
+        return Err(err(
+            path,
+            line,
+            format!("`{key}` must be a string, found {}", value.type_name()),
+        ));
+    };
+    let word = s.to_ascii_lowercase();
+    if let Some((_, choice)) = choices.iter().find(|(name, _)| *name == word) {
+        return Ok(*choice);
+    }
+    let mut names = String::new();
+    for (k, (name, _)) in choices.iter().enumerate() {
+        if k > 0 {
+            names.push_str(if k + 1 == choices.len() { " or " } else { ", " });
+        }
+        names.push('"');
+        names.push_str(name);
+        names.push('"');
+    }
+    Err(err(path, line, format!("`{key}` must be {names}")))
 }
 
 // ---------------------------------------------------------------------
@@ -1084,6 +1284,16 @@ mod tests {
             function_paren_space = true
             keyword_paren_space = false
             semicolon = "newline"
+            style = "dbt"
+            comma = "leading"
+            logical_operator = "trailing"
+            function_case = "upper"
+            type_case = "preserve"
+            indent_style = "tab"
+            blank_lines_between_statements = 2
+            max_blank_lines_in_statement = 1
+            list_layout = "expanded"
+            case_layout = "expanded"
         "#;
         let config = parse(text, &p("/repo/grebe.toml"), false).expect("should parse");
         assert_eq!(config.root, p("/repo"));
@@ -1108,6 +1318,19 @@ mod tests {
         assert_eq!(config.format.function_paren_space, Some(true));
         assert_eq!(config.format.keyword_paren_space, Some(false));
         assert_eq!(config.format.semicolon, Some(Semicolon::Newline));
+        assert_eq!(config.format.style, Some(Style::Dbt));
+        assert_eq!(config.format.comma, Some(Comma::Leading));
+        assert_eq!(
+            config.format.logical_operator,
+            Some(LogicalOperator::Trailing)
+        );
+        assert_eq!(config.format.function_case, Some(NameCase::Upper));
+        assert_eq!(config.format.type_case, Some(NameCase::Preserve));
+        assert_eq!(config.format.indent_style, Some(IndentStyle::Tab));
+        assert_eq!(config.format.blank_lines_between_statements, Some(2));
+        assert_eq!(config.format.max_blank_lines_in_statement, Some(1));
+        assert_eq!(config.format.list_layout, Some(Layout::Expanded));
+        assert_eq!(config.format.case_layout, Some(Layout::Expanded));
     }
 
     #[test]
@@ -1322,6 +1545,89 @@ mod tests {
             parse("[format]\nsemicolon = \"Spaced\"\n", &p("c.toml"), false).expect("should parse");
         assert_eq!(config.format.semicolon, Some(Semicolon::Spaced));
         assert_eq!(config.format.function_paren_space, None);
+    }
+
+    /// Every style option: each value it takes, in any letter case; a
+    /// value it does not take; a value of the wrong type; and the key
+    /// given twice.
+    #[test]
+    fn style_option_values_are_checked() {
+        let words: &[(&str, &[&str])] = &[
+            ("style", &["default", "dbt", "mazur"]),
+            ("comma", &["trailing", "leading"]),
+            ("logical_operator", &["leading", "trailing"]),
+            ("function_case", &["preserve", "upper", "lower"]),
+            ("type_case", &["preserve", "upper", "lower"]),
+            ("indent_style", &["space", "tab"]),
+            ("list_layout", &["auto", "expanded"]),
+            ("case_layout", &["auto", "expanded"]),
+        ];
+        for (key, values) in words {
+            for value in *values {
+                for value in [value.to_string(), value.to_ascii_uppercase()] {
+                    let text = format!("[format]\n{key} = \"{value}\"\n");
+                    assert!(parse(&text, &p("c.toml"), false).is_ok(), "{text:?}");
+                }
+            }
+            for bad in ["\"sideways\"", "\"\"", "true", "1", "[\"upper\"]"] {
+                let text = format!("[format]\n{key} = {bad}\n");
+                let e = parse(&text, &p("c.toml"), false).unwrap_err();
+                assert_eq!(e.line, 2, "{text:?}");
+                assert!(e.message.contains(key), "{text:?}: {}", e.message);
+            }
+            let first = values[0];
+            let text = format!("[format]\n{key} = \"{first}\"\n{key} = \"{first}\"\n");
+            let e = parse(&text, &p("c.toml"), false).unwrap_err();
+            assert_eq!(e.line, 3, "{text:?}");
+        }
+        for key in [
+            "blank_lines_between_statements",
+            "max_blank_lines_in_statement",
+        ] {
+            for (value, ok) in [
+                ("0", true),
+                ("1", true),
+                ("10", true),
+                ("11", false),
+                ("-1", false),
+                ("\"1\"", false),
+                ("true", false),
+            ] {
+                let text = format!("[format]\n{key} = {value}\n");
+                match parse(&text, &p("c.toml"), false) {
+                    Ok(_) => assert!(ok, "accepted: {text:?}"),
+                    Err(e) => {
+                        assert!(!ok, "rejected: {text:?}");
+                        assert_eq!(e.line, 2, "{text:?}");
+                    }
+                }
+            }
+            let text = format!("[format]\n{key} = 1\n{key} = 1\n");
+            let e = parse(&text, &p("c.toml"), false).unwrap_err();
+            assert_eq!(e.line, 3, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_style_names_the_styles_there_are() {
+        let e = parse("[format]\nstyle = \"sqlfluff\"\n", &p("c.toml"), false).unwrap_err();
+        assert_eq!(e.line, 2);
+        assert_eq!(
+            e.message,
+            "`style` must be \"default\", \"dbt\" or \"mazur\""
+        );
+        // The words a key takes are spelled out for the others too.
+        let e = parse("[format]\ncomma = \"first\"\n", &p("c.toml"), false).unwrap_err();
+        assert_eq!(e.message, "`comma` must be \"trailing\" or \"leading\"");
+    }
+
+    #[test]
+    fn style_options_are_read_from_pyproject_too() {
+        let text = "[tool.grebe.format]\nstyle = \"mazur\"\ncomma = \"leading\"\n";
+        let config = parse(text, &p("pyproject.toml"), true).expect("should parse");
+        assert_eq!(config.format.style, Some(Style::Mazur));
+        assert_eq!(config.format.comma, Some(Comma::Leading));
+        assert_eq!(config.format.logical_operator, None);
     }
 
     #[test]

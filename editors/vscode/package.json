@@ -295,7 +295,7 @@
         "grebe.duckdb.catalogIndex": {
           "type": "boolean",
           "default": true,
-          "description": "Keep what the editor knows of the session database by database. Local databases (the session's own, in-memory and TEMP ones, attached DuckDB files) are read again after a run. A foreign database (PostgreSQL, SQLite, MySQL, ...) is read once, when first attached, kept between windows, and read again only when a statement changes it, when its index is older than grebe.duckdb.catalogIndexMaxAge, or when you choose Refresh Connection Index in the Catalog. A database of more than 500,000 columns is left out by itself; the others still complete and are checked. Off: every database is read after every run and sent as one snapshot, and past 100,000 columns in all the editor gets none."
+          "description": "Keep what the editor knows of the session database by database. Local databases (the session's own, in-memory and TEMP ones, attached DuckDB files) are read again after a run. A foreign database (PostgreSQL, SQLite, MySQL, ...) is read once, when first attached, kept between windows, and read again only when a statement changes it, when its index is older than grebe.duckdb.catalogIndexMaxAge, or when you choose Refresh Connection Index in the Catalog. A database of more than 500,000 columns is left out by itself; the others still complete and are checked. The Catalog view draws from the same index, so a refresh asks an attached database nothing, and a database is read only when you open it. Off: every database is read after every run and sent as one snapshot, and past 100,000 columns in all the editor gets none."
         },
         "grebe.duckdb.catalogIndexMaxAge": {
           "type": "integer",

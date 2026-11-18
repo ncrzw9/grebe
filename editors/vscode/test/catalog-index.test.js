@@ -327,6 +327,98 @@ live("a database over the limit is the only one left out, and says so", async (t
   assert.equal(index.status("default", "wh").over, null);
 });
 
+// ---------------------------------------------------------- for the Catalog --
+
+live("what the Catalog draws: each database with its tables, what else it holds, and a word when a reading differs", async (t) => {
+  const dir = tmp("view");
+  const side = path.join(dir, "side.duckdb");
+  const writer = new Session({ cli: CLI, database: side, cwd: dir });
+  await writer.start();
+  await writer.run("CREATE TABLE facts (id INTEGER)");
+  writer.dispose();
+  await new Promise((r) => setTimeout(r, 200)); // let the writer release its lock
+
+  let told = 0;
+  const index = new CatalogIndex({ onRead: () => told++ });
+  const h = await harness(t, () => index);
+  assert.equal(index.view("default"), null, "a session never seen");
+  await h.user(`ATTACH '${side}' AS side (READ_ONLY)`, "attach");
+  await h.user(`CREATE TABLE orders (id INTEGER)`);
+  await h.user(`CREATE MACRO twice(x) AS x * 2`);
+  await h.user(`CREATE MACRO twice_all(n) AS TABLE SELECT i * 2 FROM range(n) r(i)`);
+  await h.user(`CREATE SEQUENCE ids`);
+  await h.user(`CREATE TYPE mood AS ENUM ('ok', 'bad')`);
+  await h.settle();
+  assert.equal(told, 1);
+
+  const view = index.view("default");
+  assert.equal(view.session, h.sess);
+  assert.equal(view.read, true);
+  const of = (db) => view.dbs.find((d) => d.db === db);
+  assert.deepEqual(
+    view.dbs.map((d) => [d.db, d.type, d.current, d.readonly, d.foreign, d.path]).sort(),
+    [["memory", "duckdb", true, false, false, null], ["side", "duckdb", false, true, false, side], ["temp", "duckdb", false, false, false, null]],
+  );
+  assert.equal(of("memory").tables, h.part("memory").tables, "the part's own tables, not a copy");
+  assert.deepEqual(of("side").tables.map((x) => x.table), ["facts"]);
+  assert.equal(of("temp").tables, null);
+  assert.deepEqual(of("memory").status, index.status("default", "memory"));
+  // Macros with their parameters and definitions, sequences, types: for
+  // the Catalog. The part names the macros, as it did.
+  assert.deepEqual(
+    of("memory").extras.map((x) => [x.sch, x.name, x.kind, x.detail]),
+    [["main", "twice", "macro", "x"], ["main", "ids", "sequence", null], ["main", "twice_all", "table_macro", "n"], ["main", "mood", "type", "ENUM"]],
+  );
+  assert.match(of("memory").extras[0].def, /x \* 2/);
+  assert.deepEqual(h.part("memory").functions, [{ name: "twice", kind: "macro" }, { name: "twice_all", kind: "table_macro" }]);
+  assert.deepEqual(of("side").extras, []);
+
+  // Read again with nothing different: nothing said.
+  await h.settle();
+  assert.equal(told, 1);
+  // A sequence is not in a part, so the server is sent nothing new; the
+  // Catalog is told all the same.
+  const digest = h.part("memory").digest;
+  await h.user(`CREATE SEQUENCE more_ids`);
+  await h.settle();
+  assert.equal(told, 2);
+  assert.equal(h.part("memory").digest, digest);
+  assert.equal(index.view("default").dbs.find((d) => d.db === "memory").extras.length, 5);
+  await h.user(`DETACH side`, "detach");
+  await h.settle();
+  assert.equal(told, 3);
+  assert.equal(index.view("default").dbs.some((d) => d.db === "side"), false);
+});
+
+live("the index waits its turn behind a background statement, and leaves the session to one somebody is waiting for", async (t) => {
+  const index = new CatalogIndex({});
+  const h = await harness(t, () => index);
+  await h.user(`CREATE TABLE orders (id INTEGER)`);
+  const slow = "SELECT count(*) FROM range(400000000) r(i) WHERE i % 7 = 3";
+  // Started, and in flight; wrapped, so that waiting for this does not
+  // wait for the statement.
+  const start = async (opts) => {
+    const job = h.sess.run(slow, opts);
+    for (let i = 0; i < 100 && !h.sess.busy; i++) await new Promise((r) => setTimeout(r, 2));
+    assert.equal(h.sess.busy, true, "the statement is in flight");
+    return { job };
+  };
+
+  // Somebody's statement (a preview, an export): nothing is asked.
+  let { job } = await start();
+  const before = h.asked.length;
+  assert.equal(await index.refresh("default", h.sess), false);
+  assert.equal(h.asked.length, before);
+  assert.equal((await job).kind, "rows");
+
+  // The Catalog's own question (the memory figure, say): the reading
+  // follows it.
+  ({ job } = await start({ background: true }));
+  assert.equal(await index.refresh("default", h.sess), true);
+  assert.equal((await job).kind, "rows");
+  assert.deepEqual(h.part("memory").tables.map((x) => x.table), ["orders"]);
+});
+
 // ------------------------------------------------ not in the user's way --
 
 const interruptible = CLI && fs.existsSync(CLI) && process.platform !== "win32" ? test : test.skip;

@@ -66,6 +66,11 @@ pub enum Doc<'a> {
     LineSuffix(String),
     /// Zero-width; marks every enclosing group as broken.
     BreakParent,
+    /// Blank lines the author left before what follows: on a line that
+    /// holds nothing yet, at least this many blank lines stand above it;
+    /// anywhere else, nothing. It never makes a line break of its own, so
+    /// it changes no layout decision.
+    BlankLines(u8),
 }
 
 impl<'a> Doc<'a> {
@@ -109,7 +114,12 @@ impl<'a> Doc<'a> {
     pub fn forces_break(&self) -> bool {
         match self {
             Self::HardLine | Self::OwnLine | Self::BreakParent => true,
-            Self::Nil | Self::Text(_) | Self::Line | Self::SoftLine | Self::LineSuffix(_) => false,
+            Self::Nil
+            | Self::Text(_)
+            | Self::Line
+            | Self::SoftLine
+            | Self::LineSuffix(_)
+            | Self::BlankLines(_) => false,
             Self::Concat(v) => v.iter().any(Self::forces_break),
             Self::Indent(d) => d.forces_break(),
             Self::Group { forced, .. } => *forced,
@@ -158,6 +168,9 @@ pub struct Printer {
     pending_break: bool,
     width_limit: usize,
     indent_size: usize,
+    /// One tab per indent level instead of `indent_size` spaces. A tab
+    /// still counts as `indent_size` columns towards the width.
+    tabs: bool,
 }
 
 impl Printer {
@@ -170,7 +183,15 @@ impl Printer {
             pending_break: false,
             width_limit,
             indent_size,
+            tabs: false,
         }
+    }
+
+    /// Indent with one tab per level rather than `indent_size` spaces.
+    #[must_use]
+    pub fn with_tabs(mut self, tabs: bool) -> Self {
+        self.tabs = tabs;
+        self
     }
 
     /// Everything printed so far, with any deferred line suffix placed.
@@ -193,17 +214,55 @@ impl Printer {
                 .is_some_and(|l| l.trim().is_empty())
     }
 
-    /// Start a new line at `ind` levels. Indentation is always spaces, never
-    /// tabs, so the output looks the same in every editor.
+    /// Start a new line at `ind` levels. Indentation is spaces unless tabs
+    /// were asked for; either way a level is `indent_size` columns wide.
     fn newline(&mut self, ind: usize) {
         self.flush_suffix();
         self.trim_line_end();
         self.out.push('\n');
-        for _ in 0..ind * self.indent_size {
-            self.out.push(' ');
+        self.push_indent(ind);
+        self.pending_break = false;
+    }
+
+    fn push_indent(&mut self, ind: usize) {
+        if self.tabs {
+            for _ in 0..ind {
+                self.out.push('\t');
+            }
+        } else {
+            for _ in 0..ind * self.indent_size {
+                self.out.push(' ');
+            }
         }
         self.pos = ind * self.indent_size;
-        self.pending_break = false;
+    }
+
+    /// On a line that holds nothing yet, make sure at least `n` blank lines
+    /// stand above it. Nothing happens at the very start of the output or
+    /// in the middle of a line: a blank line is only ever kept where the
+    /// layout broke the line anyway.
+    fn blank_lines(&mut self, n: usize, ind: usize) {
+        if !self.fresh() {
+            return;
+        }
+        let line_start = self.out.rfind('\n').map_or(0, |i| i + 1);
+        if line_start == 0 {
+            return;
+        }
+        let have = self.out[..line_start]
+            .bytes()
+            .rev()
+            .take_while(|b| *b == b'\n')
+            .count()
+            - 1;
+        if have >= n {
+            return;
+        }
+        self.out.truncate(line_start);
+        for _ in have..n {
+            self.out.push('\n');
+        }
+        self.push_indent(ind);
     }
 
     fn flush_suffix(&mut self) {
@@ -213,7 +272,7 @@ impl Printer {
     }
 
     fn trim_line_end(&mut self) {
-        while self.out.ends_with(' ') {
+        while self.out.ends_with(' ') || (self.tabs && self.out.ends_with('\t')) {
             self.out.pop();
         }
     }
@@ -242,6 +301,7 @@ impl Printer {
         while let Some((ind, mode, d)) = stack.pop() {
             match d {
                 Doc::Nil | Doc::BreakParent => {}
+                Doc::BlankLines(n) => self.blank_lines(usize::from(*n), ind),
                 // A deferred line comment must end its line before the next
                 // code, not after it: with no break between them (`WHERE -- c`
                 // then `x`, joined by a plain space), the comment would land
@@ -343,7 +403,7 @@ fn fits<'d, 'a>(
             }
         };
         match d {
-            Doc::Nil | Doc::BreakParent | Doc::LineSuffix(_) => {}
+            Doc::Nil | Doc::BreakParent | Doc::LineSuffix(_) | Doc::BlankLines(_) => {}
             Doc::Text(s) => {
                 if s.contains('\n') {
                     // The line ends inside the text; nothing after it matters.
@@ -561,6 +621,83 @@ mod tests {
         printer.hard_line();
         printer.print(&t("b"));
         assert_eq!(printer.finish(), "a\nb");
+    }
+
+    #[test]
+    fn tabs_indent_one_per_level_and_measure_as_indent_size_columns() {
+        let d = Doc::group(Doc::concat(vec![
+            t("SELECT"),
+            Doc::indent(Doc::concat(vec![
+                Doc::Line,
+                list(&["alpha", "beta", "gamma"]),
+                Doc::indent(Doc::concat(vec![Doc::HardLine, Doc::HardLine, t("x")])),
+            ])),
+        ]));
+        let tabs = |width| {
+            let mut printer = Printer::new(width, 4).with_tabs(true);
+            printer.print(&d);
+            printer.finish()
+        };
+        // No tab is left on the blank line.
+        assert_eq!(tabs(12), "SELECT\n\talpha,\n\tbeta,\n\tgamma\n\n\t\tx");
+        for width in [8, 12, 20, 40] {
+            assert_eq!(tabs(width).replace('\t', "    "), print(&d, width, 4));
+        }
+    }
+
+    #[test]
+    fn blank_lines_are_kept_on_a_fresh_line_and_nowhere_else() {
+        let two = |width| {
+            print(
+                &Doc::group(Doc::concat(vec![
+                    t("a"),
+                    Doc::Line,
+                    Doc::BlankLines(2),
+                    t("b"),
+                ])),
+                width,
+                4,
+            )
+        };
+        // No line is broken to keep one, and the group measures as if it
+        // were not there.
+        assert_eq!(two(80), "a b");
+        assert_eq!(two(3), "a b");
+        assert_eq!(two(2), "a\n\n\nb");
+        // Blank lines that are there already count: `at least`, not `more`.
+        let after_one = |n| {
+            print(
+                &Doc::concat(vec![
+                    t("a"),
+                    Doc::HardLine,
+                    Doc::HardLine,
+                    Doc::BlankLines(n),
+                    t("b"),
+                ]),
+                80,
+                4,
+            )
+        };
+        assert_eq!(after_one(1), "a\n\nb");
+        assert_eq!(after_one(3), "a\n\n\n\nb");
+        // Not at the very start, and the indentation of the line stays.
+        assert_eq!(
+            print(&Doc::concat(vec![Doc::BlankLines(2), t("a")]), 80, 4),
+            "a"
+        );
+        assert_eq!(
+            print(
+                &Doc::indent(Doc::concat(vec![
+                    t("a"),
+                    Doc::HardLine,
+                    Doc::BlankLines(1),
+                    t("b")
+                ])),
+                80,
+                4
+            ),
+            "a\n\n    b"
+        );
     }
 
     #[test]

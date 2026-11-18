@@ -31,25 +31,45 @@
 //! | `keyword_paren_space` | true: `IN (1, 2)` |
 //! | `semicolon` | attached: `ORDER BY n;` |
 //!
-//! No other knob exists: the point of one canonical style is that nobody
-//! has to configure it.
+//! And for houses that already have a style guide, the choices such guides
+//! most often make differently. Every default is the canonical style, so a
+//! project that sets none of them gets exactly what it got before they
+//! existed:
+//!
+//! | knob | default |
+//! |---|---|
+//! | `comma` | trailing: `a,` |
+//! | `logical_operator` | leading: `AND b = 2` starts its line |
+//! | `function_case` | lower: `count(x)` |
+//! | `type_case` | lower: `x::integer` |
+//! | `indent_style` | space |
+//! | `blank_lines_between_statements` | 1 |
+//! | `max_blank_lines_in_statement` | 0: the author's blank lines go |
+//! | `list_layout` | auto: a list that fits stays on one line |
+//! | `case_layout` | auto: a `CASE` that fits stays on one line |
+//!
+//! [`Style`] names a bundle of them. Nobody has to configure any of this:
+//! the point of one canonical style is that it is there when nothing is
+//! set.
 //!
 //! # Specification
 //!
-//! Black/ruff-format posture: one canonical style, near-zero knobs. The
-//! rules live in `lower`; in summary:
+//! Black/ruff-format posture: one canonical style, and knobs only where
+//! established guides disagree with it. The rules live in `lower`; in
+//! summary, for the defaults:
 //!
-//! - **Case:** keywords follow `keyword_case`; function and type names are
-//!   lower; identifiers are never re-cased, because their case is meaning.
+//! - **Case:** keywords follow `keyword_case`; function names follow
+//!   `function_case` and type names `type_case`, both lower by default;
+//!   identifiers are never re-cased, because their case is meaning.
 //! - **Statements:** a statement that fits the threshold stays on one line;
 //!   otherwise every clause (`SELECT`, `FROM`, `WHERE`, `GROUP BY`, `LIMIT`,
 //!   ...) starts a line, flush left within its query level. There is no
 //!   middle ground.
 //! - **Lists:** inline until they do not fit, then one item per line,
-//!   indented one level; commas trail, never lead. A trailing comma the
+//!   indented one level; commas trail. A trailing comma the
 //!   source had is kept in a broken list and dropped in a flat one; one is
 //!   never added.
-//! - **Indentation:** spaces only, `indent_size` per level; brackets and
+//! - **Indentation:** spaces, `indent_size` per level; brackets and
 //!   subqueries indent one level from their opening paren, the closing paren
 //!   returns to the opening line's indent.
 //! - **Expressions:** single spaces around binary operators, none before the
@@ -63,6 +83,24 @@
 //!   CTE; input blank lines are not preserved. Every statement ends with `;`
 //!   and the file with a single newline.
 //! - **Width** is measured in characters, not display columns.
+//!
+//! # Switching the formatter off
+//!
+//! A line comment on a line of its own, `-- grebe: format off` (or
+//! `-- fmt: off`), switches the formatter off up to the next
+//! `-- grebe: format on` (or `-- fmt: on`), or to the end of the file. The
+//! markers are matched whatever their letter case. Everything from the
+//! `off` line to the `on` line, both included, is emitted byte for byte.
+//!
+//! The unit is the statement: a statement any part of which lies in such a
+//! region -- one that holds a marker between its tokens, too -- is left
+//! exactly as written, all of it, from its first token to its `;` and a
+//! `--` comment after that. Laying out half a statement would mean
+//! deciding line breaks around text nobody is allowed to move.
+//!
+//! What is outside is formatted as ever. The blank lines the author left
+//! between a region and the code next to it are kept, up to
+//! `blank_lines_between_statements`.
 //!
 //! # Invariants (tests, not aspirations)
 //!
@@ -91,10 +129,11 @@
 
 pub mod doc;
 mod lower;
+mod verbatim;
 
 /// How keywords are cased. Identifiers are never re-cased; function and type
-/// names are always lower, whatever this says. Upper is the default because
-/// it is DuckDB's own documentation style.
+/// names have [`NameCase`] options of their own and do not follow this.
+/// Upper is the default because it is DuckDB's own documentation style.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum KeywordCase {
     #[default]
@@ -112,6 +151,80 @@ pub enum Semicolon {
     Spaced,
     /// On a line of its own, after the statement.
     Newline,
+}
+
+/// Where the comma of a list that breaks over lines goes. A list on one
+/// line is `a, b` either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Comma {
+    /// At the end of its item's line: `a,` then `b`.
+    #[default]
+    Trailing,
+    /// At the start of the next item's line: `a` then `, b`.
+    Leading,
+}
+
+/// Where `AND` and `OR` go when a condition breaks over lines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LogicalOperator {
+    /// At the start of the line of the operand it joins: `AND b = 2`.
+    #[default]
+    Leading,
+    /// At the end of the line before: `a = 1 AND`.
+    Trailing,
+}
+
+/// How a function name or a type name is cased.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum NameCase {
+    #[default]
+    Lower,
+    Upper,
+    /// As written.
+    Preserve,
+}
+
+/// What an indent level is made of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum IndentStyle {
+    /// `indent_size` spaces.
+    #[default]
+    Space,
+    /// One tab, counted as `indent_size` columns towards the width.
+    Tab,
+}
+
+/// When a select list, a `GROUP BY` list or a query's `ORDER BY` list goes
+/// one item per line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ListLayout {
+    /// When it does not fit on one line.
+    #[default]
+    Auto,
+    /// Whenever it has more than one item.
+    Expanded,
+}
+
+/// When a `CASE` expression goes one arm per line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CaseLayout {
+    /// When it does not fit on one line.
+    #[default]
+    Auto,
+    /// Whenever it has more than one `WHEN`.
+    Expanded,
+}
+
+/// A named bundle of options: see [`Options::for_style`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Style {
+    /// The canonical style: [`Options::default`].
+    #[default]
+    Default,
+    /// In the spirit of the dbt style guide.
+    Dbt,
+    /// In the spirit of Matt Mazur's SQL style guide.
+    Mazur,
 }
 
 /// The whole knob budget.
@@ -136,6 +249,47 @@ pub struct Options {
     /// that read as calls belong to `function_paren_space`, not here.
     pub keyword_paren_space: bool,
     pub semicolon: Semicolon,
+    /// Where the comma goes in a list that breaks: select lists,
+    /// `GROUP BY` and `ORDER BY` lists, column definitions, `VALUES` rows,
+    /// arguments, `IN` lists, CTEs -- every comma list there is. With
+    /// `Leading`, a trailing comma the source had is dropped rather than
+    /// kept, since it has no line to lead, and a line comment after an
+    /// item stays at the end of that item's line, before the line the
+    /// comma starts.
+    pub comma: Comma,
+    /// Where `AND` and `OR` go in a condition that breaks. Other operator
+    /// chains (`||`, `+`) always lead. With `Trailing`, a line comment
+    /// after an operand moves behind the operator that follows it.
+    pub logical_operator: LogicalOperator,
+    /// The case of a function name in a call: a scalar function, an
+    /// aggregate, a window function, a table function, with or without a
+    /// schema in front (the schema is an identifier and keeps its case).
+    /// `x.lower()` is such a call to the grammar, `lower` in schema `x`,
+    /// so its name is covered. Not covered, by any value: quoted names;
+    /// the name of a method called on anything but a name (`f(x).g()`,
+    /// `'a'.upper()`), which the grammar reads as a label; the name a
+    /// macro is created under; and the keyword forms that read as calls
+    /// (`CAST`, `COALESCE`, `EXTRACT`, `TRIM`, `ROW`, ...), which are
+    /// keywords and follow `keyword_case`.
+    pub function_case: NameCase,
+    /// The case of a type, wherever one stands (`CAST(x AS ...)`,
+    /// `x::...`, a column definition): its name, a user-defined one
+    /// included, and the keywords that are part of it (`timestamp with
+    /// time zone`, `struct`, `double precision`). A word that could be a
+    /// type name and stands where a column or table name does is an
+    /// identifier and keeps its case.
+    pub type_case: NameCase,
+    pub indent_style: IndentStyle,
+    /// Blank lines between one statement and the next.
+    pub blank_lines_between_statements: usize,
+    /// How many of the blank lines the author left in a row inside a
+    /// statement are kept. They are kept only where the layout breaks the
+    /// line anyway -- above an item, a clause, a CTE, a comment -- and a
+    /// line is never broken to keep one. A statement's leading comments
+    /// count as inside it, except that nothing is kept above the first.
+    pub max_blank_lines_in_statement: usize,
+    pub list_layout: ListLayout,
+    pub case_layout: CaseLayout,
 }
 
 impl Default for Options {
@@ -147,6 +301,40 @@ impl Default for Options {
             function_paren_space: false,
             keyword_paren_space: true,
             semicolon: Semicolon::Attached,
+            comma: Comma::Trailing,
+            logical_operator: LogicalOperator::Leading,
+            function_case: NameCase::Lower,
+            type_case: NameCase::Lower,
+            indent_style: IndentStyle::Space,
+            blank_lines_between_statements: 1,
+            max_blank_lines_in_statement: 0,
+            list_layout: ListLayout::Auto,
+            case_layout: CaseLayout::Auto,
+        }
+    }
+}
+
+impl Options {
+    /// The options a named style stands for. `Dbt` and `Mazur` are in the
+    /// spirit of those guides, not a claim of conformance: each sets
+    /// exactly `keyword_case` lower, `function_case` lower, `type_case`
+    /// lower, `comma` trailing, `indent_style` space, `indent_size` 4 and
+    /// `list_layout` expanded, and leaves everything else at its default.
+    /// The two are the same bundle today.
+    #[must_use]
+    pub fn for_style(style: Style) -> Self {
+        match style {
+            Style::Default => Self::default(),
+            Style::Dbt | Style::Mazur => Self {
+                keyword_case: KeywordCase::Lower,
+                function_case: NameCase::Lower,
+                type_case: NameCase::Lower,
+                comma: Comma::Trailing,
+                indent_style: IndentStyle::Space,
+                indent_size: 4,
+                list_layout: ListLayout::Expanded,
+                ..Self::default()
+            },
         }
     }
 }
@@ -165,10 +353,20 @@ pub fn format(src: &str, opts: &Options) -> String {
     if let Some(rest) = src.strip_prefix('\u{feff}') {
         return format!("\u{feff}{}", format(rest, opts));
     }
+    match verbatim::regions(src) {
+        Some(regions) => format_around(src, &regions, opts),
+        None => format_code(src, opts),
+    }
+}
+
+/// [`format`] for a file, or a stretch of one, in which the formatter is
+/// not switched off anywhere.
+fn format_code(src: &str, opts: &Options) -> String {
     if let Some(whole) = lower::format_statements(src, opts) {
         return finish(whole.text);
     }
     let spans = grebe_syntax::token::split_statements(src);
+    let toks = grebe_syntax::token::tokenize(src);
     let mut pieces: Vec<String> = Vec::new();
     let mut cursor = 0usize;
     // A piece that holds no statement -- a bare `;` with comments around it
@@ -176,12 +374,17 @@ pub fn format(src: &str, opts: &Options) -> String {
     // comments land where the whole-file path (and re-formatting the output)
     // would put them: leading the statement that follows.
     let mut carry = 0usize;
+    // The stretch of source the last piece was copied from, when it was a
+    // statement that does not parse. Another one begun on the same line is
+    // joined to it as written: what the matcher cannot read is not text
+    // this function understands well enough to break a line of.
+    let mut raw_run: Option<(usize, usize)> = None;
     for sp in &spans {
         // A piece runs from the end of the previous one to the end of this
         // statement's line: the trivia before it, so its leading comments
-        // format with it, and the rest of the `;` line, so a comment
-        // trailing the terminator stays with the statement it trails.
-        let end = end_of_line(src, sp.end as usize);
+        // format with it, and what trails the `;` on its line, so a comment
+        // there stays with the statement it trails.
+        let end = piece_end(src, &toks, sp.end as usize);
         let piece = &src[carry..end];
         cursor = end;
         match lower::format_statements(piece, opts) {
@@ -192,13 +395,23 @@ pub fn format(src: &str, opts: &Options) -> String {
                 if !formatted.text.is_empty() {
                     pieces.push(formatted.text);
                 }
+                raw_run = None;
             }
-            None => {
-                let raw = piece.trim();
-                if !raw.is_empty() {
-                    pieces.push(raw.to_string());
+            None => match raw_run {
+                Some((from, to)) if to == carry && !src[..to].ends_with('\n') => {
+                    if let Some(last) = pieces.last_mut() {
+                        *last = src[from..end].trim().to_string();
+                    }
+                    raw_run = Some((from, end));
                 }
-            }
+                _ => {
+                    let raw = piece.trim();
+                    if !raw.is_empty() {
+                        pieces.push(raw.to_string());
+                        raw_run = Some((carry, end));
+                    }
+                }
+            },
         }
         carry = end;
     }
@@ -217,13 +430,82 @@ pub fn format(src: &str, opts: &Options) -> String {
     if !tail.is_empty() {
         pieces.push(tail.to_string());
     }
-    finish(pieces.join("\n\n"))
+    finish(pieces.join(&"\n".repeat(opts.blank_lines_between_statements + 1)))
+}
+
+/// A file with regions the formatter is switched off for: the stretches
+/// between them formatted, each on its own, and the regions as written.
+///
+/// A region is whole lines, or starts or ends where a statement does, so
+/// the stretches around it are whole statements and their comments. The
+/// blank lines between a region and its neighbours are the author's, up to
+/// the number that separates statements.
+fn format_around(src: &str, regions: &[(usize, usize)], opts: &Options) -> String {
+    let newlines = |s: &str| s.bytes().filter(|b| *b == b'\n').count();
+    let keep = |blank: usize| "\n".repeat(blank.min(opts.blank_lines_between_statements));
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0usize;
+    // The stretch before a region, or after the last one.
+    let code = |out: &mut String, text: &str, region_follows: bool| {
+        let body = text.trim();
+        if body.is_empty() {
+            if !out.is_empty() && region_follows {
+                out.push_str(&keep(newlines(text)));
+            }
+            return;
+        }
+        let formatted = format_code(text, opts);
+        if formatted.is_empty() {
+            return; // nothing but a bare `;`
+        }
+        if !out.is_empty() {
+            let lead = &text[..text.len() - text.trim_start().len()];
+            out.push_str(&keep(newlines(lead)));
+        }
+        out.push_str(&formatted);
+        if region_follows {
+            let trail = &text[text.trim_end().len()..];
+            out.push_str(&keep(newlines(trail).saturating_sub(1)));
+        }
+    };
+    for &(start, end) in regions {
+        code(&mut out, &src[cursor..start], true);
+        out.push_str(&src[start..end]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        // A region that ends with its line ends before the line break.
+        cursor = end + usize::from(src[end..].starts_with('\n'));
+    }
+    code(&mut out, &src[cursor..], false);
+    out
 }
 
 /// The offset just past the newline that ends the line containing `at`, or
 /// the end of the buffer.
-fn end_of_line(src: &str, at: usize) -> usize {
-    src[at..].find('\n').map_or(src.len(), |i| at + i + 1)
+/// Where the piece of a statement that ends at `at` ends: after the
+/// comments that trail its `;` and the line break behind them. It stops
+/// short of another statement begun on the same line, and takes a comment
+/// that starts on the line whole. (Cutting at the end of the line instead
+/// split such a statement, or a comment or string that ran over the line
+/// break, in two; an unparseable half was then trimmed and re-joined, which
+/// changed the text inside a string.)
+fn piece_end(src: &str, toks: &[grebe_syntax::token::Token], at: usize) -> usize {
+    use grebe_syntax::token::TokenKind;
+    let first = toks.partition_point(|t| (t.span.start as usize) < at);
+    let mut end = at;
+    for t in &toks[first..] {
+        let (from, to) = (t.span.start as usize, t.span.end as usize);
+        match t.kind {
+            TokenKind::Whitespace => match src[from..to].find('\n') {
+                Some(i) => return from + i + 1,
+                None => end = to,
+            },
+            TokenKind::LineComment | TokenKind::BlockComment => end = to,
+            _ => return end,
+        }
+    }
+    end
 }
 
 fn finish(mut s: String) -> String {
@@ -700,6 +982,7 @@ mod tests {
                                 function_paren_space,
                                 keyword_paren_space,
                                 semicolon,
+                                ..Options::default()
                             };
                             for sql in sources {
                                 let once = format(sql, &opts);
@@ -842,6 +1125,36 @@ mod tests {
     }
 
     #[test]
+    fn fallback_never_cuts_a_statement_begun_on_the_line_of_another() {
+        let o = Options::default();
+        // The second statement does not parse and starts on the first's
+        // line; its string runs over the line break and must come out as
+        // written, not trimmed and re-joined.
+        let src = "SELEC 1 FRM; ALSO NOT 'a\n   b' SQL;\nselect 1;\n";
+        assert_eq!(
+            format(src, &o),
+            "SELEC 1 FRM; ALSO NOT 'a\n   b' SQL;\n\nSELECT 1;\n"
+        );
+        assert_eq!(format(&format(src, &o), &o), format(src, &o));
+        // A comment that starts on the `;` line and runs on stays whole
+        // and stays with its statement.
+        let src = "SELEC 1 FRM; /* one\n   two */\nselect 1;\n";
+        assert_eq!(
+            format(src, &o),
+            "SELEC 1 FRM; /* one\n   two */\n\nSELECT 1;\n"
+        );
+        // A good statement begun on a bad one's line is still formatted.
+        let src = "SELEC 1 FRM; select 'a\n   b';\n";
+        assert_eq!(format(src, &o), "SELEC 1 FRM;\n\nSELECT 'a\n   b';\n");
+        // Bad statements on lines of their own are set apart as before.
+        let src = "SELEC 1 FRM;\nSELEC 2 FRM;\n";
+        assert_eq!(format(src, &o), "SELEC 1 FRM;\n\nSELEC 2 FRM;\n");
+        // Two good statements on one line beside a bad one.
+        let src = "select 1; select 2;\nSELEC 1 FRM;\n";
+        assert_eq!(format(src, &o), "SELECT 1;\n\nSELECT 2;\n\nSELEC 1 FRM;\n");
+    }
+
+    #[test]
     fn fallback_carries_a_bare_semicolon_into_the_next_statement() {
         // The `> junk` line forces the per-statement path; the bare `;`
         // after the block comment must not become its own piece.
@@ -962,5 +1275,763 @@ mod tests {
             assert_eq!(once, want, "{src:?}");
             assert_eq!(f(&once), once, "second run moved something: {src:?}");
         }
+    }
+
+    // ----- the style options -------------------------------------------------
+
+    /// The options with one or more of them changed.
+    fn opts(change: impl FnOnce(&mut Options)) -> Options {
+        let mut o = Options::default();
+        change(&mut o);
+        o
+    }
+
+    /// Formats, and checks on the way that a second run changes nothing.
+    fn fmt(sql: &str, o: &Options) -> String {
+        let once = format(sql, o);
+        assert_eq!(format(&once, o), once, "not idempotent: {sql:?}\n{o:?}");
+        once
+    }
+
+    #[test]
+    fn the_defaults_are_the_canonical_style() {
+        let o = Options::default();
+        assert_eq!(o.comma, Comma::Trailing);
+        assert_eq!(o.logical_operator, LogicalOperator::Leading);
+        assert_eq!(o.function_case, NameCase::Lower);
+        assert_eq!(o.type_case, NameCase::Lower);
+        assert_eq!(o.indent_style, IndentStyle::Space);
+        assert_eq!(o.blank_lines_between_statements, 1);
+        assert_eq!(o.max_blank_lines_in_statement, 0);
+        assert_eq!(o.list_layout, ListLayout::Auto);
+        assert_eq!(o.case_layout, CaseLayout::Auto);
+        assert_eq!(Options::for_style(Style::Default), o);
+    }
+
+    #[test]
+    fn leading_commas_start_the_next_line_in_every_list_that_breaks() {
+        let o = opts(|o| {
+            o.comma = Comma::Leading;
+            o.inline_threshold = 30;
+        });
+        // A list on one line is the same either way.
+        assert_eq!(
+            fmt("select a, b from t where x in (1, 2)", &o),
+            "SELECT a, b\nFROM t\nWHERE x IN (1, 2);\n"
+        );
+        assert_eq!(
+            fmt(
+                "select alpha_column, beta_column, gamma_column from t group by alpha_column, beta_column, gamma_column order by alpha_column, beta_column, gamma_column",
+                &o
+            ),
+            "SELECT\n    alpha_column\n    , beta_column\n    , gamma_column\nFROM t\nGROUP BY\n    alpha_column\n    , beta_column\n    , gamma_column\nORDER BY\n    alpha_column\n    , beta_column\n    , gamma_column;\n"
+        );
+        assert_eq!(
+            fmt(
+                "create table t (id integer primary key, name varchar not null)",
+                &o
+            ),
+            "CREATE TABLE t (\n    id integer PRIMARY KEY\n    , name varchar NOT NULL\n);\n"
+        );
+        assert_eq!(
+            fmt(
+                "insert into t values (1, 'one'), (2, 'two'), (3, 'three')",
+                &o
+            ),
+            "INSERT INTO t\nVALUES\n    (1, 'one')\n    , (2, 'two')\n    , (3, 'three');\n"
+        );
+        assert_eq!(
+            fmt(
+                "select coalesce(alpha_column, beta_column, gamma_column) from t where x in ('alpha', 'beta', 'gamma', 'delta')",
+                &o
+            ),
+            "SELECT\n    COALESCE(\n        alpha_column\n        , beta_column\n        , gamma_column\n    )\nFROM t\nWHERE x IN (\n    'alpha'\n    , 'beta'\n    , 'gamma'\n    , 'delta'\n);\n"
+        );
+        assert_eq!(
+            fmt(
+                "with a as (select 1 as x from t), b as (select x from a) select * from b",
+                &o
+            ),
+            "WITH a AS (\n    SELECT 1 AS x\n    FROM t\n)\n, b AS (\n    SELECT x\n    FROM a\n)\n\nSELECT *\nFROM b;\n"
+        );
+    }
+
+    /// A list of leading commas has no place for a trailing one, so a
+    /// trailing comma the source had goes; the comma that makes a tuple
+    /// stays.
+    #[test]
+    fn leading_commas_drop_a_trailing_comma_and_keep_a_tuples() {
+        let o = opts(|o| {
+            o.comma = Comma::Leading;
+            o.inline_threshold = 30;
+        });
+        assert_eq!(
+            fmt("select alpha_column, beta_column, gamma_column, from t", &o),
+            "SELECT\n    alpha_column\n    , beta_column\n    , gamma_column\nFROM t;\n"
+        );
+        assert_eq!(
+            fmt("select (42,), (1, 2,), f(1,)", &o),
+            "SELECT (42,), (1, 2), f(1);\n"
+        );
+    }
+
+    /// The comma never ends up inside a line comment: a comment after an
+    /// item, or after its comma, ends the item's line, and the comma starts
+    /// the next one. Comments on lines of their own stay above the comma;
+    /// a block comment between the comma and the item stays there.
+    #[test]
+    fn a_leading_comma_goes_around_the_comments_between_two_items() {
+        let o = opts(|o| o.comma = Comma::Leading);
+        for (src, want) in [
+            (
+                "select a, -- first\n b from t",
+                "SELECT\n    a -- first\n    , b\nFROM t;\n",
+            ),
+            (
+                "select a -- first\n , b from t",
+                "SELECT\n    a -- first\n    , b\nFROM t;\n",
+            ),
+            (
+                "select a,\n -- about b\n b from t",
+                "SELECT\n    a\n    -- about b\n    , b\nFROM t;\n",
+            ),
+            (
+                "select a\n -- about b\n , b from t",
+                "SELECT\n    a\n    -- about b\n    , b\nFROM t;\n",
+            ),
+            (
+                "select a, /* about b */ b from t",
+                "SELECT a, /* about b */ b FROM t;\n",
+            ),
+            (
+                "select a /* about a */, b from t",
+                "SELECT a /* about a */, b FROM t;\n",
+            ),
+            (
+                "select a, -- first\n /* x */ b, c -- last\n from t",
+                "SELECT\n    a -- first\n    , /* x */ b\n    , c -- last\nFROM t;\n",
+            ),
+            (
+                "select a, -- first\n /* x */\n -- y\n /* z */ b from t",
+                "SELECT\n    a -- first\n    /* x */\n    -- y\n    , /* z */ b\nFROM t;\n",
+            ),
+            (
+                "with a as (select 1), -- first\n b as (select 2) select 3",
+                "WITH a AS (\n    SELECT 1\n) -- first\n, b AS (\n    SELECT 2\n)\n\nSELECT 3;\n",
+            ),
+        ] {
+            assert_eq!(fmt(src, &o), want, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn trailing_logical_operators_end_the_line_they_join() {
+        let o = opts(|o| {
+            o.logical_operator = LogicalOperator::Trailing;
+            o.inline_threshold = 30;
+        });
+        assert_eq!(
+            fmt(
+                "select * from t where alpha = 1 and beta = 2 and gamma = 3",
+                &o
+            ),
+            "SELECT *\nFROM t\nWHERE alpha = 1 AND\n    beta = 2 AND\n    gamma = 3;\n"
+        );
+        assert_eq!(
+            fmt(
+                "select * from t where alpha = 1 or (beta = 2 and gamma_column = 3 and delta = 4)",
+                &o
+            ),
+            "SELECT *\nFROM t\nWHERE alpha = 1 OR\n    (\n        beta = 2 AND\n            gamma_column = 3 AND\n            delta = 4\n    );\n"
+        );
+        // One that fits is the same either way, and other operators lead
+        // as ever.
+        assert_eq!(
+            fmt("select 1 where a and b", &o),
+            "SELECT 1 WHERE a AND b;\n"
+        );
+        assert_eq!(
+            fmt("select 'aaaa' || 'bbbb' || 'cccc' || 'dddd' from t", &o),
+            "SELECT\n    'aaaa'\n        || 'bbbb'\n        || 'cccc'\n        || 'dddd'\nFROM t;\n"
+        );
+        // A join condition too.
+        assert_eq!(
+            fmt(
+                "select * from a join b on a.alpha = b.alpha and a.beta = b.beta",
+                &o
+            ),
+            "SELECT *\nFROM a\nJOIN b\n    ON a.alpha = b.alpha AND\n        a.beta = b.beta;\n"
+        );
+    }
+
+    /// A line comment after an operand would swallow the operator that
+    /// comes after it: it moves behind the operator.
+    #[test]
+    fn a_trailing_logical_operator_goes_before_the_operands_line_comment() {
+        let o = opts(|o| o.logical_operator = LogicalOperator::Trailing);
+        for (src, want) in [
+            (
+                "select 1 where a = 1 -- first\n and b = 2 -- second\n and c = 3",
+                "SELECT 1\nWHERE a = 1 AND -- first\n    b = 2 AND -- second\n    c = 3;\n",
+            ),
+            (
+                "select 1 where a = 1 and -- first\n b = 2",
+                "SELECT 1\nWHERE a = 1 AND -- first\n    b = 2;\n",
+            ),
+            (
+                "select 1 where a = 1\n -- about b\n and b = 2",
+                "SELECT 1\nWHERE a = 1\n    -- about b\n    AND\n    b = 2;\n",
+            ),
+            (
+                "select 1 where (a = 1 -- inner\n or b = 2) -- outer\n and c = 3",
+                "SELECT 1\nWHERE (\n    a = 1 OR -- inner\n        b = 2\n) AND -- outer\n    c = 3;\n",
+            ),
+        ] {
+            assert_eq!(fmt(src, &o), want, "{src:?}");
+        }
+        // The default leaves the comment where it was.
+        assert_eq!(
+            fmt(
+                "select 1 where a = 1 -- first\n and b = 2",
+                &Options::default()
+            ),
+            "SELECT 1\nWHERE a = 1 -- first\n    AND b = 2;\n"
+        );
+    }
+
+    const NAMES: &str = "Select Count(*), Main.My_Func(X), x.Lower(), F(x).Upper(), Coalesce(a, B), Cast(x As Integer), y::VarChar, z::My_Type, d::Timestamp With Time Zone, Date, \"Count\"(1), Date '2020-01-01' From Read_CSV('f.csv') T Where Sum = 1";
+
+    #[test]
+    fn function_case_covers_function_names_and_nothing_else() {
+        let wide = |o: &mut Options| o.inline_threshold = 400;
+        // Lower is the default and what the formatter always did.
+        assert_eq!(
+            fmt(NAMES, &opts(wide)),
+            "SELECT count(*), Main.my_func(X), x.lower(), f(x).Upper(), COALESCE(a, B), CAST(x AS integer), y::varchar, z::my_type, d::timestamp with time zone, Date, \"Count\"(1), date '2020-01-01' FROM read_csv('f.csv') T WHERE Sum = 1;\n"
+        );
+        // Upper: the names of calls, but not the keyword forms (which
+        // follow `keyword_case`), not a quoted name, not a schema, not a
+        // column called like a function, and no type.
+        assert_eq!(
+            fmt(
+                NAMES,
+                &opts(|o| {
+                    wide(o);
+                    o.function_case = NameCase::Upper;
+                    o.keyword_case = KeywordCase::Lower;
+                })
+            ),
+            "select COUNT(*), Main.MY_FUNC(X), x.LOWER(), F(x).Upper(), coalesce(a, B), cast(x as integer), y::varchar, z::my_type, d::timestamp with time zone, Date, \"Count\"(1), date '2020-01-01' from READ_CSV('f.csv') T where Sum = 1;\n"
+        );
+        assert_eq!(
+            fmt(
+                NAMES,
+                &opts(|o| {
+                    wide(o);
+                    o.function_case = NameCase::Preserve;
+                })
+            ),
+            "SELECT Count(*), Main.My_Func(X), x.Lower(), F(x).Upper(), COALESCE(a, B), CAST(x AS integer), y::varchar, z::my_type, d::timestamp with time zone, Date, \"Count\"(1), date '2020-01-01' FROM Read_CSV('f.csv') T WHERE Sum = 1;\n"
+        );
+    }
+
+    #[test]
+    fn type_case_covers_types_and_nothing_else() {
+        let wide = |o: &mut Options| o.inline_threshold = 400;
+        // Upper: type names and the keywords of a type, whatever
+        // `keyword_case` says; a column called like a type is a column.
+        assert_eq!(
+            fmt(
+                NAMES,
+                &opts(|o| {
+                    wide(o);
+                    o.type_case = NameCase::Upper;
+                    o.keyword_case = KeywordCase::Lower;
+                })
+            ),
+            "select count(*), Main.my_func(X), x.lower(), f(x).Upper(), coalesce(a, B), cast(x as INTEGER), y::VARCHAR, z::MY_TYPE, d::TIMESTAMP WITH TIME ZONE, Date, \"Count\"(1), DATE '2020-01-01' from read_csv('f.csv') T where Sum = 1;\n"
+        );
+        assert_eq!(
+            fmt(
+                NAMES,
+                &opts(|o| {
+                    wide(o);
+                    o.type_case = NameCase::Preserve;
+                })
+            ),
+            "SELECT count(*), Main.my_func(X), x.lower(), f(x).Upper(), COALESCE(a, B), CAST(x AS Integer), y::VarChar, z::My_Type, d::Timestamp With Time Zone, Date, \"Count\"(1), Date '2020-01-01' FROM read_csv('f.csv') T WHERE Sum = 1;\n"
+        );
+        // Column definitions, nested types and their field names.
+        let ddl = "create table T (Id Integer primary key, Amount Decimal(18, 2), Tags VarChar[], S Struct(A Int, B Map(VarChar, Double Precision)))";
+        assert_eq!(
+            fmt(
+                ddl,
+                &opts(|o| {
+                    wide(o);
+                    o.type_case = NameCase::Upper;
+                })
+            ),
+            "CREATE TABLE T (Id INTEGER PRIMARY KEY, Amount DECIMAL(18, 2), Tags VARCHAR[], S STRUCT(A INT, B MAP(VARCHAR, DOUBLE PRECISION)));\n"
+        );
+        assert_eq!(
+            fmt(ddl, &opts(wide)),
+            "CREATE TABLE T (Id integer PRIMARY KEY, Amount decimal(18, 2), Tags varchar[], S struct(A int, B map(varchar, double precision)));\n"
+        );
+    }
+
+    #[test]
+    fn tabs_indent_one_per_level_and_count_as_indent_size_columns() {
+        let sql = "select alpha_column, beta_column from t where x in (select y from u where zeta > 1 and omega > 2)";
+        let o = opts(|o| {
+            o.indent_style = IndentStyle::Tab;
+            o.inline_threshold = 30;
+        });
+        let tabs = fmt(sql, &o);
+        assert_eq!(
+            tabs,
+            "SELECT\n\talpha_column,\n\tbeta_column\nFROM t\nWHERE x IN (\n\tSELECT y\n\tFROM u\n\tWHERE zeta > 1\n\t\tAND omega > 2\n);\n"
+        );
+        // The same lines as with spaces, at every indent size: a tab is as
+        // wide as the indent it stands for.
+        for indent_size in [2, 4, 8] {
+            for inline_threshold in [20, 30, 40, 60] {
+                let spaces = opts(|o| {
+                    o.indent_size = indent_size;
+                    o.inline_threshold = inline_threshold;
+                });
+                let tabs = Options {
+                    indent_style: IndentStyle::Tab,
+                    ..spaces.clone()
+                };
+                assert_eq!(
+                    fmt(sql, &tabs).replace('\t', &" ".repeat(indent_size)),
+                    fmt(sql, &spaces),
+                    "{indent_size} {inline_threshold}"
+                );
+            }
+        }
+        // No tab is left on a blank line.
+        let o = opts(|o| {
+            o.indent_style = IndentStyle::Tab;
+            o.inline_threshold = 20;
+        });
+        assert_eq!(
+            fmt("select (with a as (select 1) select * from a)", &o),
+            "SELECT\n\t(\n\t\tWITH a AS (\n\t\t\tSELECT 1\n\t\t)\n\n\t\tSELECT *\n\t\tFROM a\n\t);\n"
+        );
+    }
+
+    #[test]
+    fn statements_are_separated_by_as_many_blank_lines_as_asked() {
+        let sql = "select 1;\n\n\n\n-- two\nselect 2; select 3";
+        for (n, want) in [
+            (0, "SELECT 1;\n-- two\nSELECT 2;\nSELECT 3;\n"),
+            (1, "SELECT 1;\n\n-- two\nSELECT 2;\n\nSELECT 3;\n"),
+            (2, "SELECT 1;\n\n\n-- two\nSELECT 2;\n\n\nSELECT 3;\n"),
+        ] {
+            let o = opts(|o| o.blank_lines_between_statements = n);
+            assert_eq!(fmt(sql, &o), want, "{n}");
+        }
+        // The path a file with an unparseable statement takes agrees.
+        let sql = "select 1;\nTHIS IS NOT SQL;\nselect 2";
+        for (n, want) in [
+            (0, "SELECT 1;\nTHIS IS NOT SQL;\nSELECT 2;\n"),
+            (2, "SELECT 1;\n\n\nTHIS IS NOT SQL;\n\n\nSELECT 2;\n"),
+        ] {
+            let o = opts(|o| o.blank_lines_between_statements = n);
+            assert_eq!(fmt(sql, &o), want, "{n}");
+        }
+    }
+
+    const SPACED_OUT: &str = "-- header\n\nwith a as (select 1 as x from t),\n\n\n\nb as (select x from a)\n\nselect alpha_column,\n\n  -- about beta\n\n  beta_column,\n  gamma_column\n\nfrom b\n\n\nwhere x_column = 1\n\n  and y_column = 2;\n\n\n\nselect a,\n\n b from t;\n";
+
+    #[test]
+    fn blank_lines_in_a_statement_are_dropped_by_default() {
+        assert_eq!(
+            fmt(SPACED_OUT, &opts(|o| o.inline_threshold = 30)),
+            "-- header\nWITH a AS (\n    SELECT 1 AS x\n    FROM t\n),\nb AS (\n    SELECT x\n    FROM a\n)\n\nSELECT\n    alpha_column,\n    -- about beta\n    beta_column,\n    gamma_column\nFROM b\nWHERE x_column = 1\n    AND y_column = 2;\n\nSELECT a, b FROM t;\n"
+        );
+    }
+
+    /// Kept where a line breaks anyway, up to the number asked for, and
+    /// never a reason to break one: the last statement fits on a line and
+    /// stays on it.
+    #[test]
+    fn blank_lines_in_a_statement_are_kept_where_the_layout_breaks() {
+        let o = opts(|o| {
+            o.inline_threshold = 30;
+            o.max_blank_lines_in_statement = 1;
+        });
+        assert_eq!(
+            fmt(SPACED_OUT, &o),
+            "-- header\n\nWITH a AS (\n    SELECT 1 AS x\n    FROM t\n),\n\nb AS (\n    SELECT x\n    FROM a\n)\n\nSELECT\n    alpha_column,\n\n    -- about beta\n\n    beta_column,\n    gamma_column\n\nFROM b\n\nWHERE x_column = 1\n\n    AND y_column = 2;\n\nSELECT a, b FROM t;\n"
+        );
+        let o = opts(|o| {
+            o.inline_threshold = 30;
+            o.max_blank_lines_in_statement = 2;
+        });
+        assert_eq!(
+            fmt(SPACED_OUT, &o),
+            "-- header\n\nWITH a AS (\n    SELECT 1 AS x\n    FROM t\n),\n\n\nb AS (\n    SELECT x\n    FROM a\n)\n\nSELECT\n    alpha_column,\n\n    -- about beta\n\n    beta_column,\n    gamma_column\n\nFROM b\n\n\nWHERE x_column = 1\n\n    AND y_column = 2;\n\nSELECT a, b FROM t;\n"
+        );
+        // The blank line the layout puts after the CTEs is not doubled, and
+        // the space between statements is not the statement's to keep.
+        let o = opts(|o| {
+            o.inline_threshold = 20;
+            o.max_blank_lines_in_statement = 3;
+            o.blank_lines_between_statements = 0;
+        });
+        assert_eq!(
+            fmt(
+                "select 1;\n\n\n\nwith a as (select 1)\n\nselect * from a;\n\n\n-- next\n\nselect 2",
+                &o
+            ),
+            "SELECT 1;\nWITH a AS (\n    SELECT 1\n)\n\nSELECT *\nFROM a;\n-- next\n\nSELECT 2;\n"
+        );
+    }
+
+    /// A blank line stays with the item it stood above when the comma or
+    /// the operator moves to the other end of the line.
+    #[test]
+    fn kept_blank_lines_follow_the_item_across_comma_and_operator_styles() {
+        let trailing =
+            "select\n    alpha_column,\n\n    beta_column\nfrom t\nwhere x = 1 and\n\n    y = 2";
+        let leading =
+            "select\n    alpha_column\n\n    , beta_column\nfrom t\nwhere x = 1\n\n    and y = 2";
+        let keep = |o: &mut Options| {
+            o.max_blank_lines_in_statement = 1;
+            o.inline_threshold = 20;
+        };
+        let default =
+            "SELECT\n    alpha_column,\n\n    beta_column\nFROM t\nWHERE x = 1\n\n    AND y = 2;\n";
+        let other = "SELECT\n    alpha_column\n\n    , beta_column\nFROM t\nWHERE x = 1 AND\n\n    y = 2;\n";
+        for src in [trailing, leading] {
+            assert_eq!(fmt(src, &opts(keep)), default, "{src:?}");
+            let o = opts(|o| {
+                keep(o);
+                o.comma = Comma::Leading;
+                o.logical_operator = LogicalOperator::Trailing;
+            });
+            assert_eq!(fmt(src, &o), other, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn expanded_lists_go_one_item_per_line_even_when_they_fit() {
+        let o = opts(|o| o.list_layout = ListLayout::Expanded);
+        assert_eq!(
+            fmt(
+                "select a, b from t where x = 1 group by a, b order by a, b limit 5",
+                &o
+            ),
+            "SELECT\n    a,\n    b\nFROM t\nWHERE x = 1\nGROUP BY\n    a,\n    b\nORDER BY\n    a,\n    b\nLIMIT 5;\n"
+        );
+        // One item is not a list, and neither is `GROUP BY ALL` or the
+        // arguments of `ROLLUP`.
+        assert_eq!(
+            fmt("select a from t group by all order by 1", &o),
+            "SELECT a FROM t GROUP BY ALL ORDER BY 1;\n"
+        );
+        assert_eq!(
+            fmt("select a from t group by rollup (a, b)", &o),
+            "SELECT a FROM t GROUP BY ROLLUP(a, b);\n"
+        );
+        // Other lists are left to fit: arguments, `IN`, `VALUES`, a window's
+        // or an aggregate's `ORDER BY`.
+        assert_eq!(
+            fmt(
+                "select f(a, b), sum(x order by a, b), rank() over (partition by a, b order by c, d) from t where x in (1, 2)",
+                &o
+            ),
+            "SELECT\n    f(a, b),\n    sum(x ORDER BY a, b),\n    rank() OVER (PARTITION BY a, b ORDER BY c, d)\nFROM t\nWHERE x IN (1, 2);\n"
+        );
+        assert_eq!(
+            fmt("insert into t values (1, 2), (3, 4)", &o),
+            "INSERT INTO t VALUES (1, 2), (3, 4);\n"
+        );
+        // A subquery with a list of its own expands, and what holds it
+        // breaks with it.
+        assert_eq!(
+            fmt("select a from (select a, b from t) s", &o),
+            "SELECT a\nFROM (\n    SELECT\n        a,\n        b\n    FROM t\n) s;\n"
+        );
+        // A trailing comma is kept, as in any list that is broken.
+        assert_eq!(
+            fmt("select a, b, from t", &o),
+            "SELECT\n    a,\n    b,\nFROM t;\n"
+        );
+        assert_eq!(fmt("select a, from t", &o), "SELECT a FROM t;\n");
+    }
+
+    #[test]
+    fn expanded_case_goes_one_arm_per_line_even_when_it_fits() {
+        let o = opts(|o| o.case_layout = CaseLayout::Expanded);
+        assert_eq!(
+            fmt(
+                "select case when a = 1 then 'one' when a = 2 then 'two' else 'many' end as n from t",
+                &o
+            ),
+            "SELECT\n    CASE\n        WHEN a = 1 THEN 'one'\n        WHEN a = 2 THEN 'two'\n        ELSE 'many'\n    END AS n\nFROM t;\n"
+        );
+        assert_eq!(
+            fmt("select case x when 1 then 'a' when 2 then 'b' end", &o),
+            "SELECT\n    CASE x\n        WHEN 1 THEN 'a'\n        WHEN 2 THEN 'b'\n    END;\n"
+        );
+        // One `WHEN` is left to fit, `ELSE` or not.
+        assert_eq!(
+            fmt("select case when a then 1 else 2 end from t", &o),
+            "SELECT CASE WHEN a THEN 1 ELSE 2 END FROM t;\n"
+        );
+    }
+
+    #[test]
+    fn the_named_styles_are_the_bundles_they_are_documented_to_be() {
+        for style in [Style::Dbt, Style::Mazur] {
+            let o = Options::for_style(style);
+            let want = Options {
+                keyword_case: KeywordCase::Lower,
+                function_case: NameCase::Lower,
+                type_case: NameCase::Lower,
+                comma: Comma::Trailing,
+                indent_style: IndentStyle::Space,
+                indent_size: 4,
+                list_layout: ListLayout::Expanded,
+                ..Options::default()
+            };
+            assert_eq!(o, want, "{style:?}");
+            assert_eq!(
+                fmt(
+                    "SELECT Customer_Id, COUNT(*) AS N, CAST(Total AS DECIMAL(18, 2)) FROM Orders WHERE Status = 'open' AND Total > 0 GROUP BY 1, 3 ORDER BY N DESC",
+                    &o
+                ),
+                "select\n    Customer_Id,\n    count(*) as N,\n    cast(Total as decimal(18, 2))\nfrom Orders\nwhere Status = 'open' and Total > 0\ngroup by\n    1,\n    3\norder by N desc;\n",
+                "{style:?}"
+            );
+        }
+        // An option set next to a style overrides it: that is the caller's
+        // to do, and nothing in a style stops it.
+        let o = Options {
+            comma: Comma::Leading,
+            ..Options::for_style(Style::Dbt)
+        };
+        assert_eq!(
+            fmt("SELECT a, b FROM t", &o),
+            "select\n    a\n    , b\nfrom t;\n"
+        );
+    }
+
+    // ----- switching the formatter off -----------------------------------------
+
+    #[test]
+    fn a_region_between_off_and_on_is_emitted_as_written() {
+        let sql = "select   1;\n-- grebe: format off\nselect   a,b\n   from t ;  -- as is\n\n\nNOT   SQL (;\n-- grebe: format on\nselect   2;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1;\n-- grebe: format off\nselect   a,b\n   from t ;  -- as is\n\n\nNOT   SQL (;\n-- grebe: format on\nSELECT 2;\n"
+        );
+        // The other spelling, any letter case, indented, trailing space.
+        let sql = "select   1;\n\n  -- FMT: Off\n\tselect   2 ;\n  -- fmt:on  \n\nselect   3;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1;\n\n  -- FMT: Off\n\tselect   2 ;\n  -- fmt:on  \n\nSELECT 3;\n"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_off_runs_to_the_end_of_the_file() {
+        let sql = "select   1;\n-- fmt: off\nselect   2 ;\n\n  select 3  \n\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1;\n-- fmt: off\nselect   2 ;\n\n  select 3  \n\n"
+        );
+        // A file that does not end with a line break gets one.
+        assert_eq!(
+            fmt("-- fmt: off\nselect   2 ;", &Options::default()),
+            "-- fmt: off\nselect   2 ;\n"
+        );
+        // An `on` with no `off` before it is a comment like any other.
+        assert_eq!(
+            fmt("-- fmt: on\nselect   1", &Options::default()),
+            "-- fmt: on\nSELECT 1;\n"
+        );
+    }
+
+    /// The statement is the unit: one that holds a marker, or reaches into
+    /// a region from either side, is left as written from its first token
+    /// to its terminator, and its neighbours are formatted.
+    #[test]
+    fn a_statement_that_reaches_into_a_region_is_left_whole() {
+        let sql = "select   1;\nselect a,\n-- fmt: off\n   b,   c\n-- fmt: on\n  from   t;  -- kept\nselect   2;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1;\nselect a,\n-- fmt: off\n   b,   c\n-- fmt: on\n  from   t;  -- kept\nSELECT 2;\n"
+        );
+        // Only the `off` inside it.
+        let sql = "select   1;\n\n  select a,\n-- fmt: off\n   b from t;\nselect   2;\n-- fmt: on\nselect   3;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1;\n\n  select a,\n-- fmt: off\n   b from t;\nselect   2;\n-- fmt: on\nSELECT 3;\n"
+        );
+        // Only the `on` inside it, and code on the lines it shares.
+        let sql = "select   1; select a,\n-- fmt: off\n   b\n-- fmt: on\n  from t; select   2;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1;\nselect a,\n-- fmt: off\n   b\n-- fmt: on\n  from t;\nSELECT 2;\n"
+        );
+    }
+
+    /// What is around a region is formatted with the options in force, and
+    /// keeps the blank lines the author left next to the region, up to the
+    /// number that separates statements.
+    #[test]
+    fn the_code_around_a_region_is_formatted_as_ever() {
+        let sql = "select   a, b from t;\n\n\n\n-- fmt: off\nselect   2 ;\n-- fmt: on\n\n\n\nselect   3;\n-- fmt: off\nselect   4 ;\n-- fmt: on\nselect   5;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT a, b FROM t;\n\n-- fmt: off\nselect   2 ;\n-- fmt: on\n\nSELECT 3;\n-- fmt: off\nselect   4 ;\n-- fmt: on\nSELECT 5;\n"
+        );
+        let o = opts(|o| {
+            o.keyword_case = KeywordCase::Lower;
+            o.blank_lines_between_statements = 0;
+            o.list_layout = ListLayout::Expanded;
+        });
+        assert_eq!(
+            fmt(sql, &o),
+            "select\n    a,\n    b\nfrom t;\n-- fmt: off\nselect   2 ;\n-- fmt: on\nselect 3;\n-- fmt: off\nselect   4 ;\n-- fmt: on\nselect 5;\n"
+        );
+        // Comments next to a region stay where they are.
+        let sql = "select   1; -- one\n-- about two\n-- fmt: off\nselect   2 ;\n-- fmt: on\n-- about three\nselect   3;\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "SELECT 1; -- one\n-- about two\n-- fmt: off\nselect   2 ;\n-- fmt: on\n-- about three\nSELECT 3;\n"
+        );
+    }
+
+    /// A marker is a line comment on a line of its own. Anything else that
+    /// spells one is not, and the lint suppression comments are another
+    /// feature altogether.
+    #[test]
+    fn only_a_line_comment_on_its_own_line_switches_the_formatter_off() {
+        for (src, want) in [
+            (
+                "select   1; -- fmt: off\nselect   2;",
+                "SELECT 1; -- fmt: off\n\nSELECT 2;\n",
+            ),
+            ("/* fmt: off */\nselect   1;", "/* fmt: off */ SELECT 1;\n"),
+            (
+                "select '\n-- fmt: off\n',   1;",
+                "SELECT '\n-- fmt: off\n', 1;\n",
+            ),
+            (
+                "-- fmt: off please\nselect   1;",
+                "-- fmt: off please\nSELECT 1;\n",
+            ),
+            (
+                "-- grebe: ignore[MOD001]\nselect   count(*) from t;",
+                "-- grebe: ignore[MOD001]\nSELECT count(*)\nFROM t;\n",
+            ),
+            (
+                "-- grebe: ignore[MOD001]\n-- fmt: off\nselect   count(*) from t;\n-- fmt: on\nselect   1; -- grebe: ignore\n",
+                "-- grebe: ignore[MOD001]\n-- fmt: off\nselect   count(*) from t;\n-- fmt: on\nSELECT 1; -- grebe: ignore\n",
+            ),
+        ] {
+            assert_eq!(fmt(src, &Options::default()), want, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn a_region_survives_a_byte_order_mark_and_windows_line_ends() {
+        let sql =
+            "\u{feff}select   1;\r\n-- fmt: off\r\nselect   2 ;\r\n-- fmt: on\r\nselect   3;\r\n";
+        assert_eq!(
+            fmt(sql, &Options::default()),
+            "\u{feff}SELECT 1;\n-- fmt: off\r\nselect   2 ;\r\n-- fmt: on\r\nSELECT 3;\n"
+        );
+    }
+
+    /// Every combination of the style options: formatting the output again
+    /// changes nothing, only space, case, list commas and terminators differ
+    /// from the input, and every comment is still there.
+    #[test]
+    fn every_style_option_combination_is_idempotent_and_keeps_the_tokens() {
+        use grebe_syntax::token::{TokenKind, tokenize};
+        // The code tokens in order, and the comments, which may change
+        // places with a comma or an operator but not go.
+        fn squeeze(s: &str) -> (String, Vec<String>) {
+            let mut code = String::new();
+            let mut comments = Vec::new();
+            for t in tokenize(s) {
+                let text = &s[t.span.start as usize..t.span.end as usize];
+                match t.kind {
+                    TokenKind::Whitespace => {}
+                    TokenKind::LineComment | TokenKind::BlockComment => {
+                        comments.push(text.trim_end().to_string());
+                    }
+                    _ if text == "," || text == ";" => {}
+                    _ => code.push_str(&text.to_lowercase()),
+                }
+            }
+            comments.sort();
+            (code, comments)
+        }
+        let sources = [
+            CALLS_AND_KEYWORDS,
+            NAMES,
+            SPACED_OUT,
+            "with a as (select 1 as x from t), -- first\n\nb as (select x from a) select a, -- one\n b /* two */, c from b where x = 1 -- why\n and (y = 2 or z in (1, 2, 3)) group by a, b, c order by a, b",
+            "select case when a = 1 then 'one' when a = 2 then 'two' else 'many' end, case x when 1 then 2 end from t; select 2 -- c\n; ;",
+            "insert into t (a, b) values (1, 2), -- row\n\n (3, 4), /* last */ (5, 6) on conflict do nothing returning (a)",
+            "create table T (Id Integer primary key, -- key\n Amount Decimal(18, 2) check (amount > 0),\n\n -- tags\n Tags VarChar[],)",
+            "select a\n -- above the comma\n , b,\n /* block */ c, d -- last\n from t where a -- first\n and b\n -- above the operator\n or c",
+            "select 1;\n-- fmt: off\nselect   2 ;\n-- fmt: on\nTHIS IS NOT SQL;\nselect count(*) from t where a in (1) -- c\n",
+            "update t set a = 1, b = 2 where id = 3 and x = 4; delete from t where a and b or c",
+        ];
+        let cases = [NameCase::Lower, NameCase::Upper, NameCase::Preserve];
+        let mut combinations = 0;
+        for comma in [Comma::Trailing, Comma::Leading] {
+            for logical_operator in [LogicalOperator::Leading, LogicalOperator::Trailing] {
+                for (k, function_case) in cases.into_iter().enumerate() {
+                    let type_case = cases[(k + 1) % 3];
+                    for indent_style in [IndentStyle::Space, IndentStyle::Tab] {
+                        for blank_lines in [(1, 0), (0, 2), (2, 1)] {
+                            for list_layout in [ListLayout::Auto, ListLayout::Expanded] {
+                                for case_layout in [CaseLayout::Auto, CaseLayout::Expanded] {
+                                    for inline_threshold in [20, 100] {
+                                        let opts = Options {
+                                            inline_threshold,
+                                            comma,
+                                            logical_operator,
+                                            function_case,
+                                            type_case,
+                                            indent_style,
+                                            blank_lines_between_statements: blank_lines.0,
+                                            max_blank_lines_in_statement: blank_lines.1,
+                                            list_layout,
+                                            case_layout,
+                                            ..Options::default()
+                                        };
+                                        combinations += 1;
+                                        for sql in sources {
+                                            let once = format(sql, &opts);
+                                            assert_eq!(
+                                                format(&once, &opts),
+                                                once,
+                                                "{opts:?}\n{sql}"
+                                            );
+                                            assert_eq!(
+                                                squeeze(&once),
+                                                squeeze(sql),
+                                                "{opts:?}\n{sql}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(combinations, 576);
     }
 }

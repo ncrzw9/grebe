@@ -1,6 +1,7 @@
 // What each session's databases hold, kept database by database, for the
-// language server (catalogSync.js sends it) and the Catalog view. No
-// `vscode` import, so it can be tested with plain Node.
+// language server (catalogSync.js sends it) and the Catalog view, which
+// draws its tree from it (catalog.js). No `vscode` import, so it can be
+// tested with plain Node.
 //
 // Reading a catalog is not free. Every duckdb_*() function walks every
 // attached database, so with a PostgreSQL database of 5,000 tables attached
@@ -41,7 +42,15 @@
 // PostgreSQL from pg_catalog on the server (postgres_query), because
 // DuckDB reports no row counts and no index columns for it. That second
 // reading is extra: if it fails the columns are still indexed and the log
-// says why the rest is missing. Other foreign types get columns only.
+// says why the rest is missing. Other foreign types get columns, and which
+// of their tables are views. A view DuckDB lists no columns for (SQLite's)
+// is kept beside the part, for the Catalog: the server is told of tables
+// with their columns only.
+//
+// For the Catalog a local database's macros, sequences and types are kept
+// beside its part (they are read in the place of the macros' names alone,
+// which the part is still given), and each database says whether it is
+// read-only. Neither is sent to the server.
 
 "use strict";
 
@@ -84,7 +93,7 @@ const inList = (names) => names.map(lit).join(", ");
 const objects = (r) => r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
 
 const DATABASES =
-  `SELECT database_name AS db, path, type, database_name = current_database() AS current ` +
+  `SELECT database_name AS db, path, type, readonly, database_name = current_database() AS current ` +
   `FROM duckdb_databases() WHERE NOT internal OR database_name = 'temp'`;
 
 /** One row per table of `dbs`: its columns, types and nullability as lists
@@ -124,9 +133,22 @@ const TABLES = (dbs) => {
   );
 };
 
-const FUNCTIONS =
-  `SELECT DISTINCT database_name AS db, function_name AS "name", function_type AS "kind" FROM duckdb_functions() ` +
-  `WHERE NOT internal AND function_type IN ('macro', 'table_macro') ORDER BY ALL`;
+/** Macros, sequences and user-defined types in `dbs` (all when null). */
+const EXTRAS = (dbs) => {
+  const where = dbs ? ` AND database_name IN (${inList(dbs)})` : "";
+  return (
+    `SELECT database_name AS db, schema_name AS sch, function_name AS name, function_type AS kind, ` +
+    `array_to_string(parameters, ', ') AS detail, macro_definition AS def ` +
+    `FROM duckdb_functions() WHERE NOT internal AND function_type IN ('macro', 'table_macro')${where} ` +
+    `UNION ALL SELECT database_name, schema_name, sequence_name, 'sequence', NULL, NULL FROM duckdb_sequences() WHERE true${where} ` +
+    `UNION ALL SELECT database_name, schema_name, type_name, 'type', logical_type, NULL FROM duckdb_types() WHERE NOT internal${where} ` +
+    `ORDER BY 1, 2, 4, 3`
+  );
+};
+
+/** The views of the foreign database `db`, as DuckDB lists them. */
+const VIEWS = (db) =>
+  `SELECT schema_name AS "schema", view_name AS "table" FROM duckdb_views() WHERE NOT internal AND database_name = ${lit(db)}`;
 
 // PostgreSQL, asked directly. Not the system schemas, the TOAST tables or
 // other sessions' temporary ones.
@@ -215,6 +237,16 @@ function tablesOf(rows) {
 
 const countColumns = (tables) => tables.reduce((n, t) => n + (t.columns ? t.columns.length : 0), 0);
 
+const before = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** The macros among `extras`, as a part names them: each name and kind
+ *  once, in order. */
+function functionsOf(extras) {
+  const seen = new Map();
+  for (const x of extras) if (x.kind === "macro" || x.kind === "table_macro") seen.set(`${x.name}\u0000${x.kind}`, { name: x.name, kind: x.kind });
+  return [...seen.values()].sort((a, b) => before(a.name, b.name) || before(a.kind, b.kind));
+}
+
 class CatalogIndex {
   /**
    * @param {{
@@ -225,13 +257,16 @@ class CatalogIndex {
    *   isBusy?: () => boolean,
    *   connections?: () => { type: string, path: string }[],
    *   onChange?: (name: string) => void,
+   *   onRead?: (name: string) => void,
    *   log?: (line: string) => void,
    *   now?: () => number,
    * }} deps
    * `isForeign` decides which databases are indexed once rather than after
    * every run (any type but duckdb, unless told otherwise). `isBusy` is
    * true while a run is in progress. `connections` lists the connections
-   * still remembered: the cache of any other is deleted.
+   * still remembered: the cache of any other is deleted. `onChange` is
+   * told when a foreign database starts or stops being indexed; `onRead`
+   * when a reading of the session (refresh()) found something different.
    */
   constructor(deps = {}) {
     this.deps = deps;
@@ -256,8 +291,9 @@ class CatalogIndex {
   state(name, sess) {
     let st = this.sessions.get(name);
     if (!st || st.session !== sess) {
-      // dbs: database name -> { db, type, path, key, foreign, current, part,
-      // digest, columns, indexedAt, stale, over, error, indexing }
+      // dbs: database name -> { db, type, path, key, foreign, current,
+      // readonly, part, digest, extras, views, columns, indexedAt, stale,
+      // over, error, indexing }
       st = { session: sess, dbs: new Map(), read: false, dirty: true };
       this.sessions.set(name, st);
     }
@@ -269,6 +305,15 @@ class CatalogIndex {
     for (const [name, st] of [...this.sessions]) {
       if (!live.some((x) => x.name === name && x.session === st.session)) this.sessions.delete(name);
     }
+  }
+
+  /** The session is someone's: a run is in progress, or it is answering a
+   *  statement somebody is waiting to see (a preview, an export). Behind a
+   *  background statement, the index's own or the Catalog's, a question
+   *  only waits its turn. */
+  taken(sess) {
+    if (this.deps.isBusy && this.deps.isBusy()) return true;
+    return sess.busy && !(sess.waiting && sess.waiting.background);
   }
 
   /** One of the index's own questions to `sess`. Null when the session
@@ -336,15 +381,17 @@ class CatalogIndex {
   async refresh(name, sess) {
     if (!sess || !sess.alive) return false;
     const st = this.state(name, sess);
+    const was = this.shape(st);
     this.expire(st);
     const hasForeign = [...st.dbs.values()].some((e) => e.foreign);
     // Nothing but queries ran since the last reading. With a foreign
     // database attached the reading is not cheap, so it is skipped.
     if (st.read && !st.dirty && hasForeign) return true;
-    if (sess.busy || (this.deps.isBusy && this.deps.isBusy())) return false;
+    if (this.taken(sess)) return false;
     const dbs = await this.ask(sess, DATABASES);
     if (!dbs || dbs.kind !== "rows") return false;
-    const seen = objects(dbs).map((d) => ({ ...d, current: d.current === true || d.current === "true" }));
+    const yes = (v) => v === true || v === "true";
+    const seen = objects(dbs).map((d) => ({ ...d, current: yes(d.current), readonly: yes(d.readonly) }));
     for (const d of seen) {
       const foreign = this.isForeign(d);
       const key = d.path ? cacheKey(d.type, d.path) : null;
@@ -352,11 +399,12 @@ class CatalogIndex {
       // The same name for something else: start over.
       if (e && (e.foreign !== foreign || e.key !== key || e.type !== d.type)) e = null;
       if (!e) {
-        e = { db: d.db, type: d.type || "duckdb", path: d.path, key, foreign, part: null, digest: null, columns: 0, indexedAt: null, stale: null, over: null, error: null, indexing: false };
+        e = { db: d.db, type: d.type || "duckdb", path: d.path, key, foreign, part: null, digest: null, extras: [], views: [], columns: 0, indexedAt: null, stale: null, over: null, error: null, indexing: false };
         st.dbs.set(d.db, e);
         if (foreign) this.restore(e);
       }
       e.current = d.current;
+      e.readonly = d.readonly;
     }
     for (const db of [...st.dbs.keys()]) if (!seen.some((d) => d.db === db)) st.dbs.delete(db);
     this.expire(st);
@@ -366,22 +414,33 @@ class CatalogIndex {
       const cols = await this.ask(sess, COLUMNS(local, false));
       if (!cols || cols.kind !== "rows") return false;
       const meta = await this.ask(sess, TABLES(local));
-      const fns = await this.ask(sess, FUNCTIONS);
-      if (!meta || !fns) return false;
+      const more = await this.ask(sess, EXTRAS(local));
+      if (!meta || !more) return false;
+      const extras = more.kind === "rows" ? objects(more) : [];
       const facts = new Map();
       for (const m of meta.kind === "rows" ? objects(meta) : []) facts.set(`${m.db}\u0000${m.schema}\u0000${m.table}`, m);
       const rows = objects(cols);
       for (const db of local) {
         const e = st.dbs.get(db);
         const tables = tablesOf(rows.filter((r) => r.db === db).map((r) => ({ ...(facts.get(`${db}\u0000${r.schema}\u0000${r.table}`) || {}), ...r })));
-        const functions = fns.kind === "rows" ? objects(fns).filter((f) => f.db === db).map(({ name: n, kind }) => ({ name: n, kind })) : [];
-        this.put(e, tables, functions);
+        e.extras = extras.filter((x) => x.db === db);
+        this.put(e, tables, functionsOf(e.extras));
       }
     }
     st.read = true;
     st.dirty = false;
     this.prune();
+    if (this.shape(st) !== was && this.deps.onRead) this.deps.onRead(name);
     return true;
+  }
+
+  /** What the Catalog draws of a session, as one string: a reading that
+   *  leaves it the same has nothing new to show. */
+  shape(st) {
+    return JSON.stringify([
+      st.read,
+      [...st.dbs.values()].map((e) => [e.db, e.type, e.path, e.foreign, e.current, e.readonly, e.digest, e.extras, e.views, e.over, e.error, e.indexedAt]),
+    ]);
   }
 
   /** Mark the foreign indexes that are older than the age limit. */
@@ -444,7 +503,7 @@ class CatalogIndex {
       if (!st || st.session !== sess || !sess.alive) return true;
       const e = [...st.dbs.values()].find((x) => x.foreign && (x.stale || (x.indexedAt === null && !x.over && !x.error)));
       if (!e) return true;
-      if (sess.busy || (this.deps.isBusy && this.deps.isBusy())) return false;
+      if (this.taken(sess)) return false;
       e.indexing = true;
       this.changed(name);
       let done;
@@ -497,14 +556,26 @@ class CatalogIndex {
     if (cols.kind !== "rows") return fail(cols);
     let rows = objects(cols);
     let facts = "";
+    let bare = []; // the views with no columns listed
     if (e.type === "postgres") {
       const merged = await this.postgresFacts(sess, e, rows);
       if (!merged) return false;
       rows = merged.rows;
       facts = merged.note;
+    } else {
+      // Which of them are views: the Catalog draws those as views.
+      const views = await this.ask(sess, VIEWS(e.db));
+      if (!views) return false;
+      const key = (r) => `${r.schema}\u0000${r.table}`;
+      const named = views.kind === "rows" ? objects(views) : [];
+      const isView = new Set(named.map(key));
+      if (isView.size) rows = rows.map((r) => (isView.has(key(r)) ? { ...r, kind: "view" } : r));
+      const listed = new Set(rows.map(key));
+      bare = named.filter((v) => !listed.has(key(v))).map((v) => ({ schema: v.schema, table: v.table, kind: "view" }));
     }
     const tables = tablesOf(rows);
     this.put(e, tables, []);
+    e.views = bare;
     e.indexedAt = this.now();
     this.save(e);
     this.say(
@@ -584,6 +655,33 @@ class CatalogIndex {
     };
   }
 
+  /**
+   * What the Catalog draws of session `name`: the session it was read
+   * from, whether it has been read at all, and each database with what is
+   * known of it -- `tables` (the part's, null when there is none),
+   * `extras` (a local database's macros, sequences and types) and
+   * `status` (as status() gives it). Null for a session never seen.
+   */
+  view(name) {
+    const st = this.sessions.get(name);
+    if (!st) return null;
+    return {
+      session: st.session,
+      read: st.read,
+      dbs: [...st.dbs.values()].map((e) => ({
+        db: e.db,
+        type: e.type,
+        path: e.path,
+        readonly: e.readonly,
+        current: e.current,
+        foreign: e.foreign,
+        tables: e.over ? null : !e.part ? (e.views.length ? e.views : null) : e.views.length ? e.part.tables.concat(e.views) : e.part.tables,
+        extras: e.extras,
+        status: this.status(name, e.db),
+      })),
+    };
+  }
+
   // --- the cache ----------------------------------------------------------
 
   file(e) {
@@ -602,6 +700,7 @@ class CatalogIndex {
     }
     if (!kept || kept.version !== CACHE_VERSION || kept.type !== e.type || !Array.isArray(kept.tables) || typeof kept.indexedAt !== "number") return;
     this.put(e, kept.tables, []);
+    e.views = Array.isArray(kept.views) ? kept.views : [];
     e.indexedAt = kept.indexedAt;
     this.say(`${e.db} (${e.type}): using the index of ${new Date(kept.indexedAt).toISOString()} (${kept.tables.length.toLocaleString("en-US")} tables)`);
   }
@@ -615,6 +714,7 @@ class CatalogIndex {
     try {
       fs.mkdirSync(this.dir, { recursive: true });
       const kept = { version: CACHE_VERSION, type: e.type, where: conninfo.where(e.path), indexedAt: e.indexedAt, columns: e.columns, tables: e.part.tables };
+      if (e.views.length) kept.views = e.views;
       fs.writeFileSync(`${file}.tmp`, JSON.stringify(kept));
       fs.renameSync(`${file}.tmp`, file);
     } catch (err) {
@@ -665,4 +765,4 @@ class CatalogIndex {
   }
 }
 
-module.exports = { CatalogIndex, MAX_COLUMNS, CACHE_DIR, cacheKey, changesStructure, mentions, DATABASES, COLUMNS, TABLES, PG_RELATIONS, PG_INDEXES };
+module.exports = { CatalogIndex, MAX_COLUMNS, CACHE_DIR, cacheKey, changesStructure, mentions, DATABASES, COLUMNS, TABLES, EXTRAS, PG_RELATIONS, PG_INDEXES };

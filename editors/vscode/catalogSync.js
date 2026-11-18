@@ -21,6 +21,9 @@
 // session of its own is sent once under its name, and its files are told
 // to use it. With the setting off, every database is read after every run
 // and sent as one snapshot, and past MAX_COLUMNS columns nothing is sent.
+//
+// The Catalog draws its tree from the same index (view() below), so it is
+// kept whether or not there is a language server to send it to.
 
 "use strict";
 
@@ -55,6 +58,10 @@ async function snapshot(sess) {
 
 const DEFAULT = "default";
 
+// How many times in a row a reading that could not be asked for is tried
+// again on its own: a minute's worth.
+const MAX_RETRIES = 100;
+
 class CatalogSync {
   /**
    * @param {{ clientReady: () => Promise<object|null>,
@@ -71,6 +78,8 @@ class CatalogSync {
     this.sent = new Map();
     this.indexed = null; // which of the two ways `sent` was written in
     this.timer = null;
+    this.retry = null;
+    this.retries = 0;
     this.running = Promise.resolve();
     this.index = deps.index || new CatalogIndex({ onChange: () => this.schedule() });
   }
@@ -105,8 +114,10 @@ class CatalogSync {
 
   async syncNow() {
     const client = await this.deps.clientReady();
-    if (!client) return;
     const indexed = this.setting("catalogIndex", true) !== false;
+    // No language server (it could not be started): the index is still
+    // read, for the Catalog.
+    if (!client) return indexed ? this.readIndex(this.enabled() ? this.deps.liveSessions() : []) : undefined;
     if (this.indexed !== null && this.indexed !== indexed) this.forgetAll(client);
     this.indexed = indexed;
     return indexed ? this.syncParts(client) : this.syncWhole(client);
@@ -129,6 +140,37 @@ class CatalogSync {
 
   // --- database by database -------------------------------------------------
 
+  /** Bring the index up to date with the sessions `live`, sending nothing. */
+  async readIndex(live) {
+    this.index.keep(live);
+    for (const { name, session } of live) this.read(name, session, await this.index.refresh(name, session));
+    this.indexPending(live);
+  }
+
+  /** A reading or an indexing of `session` was `done`, or could not be
+   *  asked for. One that could not, with no run to wait for (the session
+   *  is busy with a preview, say), is tried again shortly, a few times; a
+   *  run tries again as it ends. */
+  read(name, session, done) {
+    if (done) this.retries = 0;
+    if (done || !session.alive || (this.deps.isRunning && this.deps.isRunning()) || this.retries >= MAX_RETRIES) return;
+    this.retries++;
+    clearTimeout(this.retry);
+    this.retry = setTimeout(() => this.schedule(), 500);
+    if (this.retry.unref) this.retry.unref();
+  }
+
+  /** The foreign databases that are not indexed yet, or not any more: in
+   *  the background, one at a time; each one that finishes syncs again. */
+  indexPending(live) {
+    for (const { name, session } of live) {
+      this.index
+        .indexPending(name, session)
+        .then((done) => this.read(name, session, done))
+        .catch((e) => log.error("catalog", `could not index the databases of ${name}: ${e.message ?? e}`, e));
+    }
+  }
+
   async syncParts(client) {
     const on = this.enabled();
     const live = on ? this.deps.liveSessions() : [];
@@ -136,7 +178,7 @@ class CatalogSync {
     const partKey = (catalog, database) => `part\u0000${catalog}\u0000${database}`;
     const have = new Set(); // the part keys that should be there
     for (const { name, session } of live) {
-      await this.index.refresh(name, session);
+      this.read(name, session, await this.index.refresh(name, session));
       const catalog = name === DEFAULT ? "" : name;
       const target = catalog ? { catalog } : {};
       for (const part of this.index.parts(name)) {
@@ -175,11 +217,7 @@ class CatalogSync {
     // The server drops a closed document's catalog itself.
     for (const key of [...this.sent.keys()]) if (key.startsWith("doc\u0000") && !open.has(key)) this.sent.delete(key);
 
-    // The foreign databases that are not indexed yet, or not any more: in
-    // the background, one at a time; each one that finishes syncs again.
-    for (const { name, session } of live) {
-      this.index.indexPending(name, session).catch((e) => log.error("catalog", `could not index the databases of ${name}: ${e.message ?? e}`, e));
-    }
+    this.indexPending(live);
   }
 
   // --- as one snapshot --------------------------------------------------------
@@ -250,8 +288,23 @@ class CatalogSync {
     return this.indexed ? this.index.status(name, db) : null;
   }
 
+  /**
+   * What the Catalog draws of session `name`, running as `sess`
+   * (CatalogIndex.view), from the index: null when the index is not in
+   * use, so the Catalog asks the session itself; `{ read: false }` until
+   * the index has read this session, which is then asked for.
+   */
+  view(name, sess) {
+    if (this.setting("catalogIndex", true) === false || !this.enabled()) return null;
+    const v = this.index.view(name);
+    if (v && v.session === sess && v.read) return v;
+    this.schedule();
+    return { read: false };
+  }
+
   dispose() {
     clearTimeout(this.timer);
+    clearTimeout(this.retry);
   }
 }
 
@@ -267,6 +320,8 @@ function activate(context, deps) {
       if (sync) sync.schedule();
       if (deps.onDidIndex) deps.onDidIndex(name);
     },
+    // A reading found something different: the Catalog draws it.
+    onRead: (name) => deps.onDidIndex && deps.onDidIndex(name),
     log: (line) => log.info("catalog", line),
   });
   sync = new CatalogSync({ ...deps, index });
