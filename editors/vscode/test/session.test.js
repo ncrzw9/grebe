@@ -168,13 +168,17 @@ live("an rc file cannot change the protocol", async () => {
   fs.writeFileSync(path.join(home, ".duckdbrc"), ".mode box\n.timer on\n.echo on\nSELECT 'hello from rc';\n");
   const s = new Session({ cli: CLI, database: ":memory:", cwd: home });
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home; // the child inherits it
+  process.env.USERPROFILE = home;
   try {
     await s.start();
     const r = await s.run("SELECT 7 AS n");
     assert.deepEqual([r.kind, r.rows], ["rows", [[7]]]);
   } finally {
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
     s.dispose();
   }
 });
@@ -251,7 +255,9 @@ live("checkCli: a broken ~/.duckdbrc is reported by --version already", async ()
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-rc-"));
   fs.writeFileSync(path.join(home, ".duckdbrc"), "SELEC 1;\n");
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     const r = await checkCli(CLI);
     assert.equal(r.text, null);
@@ -265,6 +271,8 @@ live("checkCli: a broken ~/.duckdbrc is reported by --version already", async ()
     s.dispose();
   } finally {
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
   }
 });
 
@@ -274,7 +282,9 @@ live("stderr outside a statement is heard; a statement's own is not", async () =
   const heard = [];
   const s = new Session({ cli: CLI, database: ":memory:", cwd: home, onStderr: (t) => heard.push(t) });
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     await s.start();
     assert.match(heard.join(""), /Loading resources from .*\.duckdbrc/);
@@ -284,6 +294,8 @@ live("stderr outside a statement is heard; a statement's own is not", async () =
     assert.deepEqual(heard, []);
   } finally {
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
     s.dispose();
   }
 });
@@ -377,6 +389,41 @@ interruptible("cancel stops a long query and keeps the session, TEMP tables incl
   }
 });
 
+interruptible("a background statement gives way to a run, and the session carries on", async () => {
+  const s = new Session({ cli: CLI, database: ":memory:", cwd: os.tmpdir(), cancelGraceMs: 300 });
+  await s.start();
+  try {
+    await s.run("CREATE TEMP TABLE keep AS SELECT 1 AS x");
+    // Nothing in flight, or a statement someone is waiting for: left alone.
+    assert.equal(s.giveWay(), false);
+    const wanted = s.run("SELECT count(*) AS n FROM range(30000000) r(i) WHERE i % 7 = 3");
+    assert.equal(s.giveWay(), false);
+    assert.equal((await wanted).kind, "rows");
+
+    // A background one in flight is stopped; one queued behind it is not
+    // run at all; what is asked after that is.
+    const slow = s.run("SELECT count(*) FROM range(100000000000) r(i) WHERE i % 7 = 3", { background: true });
+    const queued = s.run("CREATE TABLE never (a INT)", { background: true });
+    await new Promise((r) => setTimeout(r, 150));
+    const t0 = Date.now();
+    assert.equal(s.giveWay(), true);
+    const after = s.run("SELECT x FROM keep");
+    assert.deepEqual([(await slow).kind, (await slow).reason], ["cancelled", "yield"]);
+    assert.deepEqual([(await queued).kind, (await queued).reason], ["cancelled", "yield"]);
+    assert.deepEqual((await after).rows, [[1]]);
+    assert.ok(Date.now() - t0 < 2000, `gave way in ${Date.now() - t0} ms`);
+    assert.equal((await s.run("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'never'")).rows[0][0], 0);
+    // Unlike a cancel, it never ends the session, however long it takes:
+    // well past the grace period, the session is still there.
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(s.alive, true);
+    // A background statement asked after the run is an ordinary one again.
+    assert.deepEqual((await s.run("SELECT 2 AS two", { background: true })).rows, [[2]]);
+  } finally {
+    s.dispose();
+  }
+});
+
 interruptible("a timeout cancels the statement the same way", async () => {
   const s = session();
   await s.start();
@@ -394,7 +441,9 @@ interruptible("a timeout cancels the statement the same way", async () => {
 interruptible("statements run here stay out of ~/.duckdb_history", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-history-"));
   const prevHome = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE; // home, on Windows
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   const s = new Session({ cli: CLI, database: ":memory:", cwd: home });
   try {
     await s.start();
@@ -402,6 +451,8 @@ interruptible("statements run here stay out of ~/.duckdb_history", async () => {
   } finally {
     s.dispose();
     process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
   }
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(fs.existsSync(path.join(home, ".duckdb_history")), false);

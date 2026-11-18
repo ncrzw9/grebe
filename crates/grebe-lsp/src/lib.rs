@@ -14,7 +14,9 @@
 //! `workspace/didChangeConfiguration` for the `grebe.select` setting;
 //! `grebe/statements`, which tells an editor where each statement of a
 //! document begins and ends so it can run them one at a time;
-//! `textDocument/completion`; and `grebe/catalog`, by which an editor that
+//! `grebe/friendly`, the edits that rewrite a document (or the statements
+//! in a range) as friendly SQL, also offered as the source action
+//! `source.grebe.friendly`; `textDocument/completion`; and `grebe/catalog`, by which an editor that
 //! has a database open hands over what is in it, for completion and for the
 //! `CAT` rules (a `catalog = "..."` file in `grebe.toml` does the same for
 //! an editor that does not).
@@ -25,6 +27,7 @@
 
 pub mod code_action;
 pub mod completion;
+pub mod friendly;
 pub use grebe_rules::json;
 pub mod position;
 pub mod semantic;

@@ -143,7 +143,21 @@ const CLI = process.env.DUCKDB_CLI;
   assert.equal((await under()).find((n) => n.item.label === "side").contextValue, "grebe.attachedDb");
   assert.equal(Number((await sess.run("SELECT count(*) FROM side.t")).rows[0][0]), 2);
 
+  // Before the session starts, its connections are listed all the same.
+  const second = path.join(dir, "second.duckdb");
+  assert.equal((await sess.run(`ATTACH '${second}' AS second`)).kind, "ok");
   await ex.detach((await under()).find((n) => n.item.label === "side"));
+  await m.remember();
+  let running = false;
+  ex.deps.liveSession = () => (running ? m.live() : null);
+  assert.deepEqual(
+    (await under()).slice(1).map((n) => [n.item.label, n.item.contextValue]),
+    [["second", "grebe.pendingDb"], ["side", "grebe.detachedDb"]],
+  );
+  running = true;
+  await sess.run("DETACH second");
+  await m.remember();
+  m.forget("default", "second");
   await ex.forget((await under()).find((n) => n.item.label === "side"));
   assert.equal((await under()).some((n) => n.item.label === "side"), false);
 });

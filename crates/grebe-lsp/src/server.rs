@@ -28,7 +28,7 @@ use std::time::SystemTime;
 
 use grebe_rules::Severity;
 use grebe_rules::analysis::Selection;
-use grebe_rules::catalog::Catalog;
+use grebe_rules::catalog::{Catalog, Part};
 use grebe_rules::config::Config;
 #[cfg(test)]
 use grebe_rules::detect::Finding;
@@ -129,11 +129,20 @@ fn handle_message<W: Write>(
     state: &mut State,
     writer: &mut W,
 ) -> Option<i32> {
-    let Some(msg) = msg else {
+    let Some(mut msg) = msg else {
         // Not UTF-8 or not JSON: JSON-RPC's parse error, with a null id
         // since the request's own could not be read.
         respond_error(writer, Json::Null, -32700, "parse error");
         return None;
+    };
+    // Taken out of the message, not copied: a catalog's params are most of
+    // a hundred megabytes.
+    let params = match &mut msg {
+        Json::Object(pairs) => pairs
+            .iter_mut()
+            .find(|(k, _)| k == "params")
+            .map_or(Json::Null, |(_, v)| std::mem::replace(v, Json::Null)),
+        _ => Json::Null,
     };
     if msg.as_object().is_none() {
         respond_error(writer, Json::Null, -32600, "invalid request");
@@ -142,7 +151,6 @@ fn handle_message<W: Write>(
     let method = msg.get("method").and_then(Json::as_str);
     let has_id = msg.get("id").is_some();
     let id = msg.get("id").cloned().unwrap_or(Json::Null);
-    let params = msg.get("params").cloned().unwrap_or(Json::Null);
 
     if method == Some("exit") {
         return Some(exit_code(state));
@@ -203,6 +211,10 @@ fn handle_message<W: Write>(
         }
         Some("grebe/statements") => {
             let result = handle_statements(&params, state);
+            respond(writer, id, result);
+        }
+        Some("grebe/friendly") => {
+            let result = Json::Array(friendly_edits(&params, state, writer));
             respond(writer, id, result);
         }
         Some("textDocument/completion") => {
@@ -292,6 +304,13 @@ struct State {
     /// session is not running): it is not checked, and does not fall back
     /// to the shared one.
     document_catalogs: HashMap<String, Option<Rc<Catalog>>>,
+    /// Catalogs the client sent under a name (`grebe/catalog` with
+    /// `catalog: NAME`), and the documents told to use one by name: several
+    /// files that run in one session share its catalog without it being
+    /// sent once per file. A document whose named catalog is not there has
+    /// no catalog.
+    named_catalogs: HashMap<String, Rc<Catalog>>,
+    document_catalog_names: HashMap<String, String>,
     /// Catalog files named by a `grebe.toml` (`catalog = "..."`), as last
     /// read, with the modification time and size they had: a client that
     /// sends no catalog still gets the one the project configured, and a
@@ -353,10 +372,20 @@ fn handle_initialize<W: Write>(params: &Json, state: &mut State, writer: &mut W)
                     ("full".into(), Json::Bool(true)),
                 ]),
             ),
-            // Quick fixes. Declared as a plain `true` rather than with a
-            // `codeActionKinds` list: we only ever produce `quickfix`, and
-            // advertising the kinds buys nothing a client acts on.
-            ("codeActionProvider".into(), Json::Bool(true)),
+            // Quick fixes, and one source action: the friendly SQL rewrite
+            // (see `crate::friendly`). Its kind is listed so a client knows
+            // it can be asked for by name, in a "source action" menu or on
+            // save.
+            (
+                "codeActionProvider".into(),
+                Json::object(vec![(
+                    "codeActionKinds".into(),
+                    Json::Array(vec![
+                        Json::str("quickfix"),
+                        Json::str(crate::friendly::ACTION_KIND),
+                    ]),
+                )]),
+            ),
             // Whole-document formatting via `grebe_format::format`. There is
             // no range or on-type variant: the formatter only ever knows how
             // to lay out a complete document.
@@ -569,6 +598,9 @@ fn catalog_for_uri<W: Write>(
     state: &mut State,
     writer: &mut W,
 ) -> Option<Rc<Catalog>> {
+    if let Some(name) = state.document_catalog_names.get(uri) {
+        return state.named_catalogs.get(name).cloned();
+    }
     if let Some(own) = state.document_catalogs.get(uri) {
         return own.clone();
     }
@@ -664,6 +696,20 @@ fn format_options(config: Option<&Config>) -> grebe_format::Options {
             Some(grebe_rules::config::KeywordCase::Upper) => grebe_format::KeywordCase::Upper,
             Some(grebe_rules::config::KeywordCase::Lower) => grebe_format::KeywordCase::Lower,
             None => default.keyword_case,
+        },
+        function_paren_space: config
+            .format
+            .function_paren_space
+            .unwrap_or(default.function_paren_space),
+        keyword_paren_space: config
+            .format
+            .keyword_paren_space
+            .unwrap_or(default.keyword_paren_space),
+        semicolon: match config.format.semicolon {
+            Some(grebe_rules::config::Semicolon::Attached) => grebe_format::Semicolon::Attached,
+            Some(grebe_rules::config::Semicolon::Spaced) => grebe_format::Semicolon::Spaced,
+            Some(grebe_rules::config::Semicolon::Newline) => grebe_format::Semicolon::Newline,
+            None => default.semicolon,
         },
     }
 }
@@ -775,6 +821,7 @@ fn handle_did_close<W: Write>(params: &Json, state: &mut State, writer: &mut W) 
     state.documents.remove(uri);
     state.versions.remove(uri);
     state.document_catalogs.remove(uri);
+    state.document_catalog_names.remove(uri);
     state.dirty.retain(|u| u != uri);
     // Publish an empty set so a closed document's squiggles don't linger.
     publish_diagnostics(writer, uri, &[], None);
@@ -849,9 +896,76 @@ fn handle_code_action<W: Write>(params: &Json, state: &mut State, writer: &mut W
     let config = config_for_uri(&uri, state, writer);
     let resolved = resolve_selection(&uri, state, config.as_ref(), writer);
     let findings = grebe_rules::analysis::analyze(&text, &resolved.selection());
-    Json::Array(crate::code_action::actions(
-        &uri, &text, &findings, range, encoding,
-    ))
+    let mut actions = crate::code_action::actions(&uri, &text, &findings, range, encoding);
+    // The friendly SQL rewrite, only when the client asks for it by kind:
+    // it rewrites the whole document, which is not what a lightbulb is for.
+    if crate::friendly::asked_for(params.get("context").and_then(|c| c.get("only"))) {
+        let whole = Json::object(vec![(
+            "textDocument".into(),
+            Json::object(vec![("uri".into(), Json::str(&uri))]),
+        )]);
+        let edits = friendly_edits(&whole, state, writer);
+        actions.extend(crate::friendly::action(&uri, edits));
+    }
+    Json::Array(actions)
+}
+
+/// `grebe/friendly`: the text edits that rewrite a document as friendly
+/// SQL (see [`crate::friendly`]). `params.range` is optional: with one, the
+/// statements it overlaps, picked as `grebe/statements` picks them; absent,
+/// the whole document. `[]` when there is nothing to rewrite, or for a
+/// document the server has never seen. Formatting follows the document's
+/// `grebe.toml`, as `textDocument/formatting` does.
+fn friendly_edits<W: Write>(params: &Json, state: &mut State, writer: &mut W) -> Vec<Json> {
+    let Some(uri) = params
+        .get("textDocument")
+        .and_then(|d| d.get("uri"))
+        .and_then(Json::as_str)
+    else {
+        return Vec::new();
+    };
+    let uri = uri.to_string();
+    let Some(text) = state.documents.get(&uri).cloned() else {
+        return Vec::new();
+    };
+    let encoding = state.encoding;
+    let num = |v: Option<&Json>| v.and_then(Json::as_f64).unwrap_or(0.0) as u32;
+    let to_byte = |p: &Json| {
+        position::position_to_byte(&text, num(p.get("line")), num(p.get("character")), encoding)
+    };
+    let statements = params
+        .get("range")
+        .and_then(|r| Some((r.get("start")?, r.get("end")?)))
+        .map(|(start, end)| {
+            crate::statements::select(&text, Span::new(to_byte(start), to_byte(end)))
+        });
+
+    let config = config_for_uri(&uri, state, writer);
+    let foreign_heads = config.as_ref().map_or(&[][..], |c| &c.foreign_heads[..]);
+    let rewrites = crate::friendly::rewrite(
+        &text,
+        statements.as_deref(),
+        foreign_heads,
+        &format_options(config.as_ref()),
+    );
+    let lines = position::LineIndex::new(&text);
+    rewrites
+        .into_iter()
+        .map(|r| {
+            let (sl, sc) = lines.position(&text, r.span.start, encoding);
+            let (el, ec) = lines.position(&text, r.span.end, encoding);
+            Json::object(vec![
+                (
+                    "range".into(),
+                    Json::object(vec![
+                        ("start".into(), pos(sl, sc)),
+                        ("end".into(), pos(el, ec)),
+                    ]),
+                ),
+                ("newText".into(), Json::str(r.text)),
+            ])
+        })
+        .collect()
 }
 
 fn severity_to_lsp(sev: Severity) -> f64 {
@@ -961,59 +1075,160 @@ fn handle_formatting<W: Write>(params: &Json, state: &mut State, writer: &mut W)
 /// `grebe/catalog`: the client's catalog snapshot (rows as in
 /// [`grebe_rules::catalog`]).
 ///
-/// - `{ columns: [row...], functions?: [...] }`: the catalog for every
-///   document that has none of its own. `{ columns: null }` takes it away.
-///   An empty array is a catalog with nothing in it, and is taken at its
-///   word.
-/// - `{ uri, columns: [row...] }`: that document's own catalog.
-///   `{ uri, columns: null }`: that document has no catalog, and does not
-///   fall back to the shared one. `{ uri, default: true }`: it uses the
-///   shared one again.
+/// Which catalog a notification is about:
 ///
-/// Every open document the change reaches is linted again.
+/// - no `uri` and no `catalog`: the one for every document that has none
+///   of its own;
+/// - `uri`: that document's own;
+/// - `catalog: NAME` (no `uri`): a catalog kept under that name, which
+///   documents use when told to.
+///
+/// What it says about it:
+///
+/// - `{ columns: [row...], functions?: [...] }`: this is the whole of it.
+///   An empty array is a catalog with nothing in it, and is taken at its
+///   word. `{ columns: null }` takes it away; for a document that means it
+///   has no catalog, and does not fall back to the shared one.
+/// - `{ database: D, columns: [row...], functions?: [...] }`: this is the
+///   part for database `D`, in place of the part `D` had; the other
+///   databases' parts stay as they are. Rows may leave `"database"` out.
+///   `tables: [{ schema, table, kind?, rows?, primary_key?, unique?,
+///   indexes?, columns?, types?, nullable? }...]` may come beside
+///   `columns` or instead of it: what is known of each table (see
+///   [`Part::from_json`]), and, when it lists them, the table's columns in
+///   a quarter of the bytes the rows take.
+///   `{ database: D, columns: null }` (and no `tables`) drops that part.
+///   A catalog whose last part is dropped is taken away.
+/// - `{ uri, catalog: NAME }`: the document uses the catalog of that name
+///   (none, while there is no such catalog).
+///   `{ uri, default: true }`: it uses the shared one again.
+///
+/// Every open document a change reaches is linted again; a notification
+/// that changes nothing (the same part again) reaches none.
 fn handle_catalog<W: Write>(params: &Json, state: &mut State, writer: &mut W) {
-    let uri = params.get("uri").and_then(Json::as_str).map(str::to_string);
-    let to_default = params.get("default") == Some(&Json::Bool(true));
-    let catalog = match params.get("columns") {
-        None | Some(Json::Null) => None,
-        Some(_) => match Catalog::from_json(params) {
+    let text = |k: &str| params.get(k).and_then(Json::as_str).map(str::to_string);
+    let (uri, name) = (text("uri"), text("catalog"));
+    let complain = |writer: &mut W, e: String| {
+        let p = Json::object(vec![
+            ("type".into(), Json::num(2)),
+            (
+                "message".into(),
+                Json::str(format!("grebe/catalog: not a catalog snapshot: {e}")),
+            ),
+        ]);
+        notify(writer, "window/showMessage", p);
+    };
+
+    // Which catalog a document uses.
+    if let Some(u) = &uri {
+        let to_default = params.get("default") == Some(&Json::Bool(true));
+        if name.is_some() || to_default {
+            let was = (
+                state.document_catalogs.remove(u).is_some(),
+                state.document_catalog_names.remove(u),
+            );
+            if let Some(n) = &name {
+                state.document_catalog_names.insert(u.clone(), n.clone());
+            }
+            let same = !was.0 && was.1 == name;
+            if !same && state.documents.contains_key(u) {
+                mark_dirty(state, u);
+            }
+            return;
+        }
+    }
+
+    // The catalog as it is now, and as the notification leaves it.
+    let before: Option<Rc<Catalog>> = match (&uri, &name) {
+        (Some(u), _) => state.document_catalogs.get(u).cloned().flatten(),
+        (None, Some(n)) => state.named_catalogs.get(n).cloned(),
+        (None, None) => state.catalog.clone(),
+    };
+    let given = |k: &str| params.get(k).filter(|c| **c != Json::Null);
+    let (columns, tables) = (given("columns"), given("tables"));
+    let after: Option<Rc<Catalog>> = match (text("database"), columns.or(tables)) {
+        (Some(database), Some(_)) => {
+            let functions = params.get("functions");
+            let part = match Part::from_json(&database, columns, tables, functions) {
+                Ok(p) => p,
+                Err(e) => return complain(writer, e),
+            };
+            let mut next = before.as_deref().cloned().unwrap_or_default();
+            if next.set_part(part) {
+                Some(Rc::new(next))
+            } else {
+                before.clone()
+            }
+        }
+        (Some(database), None) => match &before {
+            Some(have) if have.part(&database).is_some() => {
+                let mut next = Catalog::clone(have);
+                next.remove_part(&database);
+                (!next.parts().is_empty()).then(|| Rc::new(next))
+            }
+            _ => before.clone(),
+        },
+        (None, Some(_)) => match Catalog::from_json(params) {
+            Ok(c) if before.as_deref() == Some(&c) => before.clone(),
             Ok(c) => Some(Rc::new(c)),
-            Err(e) => {
-                let p = Json::object(vec![
-                    ("type".into(), Json::num(2)),
-                    (
-                        "message".into(),
-                        Json::str(format!("grebe/catalog: not a catalog snapshot: {e}")),
-                    ),
-                ]);
-                notify(writer, "window/showMessage", p);
+            Err(e) => return complain(writer, e),
+        },
+        (None, None) => None,
+    };
+
+    let same = match (&before, &after) {
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    let mut affected: Vec<String> = match (&uri, &name) {
+        (Some(u), _) => {
+            // "No catalog" is said of a document even when it had none:
+            // from then on it does not fall back to the shared one.
+            let fell_back = !state.document_catalogs.contains_key(u);
+            state.document_catalogs.insert(u.clone(), after);
+            if same && !fell_back {
                 return;
             }
-        },
-    };
-    match (&uri, catalog) {
-        (Some(u), None) if to_default => {
-            state.document_catalogs.remove(u);
+            state
+                .documents
+                .keys()
+                .filter(|d| *d == u)
+                .cloned()
+                .collect()
         }
-        (Some(u), own) => {
-            state.document_catalogs.insert(u.clone(), own);
+        (None, Some(n)) => {
+            match after {
+                Some(c) => state.named_catalogs.insert(n.clone(), c),
+                None => state.named_catalogs.remove(n),
+            };
+            if same {
+                return;
+            }
+            state
+                .documents
+                .keys()
+                .filter(|d| state.document_catalog_names.get(*d) == Some(n))
+                .cloned()
+                .collect()
         }
-        (None, shared) => state.catalog = shared,
-    }
-    let mut affected: Vec<String> = match &uri {
-        Some(u) => state
-            .documents
-            .keys()
-            .filter(|d| *d == u)
-            .cloned()
-            .collect(),
-        // A document with a catalog of its own does not see the shared one.
-        None => state
-            .documents
-            .keys()
-            .filter(|d| !state.document_catalogs.contains_key(*d))
-            .cloned()
-            .collect(),
+        (None, None) => {
+            state.catalog = after;
+            if same {
+                return;
+            }
+            // A document with a catalog of its own does not see the shared
+            // one.
+            state
+                .documents
+                .keys()
+                .filter(|d| {
+                    !state.document_catalogs.contains_key(*d)
+                        && !state.document_catalog_names.contains_key(*d)
+                })
+                .cloned()
+                .collect()
+        }
     };
     affected.sort();
     for u in affected {
@@ -1051,7 +1266,10 @@ fn handle_completion<W: Write>(params: &Json, state: &mut State, writer: &mut W)
     );
     // The config is only needed for a catalog file it may name, and only
     // when the client has not sent a catalog itself.
-    let config = if state.document_catalogs.contains_key(&uri) || state.catalog.is_some() {
+    let config = if state.document_catalogs.contains_key(&uri)
+        || state.document_catalog_names.contains_key(&uri)
+        || state.catalog.is_some()
+    {
         None
     } else {
         config_for_uri(&uri, state, writer)

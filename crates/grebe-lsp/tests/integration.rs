@@ -941,6 +941,215 @@ fn a_malformed_catalog_is_reported_and_changes_nothing() {
     assert!(said.contains("grebe/catalog"), "{said}");
 }
 
+/// A `grebe/catalog` notification from JSON text.
+fn catalog_message(params: &str) -> String {
+    notification("grebe/catalog", json::parse(params).expect("valid JSON"))
+}
+
+/// Each round of diagnostics for `uri`, as `CODE message; ...`.
+fn rounds_said(messages: &[Json], uri: &str) -> Vec<String> {
+    published(messages, uri)
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|(c, m)| format!("{c} {m}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .collect()
+}
+
+/// A catalog can arrive database by database: each part replaces that
+/// database's part only, the same part again changes (and lints) nothing,
+/// and dropping the last part takes the catalog away.
+#[test]
+fn a_catalog_can_be_sent_in_per_database_parts() {
+    let uri = "file:///catalog/q.sql";
+    let sql = "SELECT u.emial FROM pg.public.users u JOIN ordrs o ON o.id = u.id;";
+    let memory = r#"{"database":"memory","columns":[
+        {"schema":"main","table":"orders","column":"id","type":"BIGINT"}]}"#;
+    // Table by table, with what is known of the table beside its columns.
+    let pg = r#"{"database":"pg","tables":[
+        {"schema":"public","table":"users","rows":1200,"primary_key":["id"],
+         "columns":["id","email"],"types":["INTEGER","VARCHAR"],"nullable":[false,true]}],
+        "functions":[{"name":"twice","kind":"macro"}]}"#;
+    let pg_changed = r#"{"database":"pg","tables":[
+        {"schema":"public","table":"users","rows":1200,"primary_key":["id"],
+         "columns":["id","emial"],"types":["INTEGER","VARCHAR"],"nullable":[false,true]}]}"#;
+    let messages = run_session(&[
+        did_open(uri, sql),
+        catalog_message(memory),
+        catalog_message(pg),
+        // Unchanged: not linted again.
+        catalog_message(pg),
+        catalog_message(memory),
+        // The part is replaced; `memory` is as it was.
+        catalog_message(pg_changed),
+        // Dropped: `pg` is a qualifier nobody knows, so it is not checked.
+        catalog_message(r#"{"database":"pg","columns":null}"#),
+        // A part that is not there: nothing changes.
+        catalog_message(r#"{"database":"pg","columns":null}"#),
+        // The last part goes, and the catalog with it.
+        catalog_message(r#"{"database":"memory","columns":null}"#),
+    ]);
+    let ordrs = "CAT001 Table or view ordrs is not in the catalog. Did you mean orders?";
+    assert_eq!(
+        rounds_said(&messages, uri),
+        [
+            "".to_string(),
+            ordrs.to_string(),
+            format!("CAT002 Column emial is not in the table it is qualified with.; {ordrs}"),
+            ordrs.to_string(),
+            ordrs.to_string(),
+            "".to_string(),
+        ],
+        "opened, memory, pg, pg changed, pg dropped, memory dropped"
+    );
+}
+
+/// A whole snapshot and parts can follow each other: the snapshot replaces
+/// everything, a part then replaces one database of it. A part for the
+/// wrong database is refused.
+#[test]
+fn parts_and_whole_snapshots_mix_and_a_bad_part_is_refused() {
+    let uri = "file:///catalog/q.sql";
+    let messages = run_session(&[
+        did_open(uri, "SELECT * FROM ordrs; SELECT * FROM shop.main.clients;"),
+        catalog_notification(None, SHOP),
+        // The same snapshot again: nothing to lint.
+        catalog_notification(None, SHOP),
+        catalog_message(
+            r#"{"database":"shop","columns":[
+                {"schema":"main","table":"clients","column":"id","type":"BIGINT"}]}"#,
+        ),
+        catalog_message(r#"{"database":"shop","columns":[{"database":"elsewhere","table":"t"}]}"#),
+    ]);
+    assert_eq!(
+        rounds_said(&messages, uri),
+        [
+            "",
+            "CAT001 Table or view ordrs is not in the catalog. Did you mean orders?; \
+             CAT001 Table or view clients is not in the catalog.",
+            "CAT001 Table or view ordrs is not in the catalog.",
+        ]
+    );
+    let said = messages
+        .iter()
+        .find(|m| m.get("method").and_then(Json::as_str) == Some("window/showMessage"))
+        .and_then(|m| {
+            m.get("params")?
+                .get("message")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .expect("a warning");
+    assert!(said.contains("in the part for \"shop\""), "{said}");
+}
+
+/// A catalog sent under a name is used by the documents told to: two files
+/// of one session share it without it being sent twice. A document whose
+/// named catalog is not there has none, and does not fall back.
+#[test]
+fn documents_can_share_a_catalog_by_name() {
+    let a = "file:///catalog/a.sql";
+    let b = "file:///catalog/b.sql";
+    let c = "file:///catalog/c.sql";
+    let scratch = r#"{"catalog":"scratch","database":"memory","columns":[
+        {"schema":"main","table":"events","column":"ts","type":"TIMESTAMP"}]}"#;
+    let use_scratch =
+        |uri: &str| catalog_message(&format!(r#"{{"uri":"{uri}","catalog":"scratch"}}"#));
+    let messages = run_session(&[
+        did_open(a, "SELECT * FROM evnts;"),
+        did_open(b, "SELECT * FROM evnts;"),
+        did_open(c, "SELECT * FROM evnts;"),
+        catalog_notification(None, SHOP),
+        // `a` and `b` use a catalog that is not there yet: no catalog.
+        use_scratch(a),
+        use_scratch(b),
+        // Told again: nothing changes.
+        use_scratch(a),
+        // It arrives, once, for both.
+        catalog_message(scratch),
+        // The shared one changing does not reach them.
+        catalog_notification(None, "null"),
+        // The named one goes: they have none.
+        catalog_message(r#"{"catalog":"scratch","columns":null}"#),
+        // `a` goes back to the shared one, which is not there either.
+        catalog_message(&format!(r#"{{"uri":"{a}","default":true}}"#)),
+    ]);
+    let unknown = "CAT001 Table or view evnts is not in the catalog.";
+    let known = "CAT001 Table or view evnts is not in the catalog. Did you mean events?";
+    assert_eq!(
+        rounds_said(&messages, a),
+        ["", unknown, "", known, "", ""],
+        "a: opened, shared, named (absent), named arrives, named goes, default"
+    );
+    assert_eq!(rounds_said(&messages, b), ["", unknown, "", known, ""]);
+    assert_eq!(
+        rounds_said(&messages, c),
+        ["", unknown, ""],
+        "c: opened, shared, shared cleared"
+    );
+}
+
+/// Completion reads the parts: a database's schemas and tables, a table's
+/// columns, and names by prefix.
+#[test]
+fn completion_reads_a_catalog_sent_in_parts() {
+    let uri = "file:///catalog/c.sql";
+    let sql = "SELECT u. FROM pg.public.users u;\nSELECT * FROM pg.public.;\nSELECT * FROM us";
+    let at = |id: i64, line: u32, character: u32| {
+        request(
+            id,
+            "textDocument/completion",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                (
+                    "position".into(),
+                    Json::object(vec![
+                        ("line".into(), Json::num(line)),
+                        ("character".into(), Json::num(character)),
+                    ]),
+                ),
+            ]),
+        )
+    };
+    let messages = run_session(&[
+        did_open(uri, sql),
+        catalog_message(
+            r#"{"database":"memory","columns":[
+                {"schema":"main","table":"usage","column":"n","type":"INT"}]}"#,
+        ),
+        catalog_message(
+            r#"{"database":"pg","tables":[
+                {"schema":"public","table":"users","columns":["id","email"],"types":["INTEGER","VARCHAR"]},
+                {"schema":"public","table":"orders","columns":["id"],"types":["INTEGER"]}]}"#,
+        ),
+        at(11, 0, 9),
+        at(12, 1, 24),
+        at(13, 2, 16),
+    ]);
+    let labels = |id: f64| -> Vec<String> {
+        let resp = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Json::as_f64) == Some(id))
+            .expect("a response");
+        let mut out: Vec<String> = resp
+            .get("result")
+            .and_then(|r| r.get("items"))
+            .and_then(Json::as_array)
+            .expect("items")
+            .iter()
+            .filter_map(|i| i.get("label").and_then(Json::as_str).map(str::to_string))
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(labels(11.0), ["email", "id"]);
+    assert_eq!(labels(12.0), ["orders", "users"]);
+    assert_eq!(labels(13.0), ["USING", "usage", "users"]);
+}
+
 /// `catalog = "..."` in grebe.toml gives an editor that sends no catalog
 /// the same checks `grebe check` runs.
 #[test]
@@ -1047,5 +1256,239 @@ fn a_cat_suggestion_is_a_quick_fix() {
     assert_eq!(
         edit[0].get("newText").and_then(Json::as_str),
         Some("orders")
+    );
+}
+
+fn lsp_position(line: u32, character: u32) -> Json {
+    Json::object(vec![
+        ("line".into(), Json::num(line)),
+        ("character".into(), Json::num(character)),
+    ])
+}
+
+fn lsp_range(start: (u32, u32), end: (u32, u32)) -> Json {
+    Json::object(vec![
+        ("start".into(), lsp_position(start.0, start.1)),
+        ("end".into(), lsp_position(end.0, end.1)),
+    ])
+}
+
+fn result_of(messages: &[Json], id: f64) -> Json {
+    messages
+        .iter()
+        .find(|m| m.get("id").and_then(Json::as_f64) == Some(id))
+        .and_then(|m| m.get("result").cloned())
+        .unwrap_or_else(|| panic!("no result for request {id}"))
+}
+
+/// `(range, newText)` of each text edit, the range as
+/// `[start line, start character, end line, end character]`.
+fn text_edits(edits: &Json) -> Vec<([u32; 4], String)> {
+    let at = |r: &Json, end: &str, field: &str| {
+        r.get(end)
+            .and_then(|p| p.get(field))
+            .and_then(Json::as_f64)
+            .unwrap() as u32
+    };
+    edits
+        .as_array()
+        .expect("an array of text edits")
+        .iter()
+        .map(|e| {
+            let r = e.get("range").unwrap();
+            (
+                [
+                    at(r, "start", "line"),
+                    at(r, "start", "character"),
+                    at(r, "end", "line"),
+                    at(r, "end", "character"),
+                ],
+                e.get("newText").and_then(Json::as_str).unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The words of `sql`: what a rewrite says, whatever lines it is laid out on.
+fn sql_words(sql: &str) -> Vec<&str> {
+    sql.split_whitespace().collect()
+}
+
+const CONVENTIONAL: &str = "select a, count(*) from t group by a;\n\
+                            select * from u;\n\
+                            from v select b;\n";
+
+/// `grebe/friendly` with no range rewrites the whole document: the friendly
+/// fixes, to a fixed point, then the formatter.
+#[test]
+fn friendly_rewrites_the_whole_document() {
+    let uri = "file:///friendly/whole.sql";
+    let messages = run_session(&[
+        did_open(uri, CONVENTIONAL),
+        request(
+            2,
+            "grebe/friendly",
+            Json::object(vec![("textDocument".into(), text_document(uri, vec![]))]),
+        ),
+    ]);
+    let edits = text_edits(&result_of(&messages, 2.0));
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].0, [0, 0, 3, 0], "the whole document");
+    assert_eq!(
+        sql_words(&edits[0].1),
+        sql_words("FROM t SELECT a, count() GROUP BY ALL; FROM u; FROM v SELECT b;")
+    );
+    assert_eq!(
+        grebe_format::format(&edits[0].1, &grebe_format::Options::default()),
+        edits[0].1,
+        "the result is formatted"
+    );
+}
+
+/// With a range, only the statements it touches are rewritten, each as its
+/// own edit; a statement with nothing to fix gets none.
+#[test]
+fn friendly_rewrites_only_the_selected_statements() {
+    let uri = "file:///friendly/selection.sql";
+    let messages = run_session(&[
+        did_open(uri, CONVENTIONAL),
+        // From inside the second statement to inside the third.
+        request(
+            2,
+            "grebe/friendly",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                ("range".into(), lsp_range((1, 3), (2, 4))),
+            ]),
+        ),
+        // A cursor in the first.
+        request(
+            3,
+            "grebe/friendly",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                ("range".into(), lsp_range((0, 5), (0, 5))),
+            ]),
+        ),
+    ]);
+    let edits = text_edits(&result_of(&messages, 2.0));
+    assert_eq!(edits.len(), 1, "the third is friendly already: {edits:?}");
+    assert_eq!(
+        edits[0].0,
+        [1, 0, 1, 16],
+        "the second statement, `;` included"
+    );
+    assert_eq!(sql_words(&edits[0].1), sql_words("FROM u;"));
+
+    let edits = text_edits(&result_of(&messages, 3.0));
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].0, [0, 0, 0, 37]);
+    assert_eq!(
+        sql_words(&edits[0].1),
+        sql_words("FROM t SELECT a, count() GROUP BY ALL;")
+    );
+}
+
+/// Nothing to rewrite, or a document never opened: no edits.
+#[test]
+fn friendly_has_no_edits_for_friendly_sql() {
+    let uri = "file:///friendly/done.sql";
+    let params =
+        |uri: &str| Json::object(vec![("textDocument".into(), text_document(uri, vec![]))]);
+    let messages = run_session(&[
+        did_open(uri, "from   v select b;\nselect 1;\n"),
+        request(2, "grebe/friendly", params(uri)),
+        request(3, "grebe/friendly", params("file:///friendly/unknown.sql")),
+    ]);
+    assert_eq!(result_of(&messages, 2.0), Json::Array(vec![]));
+    assert_eq!(result_of(&messages, 3.0), Json::Array(vec![]));
+}
+
+/// The rewrite is also a source code action, offered only when asked for by
+/// kind, and advertised in the capabilities.
+#[test]
+fn friendly_is_a_source_action_when_asked_for() {
+    let uri = "file:///friendly/action.sql";
+    let code_action = |id: i64, only: Option<&[&str]>| {
+        let mut context = vec![("diagnostics".to_string(), Json::Array(vec![]))];
+        if let Some(kinds) = only {
+            context.push((
+                "only".to_string(),
+                Json::Array(kinds.iter().map(|k| Json::str(*k)).collect()),
+            ));
+        }
+        request(
+            id,
+            "textDocument/codeAction",
+            Json::object(vec![
+                ("textDocument".into(), text_document(uri, vec![])),
+                ("range".into(), lsp_range((0, 0), (3, 0))),
+                ("context".into(), Json::object(context)),
+            ]),
+        )
+    };
+    let messages = run_session(&[
+        did_open(uri, CONVENTIONAL),
+        code_action(2, Some(&["source.grebe.friendly"])),
+        code_action(3, Some(&["source"])),
+        code_action(4, None),
+        code_action(5, Some(&["source.fixAll"])),
+        code_action(6, Some(&["source.grebe.friend"])),
+    ]);
+    let kinds = messages[0]
+        .get("result")
+        .and_then(|r| r.get("capabilities"))
+        .and_then(|c| c.get("codeActionProvider"))
+        .and_then(|p| p.get("codeActionKinds"))
+        .and_then(Json::as_array)
+        .expect("codeActionProvider.codeActionKinds");
+    assert!(kinds.contains(&Json::str("quickfix")), "{kinds:?}");
+    assert!(
+        kinds.contains(&Json::str("source.grebe.friendly")),
+        "{kinds:?}"
+    );
+
+    let friendly = |id: f64| -> Vec<Json> {
+        result_of(&messages, id)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a.get("kind").and_then(Json::as_str) == Some("source.grebe.friendly"))
+            .cloned()
+            .collect()
+    };
+    for id in [2.0, 3.0] {
+        let actions = friendly(id);
+        assert_eq!(actions.len(), 1, "request {id}");
+        assert_eq!(
+            actions[0].get("title").and_then(Json::as_str),
+            Some("Rewrite as friendly SQL")
+        );
+        let edits = actions[0]
+            .get("edit")
+            .and_then(|e| e.get("changes"))
+            .and_then(|c| c.get(uri))
+            .expect("edits for the document");
+        let edits = text_edits(edits);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            sql_words(&edits[0].1),
+            sql_words("FROM t SELECT a, count() GROUP BY ALL; FROM u; FROM v SELECT b;")
+        );
+    }
+    // Not under the lightbulb, not for "fix all", not for a kind that only
+    // starts with the same letters.
+    for id in [4.0, 5.0, 6.0] {
+        assert!(friendly(id).is_empty(), "request {id}");
+    }
+    // The quick fixes are still there without `only`.
+    let quick = result_of(&messages, 4.0);
+    assert!(
+        quick
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a.get("kind").and_then(Json::as_str) == Some("quickfix")),
+        "{quick:?}"
     );
 }

@@ -104,7 +104,7 @@ pub fn selection<'a>(
 /// built-in defaults, with any `[format]` knob a config sets overlaid on
 /// top.
 ///
-/// The three `[format]` knobs are the whole style surface, and they live in
+/// The `[format]` knobs are the whole style surface, and they live in
 /// the config file only -- no command-line flags -- so a project has one
 /// style regardless of who or what invokes the formatter.
 #[must_use]
@@ -121,6 +121,19 @@ pub fn format_options(config: Option<&Config>) -> grebe_format::Options {
         opts.keyword_case = match kc {
             grebe_rules::config::KeywordCase::Upper => grebe_format::KeywordCase::Upper,
             grebe_rules::config::KeywordCase::Lower => grebe_format::KeywordCase::Lower,
+        };
+    }
+    if let Some(on) = c.format.function_paren_space {
+        opts.function_paren_space = on;
+    }
+    if let Some(on) = c.format.keyword_paren_space {
+        opts.keyword_paren_space = on;
+    }
+    if let Some(s) = c.format.semicolon {
+        opts.semicolon = match s {
+            grebe_rules::config::Semicolon::Attached => grebe_format::Semicolon::Attached,
+            grebe_rules::config::Semicolon::Spaced => grebe_format::Semicolon::Spaced,
+            grebe_rules::config::Semicolon::Newline => grebe_format::Semicolon::Newline,
         };
     }
     opts

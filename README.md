@@ -81,6 +81,29 @@ Exit codes: `0` clean, `1` an error-severity finding (or `format --check`
 found work), `2` usage or config error, or a file that could not be read
 (missing, or not UTF-8) or written.
 
+### Friendly SQL
+
+`--select FRIENDLY` names the rules that rewrite conventional SQL into
+DuckDB's friendly SQL, all with a safe fix, so this turns a file into that
+style without changing what its queries return:
+
+```sh
+grebe check --fix --select FRIENDLY query.sql && grebe format query.sql
+```
+
+```sql
+SELECT region, count(*) AS orders FROM sales WHERE year = 2024 GROUP BY region;
+-- becomes
+FROM sales SELECT region, orders: count() WHERE year = 2024 GROUP BY ALL;
+```
+
+The rules: FROM before SELECT (MOD041), a bare `SELECT *` dropped (MOD022),
+`GROUP BY ALL` (MOD003), `ORDER BY ALL` (MOD013), `count()` (MOD001),
+`count_if` (MOD030) and prefix aliases (MOD023). `FRIENDLY` can stand among
+other codes (`--select FRIENDLY,MOD006`) and in a config file's `select`.
+In the editor the same rewrite is the command **grebe: Rewrite as Friendly
+SQL**.
+
 ## Configuration
 
 `grebe.toml`, or `[tool.grebe]` in `pyproject.toml`, found upward from the
@@ -91,16 +114,29 @@ include = ["**/*.sql"]
 exclude = ["generated/**"]
 # select = ["MOD001", "MOD010"]  # run only these MOD rules (opt-in ones included)
 # select = ["ALL"]               # every MOD rule, default-on and opt-in alike
+# select = ["FRIENDLY"]          # the safe rewrites into DuckDB's friendly SQL
 # catalog = "catalog.json"       # a catalog snapshot: turns on CAT001 and CAT002
 
 [severity]
 MOD001 = "warning"   # error | warning | info | off; a level turns an opt-in rule on
 
 [format]
-indent_size      = 4
-inline_threshold = 100
-keyword_case     = "upper"
+indent_size          = 4           # spaces per indent level, 1 to 16
+inline_threshold     = 100         # what fits in this many columns stays on one line
+keyword_case         = "upper"     # or "lower"
+function_paren_space = false       # true: count (x), coalesce (a, b)
+keyword_paren_space  = true        # false: IN(1, 2), AS(...), OVER(...)
+semicolon            = "attached"  # "spaced": n ;  "newline": ; on its own line
 ```
+
+The values shown are the defaults. `function_paren_space` covers every call:
+functions, aggregates, window and table functions, methods, a macro's
+parameter list, and the keyword forms that read as calls (`CAST`,
+`COALESCE`, `EXTRACT`, `ROLLUP` and the like). A type's modifiers always hug
+(`decimal(18, 2)`). `keyword_paren_space` covers every other parenthesis that
+follows a keyword (`IN`, `VALUES`, `OVER`, `AS`, `EXISTS`, `USING`, `FILTER`,
+`FROM`, `ON`, ...); a parenthesis after a name, as in `INSERT INTO t (a, b)`,
+is not affected by either.
 
 Silence one statement with `-- grebe: ignore[CODE]`, or every code with
 `-- grebe: ignore`.
@@ -124,6 +160,12 @@ A catalog is a snapshot file: a JSON array with one object per column.
 ```json
 [{"database": "shop", "schema": "main", "table": "orders", "column": "id", "type": "BIGINT"}]
 ```
+
+`grebe catalog --with-metadata` writes an object instead, which is read
+wherever the array is: the same rows under `"columns"`, each with
+`"nullable"`, and under `"tables"` what DuckDB knows of each table (its
+`kind`, estimated `rows`, `primary_key`, `unique` constraints and
+`indexes`). No rule reads those yet.
 
 `grebe catalog` writes one by running your own `duckdb` CLI, read-only, on
 a database file:
@@ -149,6 +191,16 @@ The language server completes from the same catalog: columns after
 `name.`, on statements that do not parse yet. An editor with a database
 open can send its catalog directly (the VS Code extension sends the
 session's); any other LSP client gets the `grebe.toml` one.
+
+An editor sends it with the `grebe/catalog` notification: the whole
+snapshot (`{ columns: [...] }`), or one database at a time
+(`{ database: "pg", columns: [...] }` replaces that database's part and
+leaves the others, `{ database: "pg", columns: null }` drops it), so a
+large attached database is sent once and the small local ones after every
+run. The VS Code extension does that: it reads a PostgreSQL, SQLite or
+MySQL attachment once, keeps it between windows, and leaves out, alone, a
+database of more than 500,000 columns. Looking a name up costs the same in
+a catalog of a million columns as in a small one.
 
 These rules match names; they do not bind. They report only what cannot be
 right, and say nothing when a statement or a file does something they do

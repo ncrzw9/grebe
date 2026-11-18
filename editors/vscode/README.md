@@ -139,7 +139,8 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
   file or the server, so another program can have it, and stays in the
   Catalog as *detached*. It is left alone when the session starts, and
   **Attach Again** brings it back, in the same mode. **Forget** takes a
-  connection off the list. With `grebe.duckdb.reattach: false` nothing is
+  connection off the list. The list is shown before the session starts
+  too, so you can see what it will attach. With `grebe.duckdb.reattach: false` nothing is
   attached when a session starts: every connection is listed, and attached
   when you ask.
 - **Connections in settings.** `grebe.duckdb.connections` declares
@@ -296,6 +297,50 @@ turns it off. The same check runs from the command line with a snapshot:
 `grebe check --catalog catalog.json` (see the
 [grebe README](https://github.com/ncrzw9/grebe#catalog)).
 
+The editor keeps this **database by database**, so a large connection
+costs its price once and cannot take the rest down with it:
+
+- **Local databases** -- the session's own, in-memory and TEMP ones,
+  attached DuckDB files -- are read again after a run, and only the ones
+  that changed are sent to the language server.
+- **A foreign database** -- PostgreSQL, SQLite, MySQL, anything that is
+  not DuckDB's own -- is read **once**, when it is first attached. It is
+  read again when a statement changes it (`CREATE`, `ALTER`, `DROP`, ...
+  that names it, or any of them while it is the current database), when
+  its index is older than `grebe.duckdb.catalogIndexMaxAge` minutes
+  (default 60), and when you ask: **Refresh Connection Index** on the
+  database in the Catalog, or the Catalog's **Refresh** button. Tables
+  someone else creates on the server appear after one of those. Its
+  system schemas (`pg_catalog`, `information_schema`) are not indexed;
+  names in them are neither completed nor marked.
+- **Between windows** the index of a foreign database is kept in the
+  editor's storage for the workspace, so its names are there as soon as
+  the connection is attached again. The file is named by a hash of the
+  connection and holds table and column names; the connection string and
+  its password are never written. It is deleted when you **Forget** the
+  connection.
+- **A database of more than 500,000 columns** is left out, alone: the
+  Catalog marks it *not in the editor: too large*, the output channel
+  says so once, and every other database still completes and is checked.
+- The index also records what DuckDB (or, for PostgreSQL, the server's
+  own catalog) knows of each table: whether a column may be NULL, the
+  estimated row count, the primary key, unique constraints and indexes.
+  Nothing uses these yet; they are there for rules to come.
+
+Reading a database for the editor happens after a run's results are
+shown, never during a run, and one database at a time. A run that starts
+while one is being read does not wait for it: the reading is interrupted
+and taken up again afterwards. (Not on Windows, where DuckDB cannot be
+interrupted without ending the session: there the run waits for the one
+query in flight. And DuckDB walks every attached database to answer any
+question about its catalog, so with a very large connection attached the
+re-reading after a `CREATE` takes a moment: about 0.2 s with 5,000
+PostgreSQL tables. A run of nothing but queries reads nothing.)
+
+`grebe.duckdb.catalogIndex: false` goes back to reading everything after
+every run and sending it as one snapshot, with a limit of 100,000 columns
+in all, past which the editor gets no catalog.
+
 ### PostgreSQL
 
 From the plug icon choose **PostgreSQL...**, or run **grebe: Attach
@@ -406,6 +451,11 @@ timing, and on a failure the whole statement and where DuckDB stopped),
   as `{ alias, path, type?, readOnly? }` (see [Sessions](#sessions)).
 - `grebe.duckdb.catalogInEditor`: give the language server the session's
   tables and columns for completion and the `CAT` checks (default on).
+- `grebe.duckdb.catalogIndex`: keep that database by database, reading a
+  foreign database once instead of after every run (default on; see
+  [The catalog in the editor](#the-catalog-in-the-editor)).
+- `grebe.duckdb.catalogIndexMaxAge`: minutes after which a foreign
+  database is read again (default 60; 0 never does by age).
 - `grebe.duckdb.maxRows`: most rows a query shows, and read from a data file
   opened in the grid (default 10,000). DuckDB stops producing rows there;
   **Count** gives the full total and Export always writes every row.
@@ -478,6 +528,41 @@ that call.
 The same fixes are available in bulk from the CLI: `grebe check PATH --fix`,
 plus `--unsafe` for the second band.
 
+## Rewriting as friendly SQL
+
+**grebe: Rewrite as Friendly SQL** (Command Palette, or the editor's context
+menu) turns conventional SQL into DuckDB's friendly SQL and formats the
+result:
+
+```sql
+SELECT region, count(*) AS orders FROM sales WHERE year = 2024 GROUP BY region;
+-- becomes
+FROM sales SELECT region, orders: count() WHERE year = 2024 GROUP BY ALL;
+```
+
+With a selection it rewrites the statements the selection touches and leaves
+the rest of the file alone; with none, the whole file. A statement it has
+nothing to change in is not reformatted. It is one undo step.
+
+It applies the rules the CLI calls `FRIENDLY`, the same as
+`grebe check --fix --select FRIENDLY`: FROM before SELECT (MOD041), a bare
+`SELECT *` dropped (MOD022), `GROUP BY ALL` (MOD003), `ORDER BY ALL`
+(MOD013), `count()` (MOD001), `count_if` (MOD030) and prefix aliases
+(MOD023). Each rewrite returns the same rows as the SQL it replaces. A
+query with a comment between `SELECT` and the end of its `FROM` clause keeps
+its clause order, so the comment stays where you put it, and a statement
+marked `-- grebe: ignore` is not rewritten. `grebe.select` does not change
+what the command applies.
+
+The rewrite is also a code action of kind `source.grebe.friendly`, for the
+whole file. To run it on every save:
+
+```json
+"[sql]": {
+  "editor.codeActionsOnSave": { "source.grebe.friendly": "explicit" }
+}
+```
+
 ## Silencing a finding
 
 Put `-- grebe: ignore[CODE]` on the statement — either on a line before it, or
@@ -500,8 +585,9 @@ not in CI would be worse than none.
 
 **Format Document** (and format-on-save, if you turn it on for SQL) asks the
 server for `textDocument/formatting`, which runs the same formatter as
-`grebe format`. Layout has three knobs and they live in `grebe.toml`'s
-`[format]` table (`indent_size`, `inline_threshold`, `keyword_case`), found
+`grebe format`. Layout has a few knobs and they live in `grebe.toml`'s
+`[format]` table (`indent_size`, `inline_threshold`, `keyword_case`,
+`function_paren_space`, `keyword_paren_space`, `semicolon`), found
 by walking upward from the file being formatted; the editor's `tabSize` is
 ignored on purpose, so the editor and CI never disagree about a file. The
 same `grebe.toml` also supplies `select`, `[severity]` overrides and

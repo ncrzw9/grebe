@@ -62,6 +62,12 @@ const INTERRUPTIBLE = process.platform !== "win32";
 // hold the session forever.
 const CANCEL_GRACE_MS = 3000;
 
+// On Windows the CLI ends every line it writes with "\r\n". What is read
+// from it is given Unix line ends there, so the rest of this file sees the
+// same text on every system. (A line break inside a value is escaped in
+// JSON, so only the CLI's own line ends are touched.)
+const unixLines = process.platform === "win32" ? (text) => text.replace(/\r\n/g, "\n") : (text) => text;
+
 // Every session not yet ended, so they can all be ended together.
 const live = new Set();
 
@@ -256,6 +262,7 @@ class Session {
     this.waiting = null; // { marker, resolve, reject }
     this.collecting = false; // a statement's marker is in, its stderr may not be
     this.queue = Promise.resolve();
+    this.gaveWay = 0; // how many times giveWay() was called
     this.closedWith = null;
     this.starting = false;
     this.dir = opts.cwd; // the working directory now (see chdir)
@@ -327,13 +334,21 @@ class Session {
    * `timeoutMs` ran out ("timeout"). Rejects when the session ends under it;
    * the error has `ended: true`, and `cancelled` when ending it was how a
    * cancel had to be done.
+   *
+   * `background` marks a statement nobody is waiting to see (the catalog
+   * index reading a database): giveWay() stops it, and one still queued
+   * when giveWay() is called is not run at all. Both resolve as cancelled
+   * with the reason "yield".
    */
-  run(sql, { timeoutMs = 0 } = {}) {
+  run(sql, { timeoutMs = 0, background = false } = {}) {
+    const asked = this.gaveWay;
     const job = this.queue.then(async () => {
+      if (background && asked !== this.gaveWay) return { kind: "cancelled", reason: "yield", ms: 0 };
       const started = process.hrtime.bigint();
       const trimmed = sql.replace(/\s+$/, "");
       const terminated = trimmed.endsWith(";") ? trimmed : `${trimmed}\n;`;
       const sent = this.send(terminated);
+      if (background && this.waiting) this.waiting.background = true;
       const timer = timeoutMs > 0 ? setTimeout(() => this.cancel("timeout"), timeoutMs) : null;
       let reply;
       try {
@@ -423,6 +438,22 @@ class Session {
       if (this.waiting === w) this.end(`cancelled; DuckDB did not stop within ${grace / 1000} s, so the session was ended`);
     }, grace);
     if (timer.unref) timer.unref();
+    return true;
+  }
+
+  /**
+   * A run is about to use the session: background statements make room.
+   * The one in flight, if it is a background one, is interrupted; those
+   * queued are dropped. Unlike cancel() this never ends the session: a
+   * statement that does not stop is waited for, and on Windows, where an
+   * interrupt would end the process, the one in flight is left to finish.
+   */
+  giveWay() {
+    this.gaveWay++;
+    const w = this.waiting;
+    if (!w || !w.background || w.cancelled || this.starting || this.closedWith !== null || !INTERRUPTIBLE) return false;
+    w.cancelled = "yield";
+    this.proc.kill("SIGINT");
     return true;
   }
 
@@ -518,17 +549,23 @@ class Session {
     if (!w || this.chunks.length === 0) return;
     // The marker is ASCII and at most one chunk boundary can split it, so
     // only the newest chunk plus the tail of the one before need searching.
-    const needle = Buffer.from(`${w.marker}\n`);
+    // The line ends with a newline, which on Windows is "\r\n": the CLI's
+    // stdout is in text mode there.
+    const needle = Buffer.from(w.marker);
     const last = this.chunks[this.chunks.length - 1];
     const prev = this.chunks.length > 1 ? this.chunks[this.chunks.length - 2] : null;
-    const tailLen = prev ? Math.min(prev.length, needle.length - 1) : 0;
+    const tailLen = prev ? Math.min(prev.length, needle.length + 1) : 0;
     const window = tailLen ? Buffer.concat([prev.subarray(prev.length - tailLen), last]) : last;
     const hit = window.indexOf(needle);
     if (hit < 0) return;
+    let end = hit + needle.length;
+    if (window[end] === 0x0d) end++;
+    if (window[end] !== 0x0a) return; // the end of the line has not arrived
+    end++;
     const all = Buffer.concat(this.chunks);
     const at = all.length - window.length + hit;
-    const out = all.subarray(0, at).toString("utf8");
-    const rest = all.subarray(at + needle.length);
+    const out = unixLines(all.subarray(0, at).toString("utf8"));
+    const rest = all.subarray(all.length - window.length + end);
     this.chunks = rest.length ? [rest] : [];
     this.waiting = null;
     this.collecting = true;
@@ -537,7 +574,7 @@ class Session {
     // stderr for this statement was written before the marker reached
     // stdout, so it is readable by the time the event loop turns once more.
     setImmediate(() => {
-      const err = this.err;
+      const err = unixLines(this.err);
       this.err = "";
       this.collecting = false;
       w.resolve({ out, err, cancelled });

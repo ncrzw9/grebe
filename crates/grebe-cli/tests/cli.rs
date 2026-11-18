@@ -387,6 +387,85 @@ fn select_all_combined_with_another_code_is_unknown() {
 }
 
 #[test]
+fn fix_with_select_friendly_rewrites_conventional_sql() {
+    let dir = TempDir::new("select-friendly");
+    let conventional = "\
+WITH recent AS (SELECT id, region FROM orders WHERE placed > DATE '2024-01-01')
+SELECT region, count(*) AS n FROM recent GROUP BY region ORDER BY region, n;
+SELECT * FROM orders WHERE id = 1;
+SELECT ifnull(a, 0) FROM t WHERE a = NULL;
+SELECT a, b FROM t ORDER BY a, b;
+";
+    dir.write("a.sql", conventional);
+
+    // Without --fix it only reports, and only the friendly rules.
+    let out = grebe(
+        dir.path(),
+        &["check", "--no-config", "--select", "friendly", "a.sql"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for code in ["MOD001", "MOD003", "MOD013", "MOD022", "MOD023", "MOD041"] {
+        assert!(stdout.contains(code), "{code} missing from:\n{stdout}");
+    }
+    for code in ["MOD002", "MOD006"] {
+        assert!(!stdout.contains(code), "{code} is not friendly:\n{stdout}");
+    }
+    assert_eq!(dir.read("a.sql"), conventional);
+
+    let out = grebe(
+        dir.path(),
+        &[
+            "check",
+            "--no-config",
+            "--fix",
+            "--select",
+            "FRIENDLY",
+            "a.sql",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        dir.read("a.sql"),
+        "\
+WITH recent AS (FROM orders SELECT id, region WHERE placed > DATE '2024-01-01')
+FROM recent SELECT region, n: count() GROUP BY ALL ORDER BY region, n;
+ FROM orders WHERE id = 1;
+FROM t SELECT ifnull(a, 0) WHERE a = NULL;
+FROM t SELECT a, b ORDER BY ALL;
+"
+    );
+
+    // Nothing is left for a second run.
+    let out = grebe(
+        dir.path(),
+        &["check", "--no-config", "--select", "FRIENDLY", "a.sql"],
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+
+    // FRIENDLY can stand among other codes; ALL still cannot.
+    let out = grebe(
+        dir.path(),
+        &[
+            "check",
+            "--no-config",
+            "--select",
+            "FRIENDLY,MOD006",
+            "a.sql",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MOD006"), "{stdout}");
+
+    // In a config file too.
+    dir.write("grebe.toml", "select = [\"FRIENDLY\"]\n");
+    dir.write("b.sql", "SELECT a FROM t;\n");
+    let out = grebe(dir.path(), &["check", "--fix", "b.sql"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(dir.read("b.sql"), "FROM t SELECT a;\n");
+}
+
+#[test]
 fn a_file_that_is_not_utf8_fails_the_run() {
     let dir = TempDir::new("not-utf8");
     std::fs::write(dir.path().join("bad.sql"), b"select 1;\n\xff\xfe;\n").expect("write");
@@ -638,5 +717,84 @@ fn catalog_snapshot_of_a_real_database_round_trips() {
     assert_eq!(
         stdout(&out),
         "q.sql:2:10: CAT002 unknown-column (did you mean \"Order Date\"?)\n"
+    );
+
+    // --with-metadata: the object form, which reads the same and says more.
+    let out = grebe(
+        dir.path(),
+        &[
+            "catalog",
+            "--with-metadata",
+            "--duckdb",
+            &cli,
+            "shop.duckdb",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), "2 table(s) and view(s), 3 column(s)");
+    let text = stdout(&out);
+    assert!(text.starts_with("{\"columns\": ["), "{text}");
+    assert!(text.contains("\"nullable\":true"), "{text}");
+    assert!(
+        text.contains("\"table\":\"recent\",\"kind\":\"view\""),
+        "{text}"
+    );
+    dir.write("catalog.json", &text);
+    let out = grebe(dir.path(), &["check", "--catalog", "catalog.json", "q.sql"]);
+    assert_eq!(
+        stdout(&out),
+        "q.sql:2:10: CAT002 unknown-column (did you mean \"Order Date\"?)\n"
+    );
+}
+
+/// `--with-metadata` asks duckdb twice and puts the answers together.
+#[cfg(unix)]
+#[test]
+fn catalog_with_metadata_prints_columns_and_tables() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("catalog-meta");
+    dir.write("shop.duckdb", "");
+    let fake = dir.write(
+        "duckdb",
+        "#!/bin/sh\n\
+         case \"$6\" in\n\
+         *duckdb_tables*) cat tables.json ;;\n\
+         *is_nullable*) cat snapshot.json ;;\n\
+         *) echo unexpected ;;\n\
+         esac\n",
+    );
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir.write("snapshot.json", SHOP);
+    dir.write(
+        "tables.json",
+        "[{\"database\":\"shop\",\"schema\":\"main\",\"table\":\"orders\",\"kind\":\"table\",\
+         \"rows\":12,\"primary_key\":[\"id\"],\"unique\":[],\"indexes\":null}]\n",
+    );
+    let out = grebe(
+        dir.path(),
+        &[
+            "catalog",
+            "--duckdb",
+            "./duckdb",
+            "--with-metadata",
+            "shop.duckdb",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out).trim(), "1 table(s) and view(s), 2 column(s)");
+    let text = stdout(&out);
+    assert!(text.starts_with("{\"columns\": ["), "{text}");
+    assert!(
+        text.contains("\"tables\": [{\"database\":\"shop\""),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with("}]}"), "{text}");
+    // And `check` reads what it wrote.
+    dir.write("catalog.json", &text);
+    dir.write("q.sql", "SELECT * FROM ordrs;\n");
+    let out = grebe(dir.path(), &["check", "--catalog", "catalog.json", "q.sql"]);
+    assert_eq!(
+        stdout(&out),
+        "q.sql:1:15: CAT001 unknown-table (did you mean orders?)\n"
     );
 }

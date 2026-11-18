@@ -80,8 +80,10 @@ pub struct Matcher<'a> {
     /// Packrat state for every `(rule, token position)` in the window
     /// `base..base + width`, at `rule * width + (token - base)`: [`UNSEEN`],
     /// [`ACTIVE`] (being matched; re-entering means left recursion),
-    /// [`FAILED`], or `HIT_BASE + i` for `hits[i]`. A flat table, so a rule
-    /// entry is an array read.
+    /// [`FAILED`], or a match: `HIT_BASE + i` for `hits[i]` while nodes are
+    /// built as rules match, and `HIT_BASE` plus the token the match ended
+    /// at otherwise, when there is no subtree to remember. A flat table, so
+    /// a rule entry is an array read.
     ///
     /// The window is one top-level statement: `Program <- TopLevelStatement*`
     /// never backtracks into a statement it has matched, so when the next
@@ -92,8 +94,12 @@ pub struct Matcher<'a> {
     /// again, ~120 KB per line of typical SQL.
     memo: Vec<u32>,
     /// The window slots written since the window opened, so the next
-    /// statement can reset those and nothing else.
+    /// statement can reset those and nothing else. Up to [`TOUCHED_LIMIT`]:
+    /// past that the list would rival the table (a statement of a million
+    /// tokens writes ten million slots), so it is given up, `touched_all`
+    /// is set, and the table is replaced instead of reset.
     touched: Vec<usize>,
+    touched_all: bool,
     base: usize,
     width: usize,
     /// Entries outside the window (lookahead past a statement's `;`),
@@ -103,8 +109,9 @@ pub struct Matcher<'a> {
     positions: usize,
     /// The `TopLevelStatement*` loop of `Program`, where windows begin.
     statements: Option<ExprId>,
-    /// Successful matches: where each ended, and its subtree as a range of
-    /// `pool`.
+    /// Successful matches made while building nodes: where each ended, and
+    /// its subtree as a range of `pool`. Empty otherwise: a statement is
+    /// matched without nodes first, and its matches are in `memo` whole.
     ///
     /// The subtree matters: a memo that stored only the end position would
     /// skip node construction on every hit, and expression rules are
@@ -155,12 +162,38 @@ const HIT_BASE: u32 = 3;
 /// a contiguous run that carries no ids. Memoising or replaying one is a
 /// plain copy; parent and child links are derived once, after the match, by
 /// [`link`].
-#[derive(Clone, Copy)]
-struct RawNode {
-    rule: RuleId,
-    span: Span,
+///
+/// A node covers the code tokens `start..end`, counted without trivia. A
+/// node that matched nothing (an absent optional clause) has `start == end`,
+/// at the token that follows it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FlatNode {
+    pub rule: RuleId,
+    pub start: u32,
+    pub end: u32,
     /// Number of descendants.
-    size: u32,
+    pub size: u32,
+}
+
+type RawNode = FlatNode;
+
+/// The byte span of a node over the code tokens `start..end`: from the first
+/// token's start to the last token's end, and empty, at the next token (or
+/// the end of the last one), for a node that matched nothing.
+fn byte_span(tokens: &[(Token, usize)], start: usize, end: usize) -> Span {
+    let start_byte = if start < tokens.len() {
+        tokens[start].0.span.start
+    } else if let Some(last) = tokens.last() {
+        last.0.span.end
+    } else {
+        0
+    };
+    let end_byte = if end > start && end <= tokens.len() {
+        tokens[end - 1].0.span.end
+    } else {
+        start_byte
+    };
+    Span::new(start_byte, end_byte)
 }
 
 // A FIRST set's flags (build.rs computes the sets and has the same bits).
@@ -190,6 +223,9 @@ fn literal_id(text: &[u8]) -> u16 {
 /// Largest memo table kept for the next parse on the thread: 64 MB.
 const SPARE_MEMO_LIMIT: usize = 1 << 24;
 
+/// Most slots listed in `Matcher::touched`: 8 MB of them.
+const TOUCHED_LIMIT: usize = 1 << 20;
+
 thread_local! {
     /// A memo table with every slot [`UNSEEN`], left by the last matcher.
     static SPARE_MEMO: std::cell::Cell<Vec<u32>> = const { std::cell::Cell::new(Vec::new()) };
@@ -197,7 +233,7 @@ thread_local! {
 
 impl Drop for Matcher<'_> {
     fn drop(&mut self) {
-        if self.memo.len() > SPARE_MEMO_LIMIT {
+        if self.memo.len() > SPARE_MEMO_LIMIT || self.touched_all {
             return;
         }
         for &i in &self.touched {
@@ -253,6 +289,7 @@ impl<'a> Matcher<'a> {
             // a table of its own.
             memo: SPARE_MEMO.with(|m| m.take()),
             touched: Vec::new(),
+            touched_all: false,
             base: 0,
             width: 0,
             overflow: HashMap::new(),
@@ -283,11 +320,12 @@ impl<'a> Matcher<'a> {
         self.base = at;
         self.width = end - at + 1;
         let needed = RULES.len() * self.width;
-        if needed > self.memo.len() {
+        if needed > self.memo.len() || self.touched_all {
             // A fresh zeroed table, not a resized one: the allocator hands
             // out zeroed pages lazily, so only the slots this statement
             // touches cost anything -- a file with no `;` is one window
             // over the whole file.
+            self.memo = Vec::new(); // the old table goes before the new one comes
             self.memo = vec![UNSEEN; needed];
         } else {
             // The table is reused: a statement writes a few slots per token
@@ -299,6 +337,7 @@ impl<'a> Matcher<'a> {
             }
         }
         self.touched.clear();
+        self.touched_all = false;
         self.overflow.clear();
         self.hits.clear();
         self.pool.clear();
@@ -338,6 +377,13 @@ impl<'a> Matcher<'a> {
         match self.memo_get(slot) {
             UNSEEN => {}
             ACTIVE | FAILED => return None, // ACTIVE: guard left recursion
+            hit if !self.build_nodes => {
+                let end = (hit - HIT_BASE) as usize;
+                if end > self.far {
+                    self.far = end;
+                }
+                return Some(end);
+            }
             hit => {
                 let (end, offset, len) = self.hits[(hit - HIT_BASE) as usize];
                 let (offset, len) = (offset as usize, len as usize);
@@ -353,7 +399,11 @@ impl<'a> Matcher<'a> {
             return None;
         }
         if let Slot::Window(i) = slot {
-            self.touched.push(i);
+            if self.touched.len() < TOUCHED_LIMIT {
+                self.touched.push(i);
+            } else {
+                self.touched_all = true;
+            }
         }
         self.memo_set(slot, ACTIVE);
         self.depth += 1;
@@ -491,26 +541,14 @@ impl<'a> Matcher<'a> {
 
         if let Some(end_idx) = res {
             if !self.build_nodes {
-                self.record_hit(slot, end_idx, 0, 0);
+                self.memo_set(slot, HIT_BASE + end_idx as u32);
                 return res;
             }
-            let start_byte = if token_idx < self.match_tokens.len() {
-                self.match_tokens[token_idx].0.span.start
-            } else if !self.match_tokens.is_empty() {
-                self.match_tokens.last().unwrap().0.span.end
-            } else {
-                0
-            };
-            let end_byte = if end_idx > token_idx && end_idx <= self.match_tokens.len() {
-                self.match_tokens[end_idx - 1].0.span.end
-            } else {
-                start_byte
-            };
-
             let size = (self.nodes.len() - body_start) as u32;
             self.nodes.push(RawNode {
                 rule: rule_id,
-                span: Span::new(start_byte, end_byte),
+                start: token_idx as u32,
+                end: end_idx as u32,
                 size,
             });
             // Program is matched once and never replayed: copying the
@@ -600,7 +638,9 @@ impl<'a> Matcher<'a> {
             self.build_failed = true;
             return token_idx;
         }
-        let end_idx = self.hits[(hit - HIT_BASE) as usize].0;
+        // `build` follows a match made without nodes, so the entry is the
+        // end itself.
+        let end_idx = (hit - HIT_BASE) as usize;
         let body_start = self.nodes.len();
         let native = matches!(
             rule_id,
@@ -630,22 +670,11 @@ impl<'a> Matcher<'a> {
                 self.build_failed = true;
             }
         }
-        let start_byte = if token_idx < self.match_tokens.len() {
-            self.match_tokens[token_idx].0.span.start
-        } else if !self.match_tokens.is_empty() {
-            self.match_tokens.last().unwrap().0.span.end
-        } else {
-            0
-        };
-        let end_byte = if end_idx > token_idx && end_idx <= self.match_tokens.len() {
-            self.match_tokens[end_idx - 1].0.span.end
-        } else {
-            start_byte
-        };
         let size = (self.nodes.len() - body_start) as u32;
         self.nodes.push(RawNode {
             rule: rule_id,
-            span: Span::new(start_byte, end_byte),
+            start: token_idx as u32,
+            end: end_idx as u32,
             size,
         });
         end_idx
@@ -844,6 +873,129 @@ impl<'a> Matcher<'a> {
     }
 }
 
+/// What [`Statements::advance`] found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    /// A top-level statement matched; [`Statements::nodes`] holds its tree.
+    Statement,
+    /// The input does not parse from here on. [`parse`] returns `None` for
+    /// the same input.
+    Rejected,
+    /// Every token has been matched.
+    End,
+}
+
+/// A file parsed one top-level statement at a time.
+///
+/// [`parse`] builds the tree of the whole file, linked and indexed, which
+/// costs a few hundred bytes of tree per byte of SQL. A consumer that works
+/// through a file statement by statement and keeps nothing between them
+/// (the formatter) does not need the file's tree at once, nor the links: it
+/// reads each statement's nodes as the matcher made them, in post-order,
+/// and they are gone when the next statement is matched. Memory follows the
+/// largest statement.
+///
+/// The nodes of the statements, one after the other, are the nodes [`parse`]
+/// links into its arena, in the same order, without the `Program` root.
+pub struct Statements<'a> {
+    matcher: Matcher<'a>,
+    tokens: Vec<Token>,
+    at: usize,
+}
+
+impl<'a> Statements<'a> {
+    #[must_use]
+    pub fn new(src: &'a str) -> Self {
+        let tokens = tokenize(src);
+        let mut matcher = Matcher::new(src, &tokens, true);
+        // `Program` is one level of the recursion [`parse`] counts against
+        // `MAX_DEPTH`; a statement is as deep here as it is there.
+        matcher.depth = 1;
+        Statements {
+            matcher,
+            tokens,
+            at: 0,
+        }
+    }
+
+    /// Every token of the file, trivia included.
+    #[must_use]
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens
+    }
+
+    /// The code tokens, which node ranges count, each with its index in
+    /// [`Statements::tokens`].
+    #[must_use]
+    pub fn code_tokens(&self) -> &[(Token, usize)] {
+        &self.matcher.match_tokens
+    }
+
+    /// The keyword categories of a code token, [`classify_keyword`] of its
+    /// text: `Keyword::NONE` for anything but a word.
+    #[must_use]
+    pub fn keyword(&self, code_token: usize) -> Keyword {
+        self.matcher.keywords[code_token]
+    }
+
+    /// The nodes of the statement the last [`Statements::advance`] matched,
+    /// in post-order: a node's descendants are the `size` nodes before it,
+    /// and the last node is the `TopLevelStatement`.
+    #[must_use]
+    pub fn nodes(&self) -> &[FlatNode] {
+        &self.matcher.nodes
+    }
+
+    /// Match the next top-level statement.
+    pub fn advance(&mut self) -> Step {
+        let m = &mut self.matcher;
+        m.nodes.clear();
+        let at = self.at;
+        if at >= m.match_tokens.len() {
+            return Step::End;
+        }
+        let Some(Expr::ZeroOrMore(item)) =
+            m.statements.map(|loop_id| &EXPRESSIONS[loop_id.0 as usize])
+        else {
+            return Step::Rejected;
+        };
+        let item = *item;
+        // The two passes `evaluate` makes over a statement of `Program`:
+        // match without nodes, then walk the match to emit them.
+        m.start_statement(at);
+        m.build_nodes = false;
+        m.build_failed = false;
+        let matched = m.evaluate(item, at);
+        let next = match matched {
+            Some(next) if next != at => {
+                m.build(item, at);
+                next
+            }
+            _ => {
+                m.build_nodes = true;
+                return Step::Rejected;
+            }
+        };
+        m.build_nodes = true;
+        if m.build_failed {
+            // The walk lost the match (see `Matcher::build`): match and
+            // build this statement in one pass instead.
+            m.build_failed = false;
+            m.nodes.clear();
+            m.start_statement(at);
+            m.one_pass = true;
+            let again = m.evaluate(item, at);
+            m.one_pass = false;
+            if again != Some(next) {
+                m.nodes.clear();
+                return Step::Rejected;
+            }
+        }
+        self.at = next;
+        Step::Statement
+    }
+}
+
 /// Parse the source code to construct a lossless concrete syntax tree (CST).
 #[must_use]
 pub fn parse(src: &str) -> Option<Tree> {
@@ -859,7 +1011,7 @@ pub fn parse(src: &str) -> Option<Tree> {
     if end_idx != matcher.match_tokens.len() || matcher.nodes.is_empty() {
         return None;
     }
-    let mut nodes = link(&matcher.nodes);
+    let mut nodes = link(&matcher.nodes, &matcher.match_tokens);
     let root_idx = nodes.len() - 1;
 
     // Node spans are derived from NON-trivia tokens, so leading and
@@ -937,12 +1089,12 @@ fn containing_child(
 /// clause that matched nothing) placed at the next token, just past the
 /// node that matched them; they attach to the nearest ancestor that
 /// contains that position.
-fn link(raw: &[RawNode]) -> Vec<Node> {
+fn link(raw: &[RawNode], tokens: &[(Token, usize)]) -> Vec<Node> {
     let mut nodes: Vec<Node> = raw
         .iter()
         .map(|r| Node {
             rule: r.rule,
-            span: r.span,
+            span: byte_span(tokens, r.start as usize, r.end as usize),
             parent: None,
             children: Vec::new(),
             tokens: Vec::new(),
@@ -954,9 +1106,10 @@ fn link(raw: &[RawNode]) -> Vec<Node> {
         let split = roots.partition_point(|&c| c < first);
         let mut children = Vec::new();
         let mut outside = Vec::new();
+        let outer = nodes[i].span;
         for c in roots.drain(split..) {
-            let span = raw[c].span;
-            if span.start >= r.span.start && span.end <= r.span.end {
+            let span = nodes[c].span;
+            if span.start >= outer.start && span.end <= outer.end {
                 nodes[c].parent = Some(NodeId(i as u32));
                 children.push(NodeId(c as u32));
             } else {
@@ -1053,6 +1206,114 @@ mod tests {
         // And the tree is the whole file's.
         let tree = parse(&src).expect("parses");
         assert_eq!(tree.find("SelectStatement").len(), 2_000);
+    }
+
+    /// `Statements` against `parse`, which is the definition: the same
+    /// verdict, the same nodes in the same order, and for every node that
+    /// covers a token, the parent `link` gives it is the node whose `size`
+    /// reaches back over it.
+    fn assert_statements_match_parse(src: &str) {
+        let tree = parse(src);
+        let mut statements = Statements::new(src);
+        let mut flat: Vec<(RuleId, Span)> = Vec::new();
+        let mut parents: Vec<Option<usize>> = Vec::new();
+        let mut rejected = false;
+        loop {
+            match statements.advance() {
+                Step::End => break,
+                Step::Rejected => {
+                    rejected = true;
+                    break;
+                }
+                Step::Statement => {
+                    let base = flat.len();
+                    let nodes = statements.nodes();
+                    let code = statements.code_tokens();
+                    assert_eq!(
+                        RULES[nodes.last().unwrap().rule.0 as usize].name,
+                        "TopLevelStatement"
+                    );
+                    let mut parent = vec![None; nodes.len()];
+                    for (i, n) in nodes.iter().enumerate() {
+                        flat.push((n.rule, byte_span(code, n.start as usize, n.end as usize)));
+                        let first = i - n.size as usize;
+                        let mut c = i;
+                        while c > first {
+                            c -= 1;
+                            parent[c] = Some(base + i);
+                            c -= nodes[c].size as usize;
+                        }
+                    }
+                    parents.extend(parent);
+                }
+            }
+        }
+        let Some(tree) = tree else {
+            assert!(rejected, "parse rejects, Statements does not: {src:?}");
+            return;
+        };
+        assert!(!rejected, "Statements rejects, parse does not: {src:?}");
+        // Everything but the `Program` root, which is last.
+        let linked = &tree.nodes[..tree.nodes.len() - 1];
+        assert_eq!(flat.len(), linked.len(), "{src:?}");
+        let root = tree.root();
+        for (i, n) in linked.iter().enumerate() {
+            // The root's span is stretched over the file's trivia; no
+            // statement node is the root.
+            assert_eq!(flat[i], (n.rule, n.span), "node {i} of {src:?}");
+            if n.span.is_empty() {
+                continue;
+            }
+            let want = n.parent.filter(|&p| p != root).map(|p| p.0 as usize);
+            assert_eq!(parents[i], want, "parent of node {i} of {src:?}");
+        }
+    }
+
+    #[test]
+    fn statements_yield_the_nodes_parse_links() {
+        for src in [
+            "",
+            "-- only a comment\n",
+            ";",
+            "SELECT 1",
+            "SELECT 1;;; SELECT 2; -- tail\n",
+            "SELECT a + 1 * 2, count(*) FILTER (WHERE x) FROM t WHERE d IN (1, 2) GROUP BY ALL;",
+            "FROM t SELECT a, b WHERE a > 1 ORDER BY 1 LIMIT 3; FROM u;",
+            "INSERT INTO t (j, i) VALUES (1, 1) ON CONFLICT DO UPDATE SET j = EXCLUDED.j;\nSELECT 2",
+            "WITH a AS (SELECT 1 AS x), b AS (FROM a) SELECT * FROM b UNION ALL SELECT 2;",
+            "SELECT 1; THIS IS NOT SQL; SELECT 2;",
+            "SELECT (;",
+            "SELECT 'a'\n'b', $$x$$, e'\\n';",
+        ] {
+            assert_statements_match_parse(src);
+        }
+        let rows: Vec<String> = (0..40).map(|i| format!("({i}, 'x{i}')")).collect();
+        assert_statements_match_parse(&format!(
+            "INSERT INTO t VALUES {}; SELECT * FROM t WHERE a IN ({});",
+            rows.join(", "),
+            (0..40)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        // Every statement of the fixtures, alone and as the file it is in.
+        for fixture in [
+            include_str!("../tests/fixtures/duckdb20.sql"),
+            include_str!("../tests/fixtures/known-divergences.sql"),
+        ] {
+            assert_statements_match_parse(fixture);
+            let mut parsing = String::new();
+            for span in crate::token::split_statements(fixture) {
+                let stmt = &fixture[span.start as usize..span.end as usize];
+                assert_statements_match_parse(stmt);
+                if parse(stmt).is_some() {
+                    parsing.push_str(stmt);
+                    parsing.push('\n');
+                }
+            }
+            assert!(parse(&parsing).is_some());
+            assert_statements_match_parse(&parsing);
+        }
     }
 
     /// DuckDB rejects a string, quoted identifier, dollar-quote or block

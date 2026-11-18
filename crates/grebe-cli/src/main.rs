@@ -728,11 +728,14 @@ fn run() -> i32 {
 fn catalog_command(args: &[String]) -> i32 {
     let mut duckdb = "duckdb".to_string();
     let mut database: Option<&str> = None;
+    let mut with_metadata = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--help" {
             print_catalog_help();
             return 0;
+        } else if a == "--with-metadata" {
+            with_metadata = true;
         } else if a == "--duckdb" {
             match it.next() {
                 Some(v) => duckdb = v.clone(),
@@ -754,44 +757,67 @@ fn catalog_command(args: &[String]) -> i32 {
             database = Some(a.as_str());
         }
     }
-    let mut cmd = std::process::Command::new(&duckdb);
-    cmd.env("DUCKDB_AGENT_MODE", "0").arg("-no-init");
-    match database {
-        Some(db) => {
-            if !std::path::Path::new(db).is_file() {
-                eprintln!("grebe catalog: no database file at {db}");
-                return 2;
-            }
-            cmd.arg("-readonly").arg(db);
-        }
-        None => {
-            cmd.arg(":memory:");
-        }
-    }
-    cmd.arg("-json")
-        .arg("-c")
-        .arg(grebe_rules::catalog::SNAPSHOT_SQL);
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("grebe catalog: could not run {duckdb}: {e}");
-            eprintln!("Install the DuckDB CLI, or point at it with --duckdb PATH.");
+    if let Some(db) = database {
+        if !std::path::Path::new(db).is_file() {
+            eprintln!("grebe catalog: no database file at {db}");
             return 2;
         }
-    };
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        eprintln!("grebe catalog: {duckdb} failed: {}", stderr.trim());
-        return 2;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // What duckdb prints for `sql`, and what it said on stderr.
+    let query = |sql: &str| -> Result<(String, String), i32> {
+        let mut cmd = std::process::Command::new(&duckdb);
+        cmd.env("DUCKDB_AGENT_MODE", "0").arg("-no-init");
+        match database {
+            Some(db) => cmd.arg("-readonly").arg(db),
+            None => cmd.arg(":memory:"),
+        };
+        cmd.arg("-json").arg("-c").arg(sql);
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("grebe catalog: could not run {duckdb}: {e}");
+                eprintln!("Install the DuckDB CLI, or point at it with --duckdb PATH.");
+                return Err(2);
+            }
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            eprintln!("grebe catalog: {duckdb} failed: {}", stderr.trim());
+            return Err(2);
+        }
+        Ok((String::from_utf8_lossy(&output.stdout).into_owned(), stderr))
+    };
+    let (stdout, stderr) = if with_metadata {
+        // Two queries, put together as the object form of a snapshot.
+        let columns = match query(grebe_rules::catalog::SNAPSHOT_NULLABLE_SQL) {
+            Ok(r) => r,
+            Err(code) => return code,
+        };
+        let tables = match query(grebe_rules::catalog::TABLES_SQL) {
+            Ok(r) => r,
+            Err(code) => return code,
+        };
+        (
+            format!(
+                "{{\"columns\": {},\n\"tables\": {}}}\n",
+                columns.0.trim(),
+                tables.0.trim()
+            ),
+            columns.1 + &tables.1,
+        )
+    } else {
+        match query(grebe_rules::catalog::SNAPSHOT_SQL) {
+            Ok(r) => r,
+            Err(code) => return code,
+        }
+    };
     match grebe_rules::catalog::Catalog::from_json_text(&stdout) {
         Ok(cat) => {
             out!("{stdout}");
-            let columns: usize = cat.tables().iter().map(|t| t.columns.len()).sum();
+            let columns: usize = cat.tables().map(|t| t.columns.len()).sum();
             eprintln!(
                 "{} table(s) and view(s), {columns} column(s)",
-                cat.tables().len()
+                cat.table_count()
             );
             0
         }
@@ -809,20 +835,31 @@ fn catalog_command(args: &[String]) -> i32 {
 fn print_catalog_help() {
     outln!("grebe catalog — print a catalog snapshot of a DuckDB database");
     outln!();
-    outln!("Usage: grebe catalog [--duckdb PATH] [DATABASE] > catalog.json");
+    outln!("Usage: grebe catalog [--duckdb PATH] [--with-metadata] [DATABASE] > catalog.json");
     outln!();
     outln!("Arguments:");
     outln!("  DATABASE   a DuckDB database file, opened read-only. Without one,");
     outln!("             the snapshot is of an empty in-memory database.");
     outln!();
     outln!("Options:");
-    outln!("  --duckdb PATH   the duckdb CLI to run (default: duckdb on PATH)");
+    outln!("  --duckdb PATH     the duckdb CLI to run (default: duckdb on PATH)");
+    outln!("  --with-metadata   also say what DuckDB knows of each table: whether");
+    outln!("                    each column may be NULL, the estimated row count,");
+    outln!("                    the primary key, unique constraints and indexes");
     outln!();
     outln!("The snapshot is a JSON array with one object per column:");
     outln!("  {{\"database\", \"schema\", \"table\", \"column\", \"type\"}}");
     outln!("It is what DuckDB prints in -json mode for:");
     outln!("  {}", grebe_rules::catalog::SNAPSHOT_SQL);
     outln!("so any other way of running that query gives the same file.");
+    outln!();
+    outln!("With --with-metadata the snapshot is an object instead:");
+    outln!("  {{\"columns\": [the same rows, each with \"nullable\"],");
+    outln!("   \"tables\": [{{\"database\", \"schema\", \"table\", \"kind\", \"rows\",");
+    outln!("               \"primary_key\", \"unique\", \"indexes\"}}]}}");
+    outln!("Both forms are read wherever a snapshot is. The row count is DuckDB's");
+    outln!("estimate (it does not go down when rows are deleted). No rule reads");
+    outln!("the extra facts yet.");
     outln!();
     outln!("Give it to 'grebe check --catalog FILE', or name it in grebe.toml as");
     outln!("catalog = \"catalog.json\", and CAT001 (unknown table) and CAT002");
@@ -887,8 +924,22 @@ fn print_format_help() {
     outln!();
     outln!("Without --config or --no-config, grebe.toml (or [tool.grebe] in");
     outln!("pyproject.toml) is discovered by walking up from the first path given");
-    outln!("(the current directory, for stdin). Its [format] table sets");
-    outln!("indent_size, inline_threshold and keyword_case.");
+    outln!("(the current directory, for stdin). Its [format] table sets:");
+    outln!();
+    outln!("  indent_size           spaces per indent level, 1 to 16 (default 4)");
+    outln!("  inline_threshold      a construct that fits in this many columns");
+    outln!("                        stays on one line, 20 to 1000 (default 100)");
+    outln!("  keyword_case          \"upper\" or \"lower\" (default \"upper\")");
+    outln!("  function_paren_space  true puts a space between a call's name and");
+    outln!("                        its parenthesis: count (x), coalesce (a, b);");
+    outln!("                        type modifiers stay decimal(18, 2)");
+    outln!("                        (default false)");
+    outln!("  keyword_paren_space   false removes the space between a keyword");
+    outln!("                        and a parenthesis after it: IN(1, 2), AS(...),");
+    outln!("                        OVER(...) (default true)");
+    outln!("  semicolon             \"attached\" ends a statement n; \"spaced\"");
+    outln!("                        n ; and \"newline\" puts the semicolon on a");
+    outln!("                        line of its own (default \"attached\")");
     outln!();
     outln!("Exit codes:");
     outln!("  0   nothing needed changing, or files were rewritten");
@@ -917,6 +968,12 @@ fn print_check_help() {
     outln!("                            [severity]. Wins over a config file's select.");
     outln!("  --select ALL              run every MOD rule, default-on and opt-in");
     outln!("                            alike -- the strictest check available.");
+    outln!("  --select FRIENDLY         run the rules that rewrite a query into");
+    outln!("                            DuckDB's friendly SQL (FROM first, GROUP BY");
+    outln!("                            ALL, count(), ...); 'grebe rules' lists them.");
+    outln!("                            All have a safe fix, so with --fix this turns");
+    outln!("                            conventional SQL into that style. Can stand");
+    outln!("                            among other codes: FRIENDLY,MOD006.");
     outln!("  --fix                     rewrite the files in place, applying the");
     outln!("                            fixes marked safe in 'grebe rules'. What is");
     outln!("                            printed afterwards is what is left.");
@@ -1066,6 +1123,10 @@ fn print_rules_table() {
     outln!();
     outln!(
         "Rows marked \"off (opt-in)\" default to Off; enable one with 'grebe check --select CODE,...'."
+    );
+    outln!(
+        "'--select FRIENDLY' is {}: the safe rewrites into DuckDB's friendly SQL.",
+        grebe_rules::FRIENDLY.join(", ")
     );
 
     outln!(
