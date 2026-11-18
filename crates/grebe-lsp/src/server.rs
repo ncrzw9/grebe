@@ -679,6 +679,20 @@ fn format_options(config: Option<&Config>) -> grebe_format::Options {
             Some(grebe_rules::config::KeywordCase::Lower) => grebe_format::KeywordCase::Lower,
             None => default.keyword_case,
         },
+        function_paren_space: config
+            .format
+            .function_paren_space
+            .unwrap_or(default.function_paren_space),
+        keyword_paren_space: config
+            .format
+            .keyword_paren_space
+            .unwrap_or(default.keyword_paren_space),
+        semicolon: match config.format.semicolon {
+            Some(grebe_rules::config::Semicolon::Attached) => grebe_format::Semicolon::Attached,
+            Some(grebe_rules::config::Semicolon::Spaced) => grebe_format::Semicolon::Spaced,
+            Some(grebe_rules::config::Semicolon::Newline) => grebe_format::Semicolon::Newline,
+            None => default.semicolon,
+        },
     }
 }
 

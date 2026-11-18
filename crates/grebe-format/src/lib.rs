@@ -21,6 +21,16 @@
 //! | `inline_threshold` | 100 |
 //! | `keyword_case` | UPPER |
 //!
+//! To those three it adds three of its own, each about one character of
+//! space, for houses whose style differs from the default there and
+//! nowhere else:
+//!
+//! | knob | default |
+//! |---|---|
+//! | `function_paren_space` | false: `count(x)` |
+//! | `keyword_paren_space` | true: `IN (1, 2)` |
+//! | `semicolon` | attached: `ORDER BY n;` |
+//!
 //! No other knob exists: the point of one canonical style is that nobody
 //! has to configure it.
 //!
@@ -74,9 +84,10 @@
 //!
 //! - [`doc`] — the IR and its printer. Knows nothing about SQL.
 //! - [`lower`] — CST → `Doc`. Knows nothing about widths.
-//! - [`format`] — the entry point: parse, lower, print; and when a file does
-//!   not parse as a whole, do that per statement and leave what we cannot
-//!   parse exactly as it was.
+//! - [`format`] — the entry point: parse, lower, print, one top-level
+//!   statement at a time, so a large file costs its largest statement and
+//!   not its size; and when a file does not parse as a whole, do that per
+//!   statement and leave what we cannot parse exactly as it was.
 
 pub mod doc;
 mod lower;
@@ -91,6 +102,18 @@ pub enum KeywordCase {
     Lower,
 }
 
+/// Where a statement's terminating `;` goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Semicolon {
+    /// Right after the last token: `ORDER BY n;`.
+    #[default]
+    Attached,
+    /// After a space: `ORDER BY n ;`.
+    Spaced,
+    /// On a line of its own, after the statement.
+    Newline,
+}
+
 /// The whole knob budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -99,6 +122,20 @@ pub struct Options {
     /// A construct that fits within this many columns stays on one line.
     pub inline_threshold: usize,
     pub keyword_case: KeywordCase,
+    /// A space between a call's name and its `(`: `count (x)`. A call is a
+    /// function, aggregate, window, table function or method call, a macro
+    /// definition's parameter list, and the keyword forms that read as
+    /// calls (`CAST`, `TRY_CAST`, `COALESCE`, `NULLIF`, `EXTRACT`,
+    /// `POSITION`, `SUBSTRING`, `TRIM`, `OVERLAY`, `ROW`, `GROUPING`,
+    /// `COLUMNS`, `UNPACK`, `TRY`, `CUBE`, `ROLLUP`). Type modifiers
+    /// (`decimal(18, 2)`) are not calls and always hug.
+    pub function_paren_space: bool,
+    /// A space between a keyword and a `(` that follows it: `IN (1, 2)`,
+    /// `VALUES (1)`, `OVER (...)`, `AS (...)`, `EXISTS (...)`, `FROM (...)`.
+    /// Off, every such parenthesis hugs its keyword. The keyword forms
+    /// that read as calls belong to `function_paren_space`, not here.
+    pub keyword_paren_space: bool,
+    pub semicolon: Semicolon,
 }
 
 impl Default for Options {
@@ -107,6 +144,9 @@ impl Default for Options {
             indent_size: 4,
             inline_threshold: 100,
             keyword_case: KeywordCase::Upper,
+            function_paren_space: false,
+            keyword_paren_space: true,
+            semicolon: Semicolon::Attached,
         }
     }
 }
@@ -125,8 +165,8 @@ pub fn format(src: &str, opts: &Options) -> String {
     if let Some(rest) = src.strip_prefix('\u{feff}') {
         return format!("\u{feff}{}", format(rest, opts));
     }
-    if let Some(tree) = grebe_syntax::matcher::parse(src) {
-        return finish(format_tree(&tree, src, opts));
+    if let Some(whole) = lower::format_statements(src, opts) {
+        return finish(whole.text);
     }
     let spans = grebe_syntax::token::split_statements(src);
     let mut pieces: Vec<String> = Vec::new();
@@ -144,14 +184,13 @@ pub fn format(src: &str, opts: &Options) -> String {
         let end = end_of_line(src, sp.end as usize);
         let piece = &src[carry..end];
         cursor = end;
-        match grebe_syntax::matcher::parse(piece) {
-            Some(tree) => {
-                if tree.find("Statement").is_empty() {
+        match lower::format_statements(piece, opts) {
+            Some(formatted) => {
+                if !formatted.has_statement {
                     continue; // carry forward; `carry` stays put
                 }
-                let out = format_tree(&tree, piece, opts);
-                if !out.is_empty() {
-                    pieces.push(out);
+                if !formatted.text.is_empty() {
+                    pieces.push(formatted.text);
                 }
             }
             None => {
@@ -166,10 +205,9 @@ pub fn format(src: &str, opts: &Options) -> String {
     if carry < cursor {
         // Trailing statement-less pieces: comments after the last statement.
         let piece = &src[carry..cursor];
-        if let Some(tree) = grebe_syntax::matcher::parse(piece) {
-            let out = format_tree(&tree, piece, opts);
-            if !out.is_empty() {
-                pieces.push(out);
+        if let Some(formatted) = lower::format_statements(piece, opts) {
+            if !formatted.text.is_empty() {
+                pieces.push(formatted.text);
             }
         } else if !piece.trim().is_empty() {
             pieces.push(piece.trim().to_string());
@@ -186,12 +224,6 @@ pub fn format(src: &str, opts: &Options) -> String {
 /// the end of the buffer.
 fn end_of_line(src: &str, at: usize) -> usize {
     src[at..].find('\n').map_or(src.len(), |i| at + i + 1)
-}
-
-fn format_tree(tree: &grebe_syntax::cst::Tree, src: &str, opts: &Options) -> String {
-    let lowerer = lower::Lowerer::new(tree, src, opts);
-    let doc = lowerer.program();
-    doc::print(&doc, opts.inline_threshold, opts.indent_size)
 }
 
 fn finish(mut s: String) -> String {
@@ -347,6 +379,362 @@ mod tests {
         assert_eq!(
             narrow(sql, 20),
             "SELECT a\nFROM t\nUNION ALL\nSELECT b\nFROM u;\n"
+        );
+    }
+
+    /// `FROM t SELECT ...` is the same query as `SELECT ... FROM t` and gets
+    /// the same layout: one line while it fits, and once it does not, a
+    /// line per clause, in the order the clauses were written.
+    #[test]
+    fn a_from_first_query_lays_out_like_its_select_first_form() {
+        let from_first = "from t select a, b where a > 1 group by all order by 1;";
+        let select_first = "select a, b from t where a > 1 group by all order by 1;";
+        assert_eq!(
+            f(from_first),
+            "FROM t SELECT a, b WHERE a > 1 GROUP BY ALL ORDER BY 1;\n"
+        );
+        assert_eq!(
+            f(select_first),
+            "SELECT a, b FROM t WHERE a > 1 GROUP BY ALL ORDER BY 1;\n"
+        );
+        assert_eq!(
+            narrow(from_first, 40),
+            "FROM t\nSELECT a, b\nWHERE a > 1\nGROUP BY ALL\nORDER BY 1;\n"
+        );
+        assert_eq!(
+            narrow(select_first, 40),
+            "SELECT a, b\nFROM t\nWHERE a > 1\nGROUP BY ALL\nORDER BY 1;\n"
+        );
+        assert_eq!(f("from t"), "FROM t;\n");
+        assert_eq!(narrow("from t", 3), "FROM t;\n");
+    }
+
+    /// The two forms differ in where the `FROM` block stands and in nothing
+    /// else: the same lines, at every width, joins and wrapped lists
+    /// included.
+    #[test]
+    fn from_first_and_select_first_break_into_the_same_lines() {
+        let from = "from orders o join customers c on o.cid = c.id left join x using (k)";
+        let select = "select alpha_column, beta_column, count(*) as n";
+        let rest = "where alpha_column > 1 and beta_column < 100 group by all having count(*) > 2 qualify row_number() over (partition by alpha_column order by beta_column) = 1 order by 1 limit 10";
+        for (from, select) in [
+            (from, select),
+            ("from t", "select a"),
+            ("from tbl_one, tbl_two, tbl_three, tbl_four", select),
+            (
+                "from (select a, b from u where a > 1) s",
+                "select distinct a, b",
+            ),
+        ] {
+            for w in [20, 30, 40, 60, 100, 400] {
+                let from_first = narrow(&format!("{from} {select} {rest}"), w);
+                let select_first = narrow(&format!("{select} {from} {rest}"), w);
+                let lines = |s: &str| {
+                    let mut lines: Vec<String> = s.lines().map(str::to_string).collect();
+                    lines.sort();
+                    lines
+                };
+                if from_first.lines().count() > 1 {
+                    assert_eq!(
+                        lines(&from_first),
+                        lines(&select_first),
+                        "width {w}:\n{from_first}\n{select_first}"
+                    );
+                } else {
+                    assert_eq!(
+                        select_first.lines().count(),
+                        1,
+                        "width {w}:\n{select_first}"
+                    );
+                }
+                assert_eq!(narrow(&from_first, w), from_first, "width {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn from_first_queries_break_wherever_a_query_can_stand() {
+        // A CTE body and the main query.
+        assert_eq!(
+            narrow(
+                "with c as (from t select a, b where a > 1) from c select a",
+                30
+            ),
+            "WITH c AS (\n    FROM t\n    SELECT a, b\n    WHERE a > 1\n)\n\nFROM c\nSELECT a;\n"
+        );
+        // A subquery, in a FROM-first query and in a SELECT-first one.
+        assert_eq!(
+            narrow("from (from t select a, b where a > 1) select a", 30),
+            "FROM (\n    FROM t\n    SELECT a, b\n    WHERE a > 1\n)\nSELECT a;\n"
+        );
+        assert_eq!(
+            narrow(
+                "select * from (from t select a, b where a > 1 order by 1) s",
+                30
+            ),
+            "SELECT *\nFROM (\n    FROM t\n    SELECT a, b\n    WHERE a > 1\n    ORDER BY 1\n) s;\n"
+        );
+        // Members of a set operation.
+        assert_eq!(
+            narrow("from t select a union all from u select b", 20),
+            "FROM t\nSELECT a\nUNION ALL\nFROM u\nSELECT b;\n"
+        );
+        // CREATE TABLE AS, CREATE VIEW, INSERT, COPY.
+        assert_eq!(
+            narrow("create table x as from t select a, b where a > 1", 30),
+            "CREATE TABLE x AS\nFROM t\nSELECT a, b\nWHERE a > 1;\n"
+        );
+        assert_eq!(
+            narrow("create view v as from t select a, b where a > 1", 30),
+            "CREATE VIEW v AS\nFROM t\nSELECT a, b\nWHERE a > 1;\n"
+        );
+        assert_eq!(
+            narrow("insert into x from t select a, b where a > 1", 30),
+            "INSERT INTO x\nFROM t\nSELECT a, b\nWHERE a > 1;\n"
+        );
+        assert_eq!(
+            narrow("copy (from t select a, b where a > 1) to 'x.csv'", 30),
+            "COPY (\n    FROM t\n    SELECT a, b\n    WHERE a > 1\n) TO 'x.csv';\n"
+        );
+        // Joins at clause level, a wrapped select list, a broken AND chain.
+        assert_eq!(
+            narrow(
+                "from orders o join customers c on o.cid = c.id select alpha_column, beta_column, gamma_column where alpha_column = 1 and beta_column = 2",
+                34
+            ),
+            "FROM orders o\nJOIN customers c ON o.cid = c.id\nSELECT\n    alpha_column,\n    beta_column,\n    gamma_column\nWHERE alpha_column = 1\n    AND beta_column = 2;\n"
+        );
+        // No select list at all.
+        assert_eq!(
+            narrow("from t where alpha = 1 and beta = 2 and gamma = 3", 30),
+            "FROM t\nWHERE alpha = 1\n    AND beta = 2\n    AND gamma = 3;\n"
+        );
+    }
+
+    const CALLS_AND_KEYWORDS: &str = "select count(*), coalesce(a, b), cast(x as decimal(18, 2)), x.lower(), sum(a) filter (where a > 1) over (partition by b) from read_csv('f.csv') t join u using (k) where a in (1, 2) and exists (select 1) and not (a > 1) group by rollup (a, b)";
+
+    #[test]
+    fn function_paren_space_sets_calls_off_and_leaves_types_and_keywords() {
+        let opts = Options {
+            function_paren_space: true,
+            inline_threshold: 400,
+            ..Options::default()
+        };
+        assert_eq!(
+            format(CALLS_AND_KEYWORDS, &opts),
+            "SELECT count (*), COALESCE (a, b), CAST (x AS decimal(18, 2)), x.lower (), sum (a) FILTER (WHERE a > 1) OVER (PARTITION BY b) FROM read_csv ('f.csv') t JOIN u USING (k) WHERE a IN (1, 2) AND EXISTS (SELECT 1) AND NOT (a > 1) GROUP BY ROLLUP (a, b);\n"
+        );
+        // A macro's parameter list is its call, spelled once; a CTE's
+        // column list and a column list after a table name are not calls.
+        assert_eq!(
+            format(
+                "create macro add_one(a) as a + 1; with c(n) as (select 1) select * from c; insert into t (a) values (1)",
+                &opts
+            ),
+            "CREATE MACRO add_one (a) AS a + 1;\n\nWITH c(n) AS (SELECT 1) SELECT * FROM c;\n\nINSERT INTO t (a) VALUES (1);\n"
+        );
+        // An argument list that breaks still opens on the name's line.
+        let narrow = Options {
+            inline_threshold: 20,
+            ..opts
+        };
+        assert_eq!(
+            format("select coalesce(alpha_column, beta_column)", &narrow),
+            "SELECT\n    COALESCE (\n        alpha_column,\n        beta_column\n    );\n"
+        );
+    }
+
+    #[test]
+    fn keyword_paren_space_off_hugs_every_parenthesis_after_a_keyword() {
+        let opts = Options {
+            keyword_paren_space: false,
+            inline_threshold: 400,
+            ..Options::default()
+        };
+        assert_eq!(
+            format(CALLS_AND_KEYWORDS, &opts),
+            "SELECT count(*), COALESCE(a, b), CAST(x AS decimal(18, 2)), x.lower(), sum(a) FILTER(WHERE a > 1) OVER(PARTITION BY b) FROM read_csv('f.csv') t JOIN u USING(k) WHERE a IN(1, 2) AND EXISTS(SELECT 1) AND NOT(a > 1) GROUP BY ROLLUP(a, b);\n"
+        );
+        // The clause keywords too; a parenthesis after a name is not one
+        // after a keyword, and an operator's is not either.
+        assert_eq!(
+            format(
+                "with c(n) as (select 1) select (n + 1) * 2 from (select n from c) s where (n > 1) order by (n); insert into t (a, b) values (1, 2), (3, 4); select case (a) when (1) then (2) end, 1 + (2)",
+                &opts
+            ),
+            "WITH c(n) AS(SELECT 1) SELECT(n + 1) * 2 FROM(SELECT n FROM c) s WHERE(n > 1) ORDER BY(n);\n\nINSERT INTO t (a, b) VALUES(1, 2), (3, 4);\n\nSELECT CASE(a) WHEN(1) THEN(2) END, 1 + (2);\n"
+        );
+        // A clause that breaks puts its list on the next line as ever.
+        let narrow = Options {
+            inline_threshold: 20,
+            ..opts
+        };
+        assert_eq!(
+            format("insert into t values (1, 'one'), (2, 'two')", &narrow),
+            "INSERT INTO t\nVALUES\n    (1, 'one'),\n    (2, 'two');\n"
+        );
+    }
+
+    #[test]
+    fn the_semicolon_goes_where_the_option_says() {
+        let with = |semicolon: Semicolon, sql: &str| {
+            format(
+                sql,
+                &Options {
+                    semicolon,
+                    inline_threshold: 30,
+                    ..Options::default()
+                },
+            )
+        };
+        let sql = "select a from t order by n; select 2";
+        assert_eq!(
+            with(Semicolon::Attached, sql),
+            "SELECT a FROM t ORDER BY n;\n\nSELECT 2;\n"
+        );
+        assert_eq!(
+            with(Semicolon::Spaced, sql),
+            "SELECT a FROM t ORDER BY n ;\n\nSELECT 2 ;\n"
+        );
+        assert_eq!(
+            with(Semicolon::Newline, sql),
+            "SELECT a FROM t ORDER BY n\n;\n\nSELECT 2\n;\n"
+        );
+        // After a statement that broke, too.
+        let sql = "select alpha, beta from some_table where alpha > 1";
+        assert_eq!(
+            with(Semicolon::Spaced, sql),
+            "SELECT alpha, beta\nFROM some_table\nWHERE alpha > 1 ;\n"
+        );
+        assert_eq!(
+            with(Semicolon::Newline, sql),
+            "SELECT alpha, beta\nFROM some_table\nWHERE alpha > 1\n;\n"
+        );
+    }
+
+    /// The semicolon is never swallowed by a line comment: a comment after
+    /// the last token ends up after the `;` when the `;` stays on that
+    /// line, as it always has, and stays on its line when the `;` takes
+    /// the next one.
+    #[test]
+    fn the_semicolon_never_lands_in_a_trailing_comment() {
+        let cases = [
+            (
+                "select 1 -- c\n;",
+                "SELECT 1; -- c\n",
+                "SELECT 1 ; -- c\n",
+                "SELECT 1 -- c\n;\n",
+            ),
+            (
+                "select 1 -- c",
+                "SELECT 1; -- c\n",
+                "SELECT 1 ; -- c\n",
+                "SELECT 1 -- c\n;\n",
+            ),
+            (
+                "select 1; -- c",
+                "SELECT 1; -- c\n",
+                "SELECT 1 ; -- c\n",
+                "SELECT 1\n; -- c\n",
+            ),
+            (
+                "select 1\n-- c\n;",
+                "SELECT 1\n-- c\n;\n",
+                "SELECT 1\n-- c\n;\n",
+                "SELECT 1\n-- c\n;\n",
+            ),
+            (
+                "select 1 /* c */;",
+                "SELECT 1 /* c */;\n",
+                "SELECT 1 /* c */ ;\n",
+                "SELECT 1 /* c */\n;\n",
+            ),
+        ];
+        for (sql, attached, spaced, newline) in cases {
+            for (semicolon, want) in [
+                (Semicolon::Attached, attached),
+                (Semicolon::Spaced, spaced),
+                (Semicolon::Newline, newline),
+            ] {
+                let opts = Options {
+                    semicolon,
+                    ..Options::default()
+                };
+                let once = format(sql, &opts);
+                assert_eq!(once, want, "{semicolon:?} {sql:?}");
+                assert_eq!(format(&once, &opts), once, "{semicolon:?} {sql:?} again");
+            }
+        }
+    }
+
+    /// Every combination of the options, in both keyword cases: formatting
+    /// the output again changes nothing, and only space, case, list commas
+    /// and terminators differ from the input.
+    #[test]
+    fn every_option_combination_is_idempotent_and_keeps_the_tokens() {
+        fn squeeze(s: &str) -> String {
+            s.chars()
+                .filter(|c| !c.is_whitespace() && *c != ',' && *c != ';')
+                .flat_map(char::to_lowercase)
+                .collect()
+        }
+        let sources = [
+            CALLS_AND_KEYWORDS,
+            "with c(n) as (select 1) select (n + 1) * 2 from (select n from c) s where (n > 1) order by (n)",
+            "insert into t (a, b) values (1, 2), (3, 4) on conflict do nothing returning (a)",
+            "select a, -- first\n b /* second */ from t -- tail\n;\n-- footer\n",
+            "select case (a) when (1) then (2) else coalesce(b, (3)) end from t; select 2 -- c\n; ;",
+            "from t select try_cast(a as varchar(10)), extract(year from d), row(1, 2) where a = any (select 1)",
+            "create table t (id integer primary key, amount decimal(18, 2) check (amount > 0)); create macro f(a) as a + 1",
+            "select 1;\nTHIS IS NOT SQL;\nselect count(*) from t where a in (1) -- c\n",
+        ];
+        for function_paren_space in [false, true] {
+            for keyword_paren_space in [false, true] {
+                for semicolon in [Semicolon::Attached, Semicolon::Spaced, Semicolon::Newline] {
+                    for keyword_case in [KeywordCase::Upper, KeywordCase::Lower] {
+                        for inline_threshold in [20, 100] {
+                            let opts = Options {
+                                indent_size: 4,
+                                inline_threshold,
+                                keyword_case,
+                                function_paren_space,
+                                keyword_paren_space,
+                                semicolon,
+                            };
+                            for sql in sources {
+                                let once = format(sql, &opts);
+                                assert_eq!(format(&once, &opts), once, "{opts:?}\n{sql}");
+                                assert_eq!(squeeze(&once), squeeze(sql), "{opts:?}\n{sql}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_spacing_options_combine_with_lower_case_keywords() {
+        let opts = Options {
+            keyword_case: KeywordCase::Lower,
+            function_paren_space: true,
+            keyword_paren_space: false,
+            semicolon: Semicolon::Spaced,
+            inline_threshold: 400,
+            ..Options::default()
+        };
+        assert_eq!(
+            format(CALLS_AND_KEYWORDS, &opts),
+            "select count (*), coalesce (a, b), cast (x as decimal(18, 2)), x.lower (), sum (a) filter(where a > 1) over(partition by b) from read_csv ('f.csv') t join u using(k) where a in(1, 2) and exists(select 1) and not(a > 1) group by rollup (a, b) ;\n"
+        );
+        let opts = Options {
+            semicolon: Semicolon::Newline,
+            inline_threshold: 30,
+            ..opts
+        };
+        assert_eq!(
+            format("SELECT COUNT(*) FROM t WHERE a IN (1, 2) -- c", &opts),
+            "select count (*)\nfrom t\nwhere a in(1, 2) -- c\n;\n"
         );
     }
 

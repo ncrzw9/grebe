@@ -121,10 +121,22 @@ exclude = ["generated/**"]
 MOD001 = "warning"   # error | warning | info | off; a level turns an opt-in rule on
 
 [format]
-indent_size      = 4
-inline_threshold = 100
-keyword_case     = "upper"
+indent_size          = 4           # spaces per indent level, 1 to 16
+inline_threshold     = 100         # what fits in this many columns stays on one line
+keyword_case         = "upper"     # or "lower"
+function_paren_space = false       # true: count (x), coalesce (a, b)
+keyword_paren_space  = true        # false: IN(1, 2), AS(...), OVER(...)
+semicolon            = "attached"  # "spaced": n ;  "newline": ; on its own line
 ```
+
+The values shown are the defaults. `function_paren_space` covers every call:
+functions, aggregates, window and table functions, methods, a macro's
+parameter list, and the keyword forms that read as calls (`CAST`,
+`COALESCE`, `EXTRACT`, `ROLLUP` and the like). A type's modifiers always hug
+(`decimal(18, 2)`). `keyword_paren_space` covers every other parenthesis that
+follows a keyword (`IN`, `VALUES`, `OVER`, `AS`, `EXISTS`, `USING`, `FILTER`,
+`FROM`, `ON`, ...); a parenthesis after a name, as in `INSERT INTO t (a, b)`,
+is not affected by either.
 
 Silence one statement with `-- grebe: ignore[CODE]`, or every code with
 `-- grebe: ignore`.

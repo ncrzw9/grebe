@@ -22,14 +22,20 @@
 //!   opportunity after it always breaks, even in a flat group. A caller that
 //!   needs the whole enclosing group broken adds a [`Doc::BreakParent`].
 
+use std::borrow::Cow;
+
 /// A layout description. Build these bottom-up; `Doc::group` computes its
 /// forced-break flag from the finished subtree.
+///
+/// Text is borrowed where it can be: nearly every token prints exactly as
+/// the source spells it, and a `String` apiece was a tenth of the time to
+/// format a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Doc {
+pub enum Doc<'a> {
     Nil,
     /// Literal text. Newlines inside are honoured but not planned around —
     /// they occur only in multi-line block comments and dollar-quoted strings.
-    Text(String),
+    Text(Cow<'a, str>),
     /// A space when flat, a newline when broken.
     Line,
     /// Nothing when flat, a newline when broken.
@@ -41,20 +47,20 @@ pub enum Doc {
     /// line of its own without ever producing a blank line next to a break
     /// the layout was going to make anyway.
     OwnLine,
-    Concat(Vec<Doc>),
+    Concat(Vec<Doc<'a>>),
     /// One more indent level for every newline inside.
-    Indent(Box<Doc>),
+    Indent(Box<Doc<'a>>),
     /// Flat if it fits, broken otherwise. `forced` is true if the subtree
     /// contains a `HardLine`, `OwnLine` or `BreakParent` on a path that would
     /// print flat.
     Group {
-        doc: Box<Doc>,
+        doc: Box<Doc<'a>>,
         forced: bool,
     },
     /// Chooses by the mode of the nearest enclosing group.
     IfBreak {
-        broken: Box<Doc>,
-        flat: Box<Doc>,
+        broken: Box<Doc<'a>>,
+        flat: Box<Doc<'a>>,
     },
     /// Emitted just before the next newline, whatever comes between.
     LineSuffix(String),
@@ -62,8 +68,8 @@ pub enum Doc {
     BreakParent,
 }
 
-impl Doc {
-    pub fn text(s: impl Into<String>) -> Self {
+impl<'a> Doc<'a> {
+    pub fn text(s: impl Into<Cow<'a, str>>) -> Self {
         Self::Text(s.into())
     }
 
@@ -129,144 +135,200 @@ fn width(s: &str) -> usize {
 /// The output never carries trailing spaces and ends without a newline; the
 /// caller decides how a file ends.
 #[must_use]
-pub fn print(doc: &Doc, width_limit: usize, indent_size: usize) -> String {
-    let mut out = String::new();
-    let mut pos = 0usize;
-    let mut suffix: Vec<&str> = Vec::new();
-    // A line comment has been deferred to the end of this line. Whatever
-    // follows it must start on the next line, even inside a group that was
-    // going to stay flat: otherwise the comment ends up after code it did
-    // not trail, and re-formatting the output attaches it there -- not
-    // idempotent.
-    let mut pending_break = false;
-    let mut stack: Vec<(usize, Mode, &Doc)> = vec![(0, Mode::Break, doc)];
+pub fn print(doc: &Doc<'_>, width_limit: usize, indent_size: usize) -> String {
+    let mut printer = Printer::new(width_limit, indent_size);
+    printer.print(doc);
+    printer.finish()
+}
 
-    // A line that holds nothing but indentation. `Line`/`SoftLine` breaks and
-    // `OwnLine` do nothing on a fresh line: the newline they wanted is already
-    // there. Only `HardLine` insists, which is how a blank line is spelled.
-    let fresh = |out: &String, suffix: &[&str]| {
-        suffix.is_empty() && out.rsplit('\n').next().is_some_and(|l| l.trim().is_empty())
-    };
+/// The printer, for output that is built from more than one `Doc`: printing
+/// documents one after the other gives what printing their concatenation
+/// gives, as long as each is followed by a hard line break or by nothing --
+/// `fits` never looks past either. A file is printed a statement at a time
+/// this way, and no more than one statement's `Doc` exists at once.
+pub struct Printer {
+    out: String,
+    pos: usize,
+    suffix: Vec<String>,
+    /// A line comment has been deferred to the end of this line. Whatever
+    /// follows it must start on the next line, even inside a group that was
+    /// going to stay flat: otherwise the comment ends up after code it did
+    /// not trail, and re-formatting the output attaches it there -- not
+    /// idempotent.
+    pending_break: bool,
+    width_limit: usize,
+    indent_size: usize,
+}
 
-    while let Some((ind, mode, d)) = stack.pop() {
-        match d {
-            Doc::Nil | Doc::BreakParent => {}
-            // A deferred line comment must end its line before the next
-            // code, not after it: with no break between them (`WHERE -- c`
-            // then `x`, joined by a plain space), the comment would land
-            // after `x`, and the next run would attach it there -- then lay
-            // the statement out differently. The space is dropped; the code
-            // starts the next line. A `,` or `;` still closes the line it
-            // ends, before the comment: `a, -- c` is where the next run
-            // finds that comment, so it stays put.
-            Doc::Text(s) if pending_break && s.trim().is_empty() => {}
-            Doc::Text(s) if pending_break && !s.is_empty() && s != "," && s != ";" => {
-                newline(&mut out, &mut suffix, ind, indent_size, &mut pos);
-                pending_break = false;
-                out.push_str(s);
-                pos = match s.rfind('\n') {
-                    Some(i) => width(&s[i + 1..]),
-                    None => pos + width(s),
-                };
-            }
-            Doc::Text(s) => {
-                out.push_str(s);
-                pos = match s.rfind('\n') {
-                    Some(i) => width(&s[i + 1..]),
-                    None => pos + width(s),
-                };
-            }
-            Doc::Line => match mode {
-                Mode::Flat if !pending_break => {
-                    out.push(' ');
-                    pos += 1;
-                }
-                _ => {
-                    if !fresh(&out, &suffix) {
-                        newline(&mut out, &mut suffix, ind, indent_size, &mut pos);
-                        pending_break = false;
-                    }
-                }
-            },
-            Doc::SoftLine => {
-                if (mode == Mode::Break || pending_break) && !fresh(&out, &suffix) {
-                    newline(&mut out, &mut suffix, ind, indent_size, &mut pos);
-                    pending_break = false;
-                }
-            }
-            Doc::OwnLine => {
-                if !fresh(&out, &suffix) {
-                    newline(&mut out, &mut suffix, ind, indent_size, &mut pos);
-                    pending_break = false;
-                }
-            }
-            Doc::HardLine => {
-                newline(&mut out, &mut suffix, ind, indent_size, &mut pos);
-                pending_break = false;
-            }
-            Doc::Concat(v) => {
-                for part in v.iter().rev() {
-                    stack.push((ind, mode, part));
-                }
-            }
-            Doc::Indent(inner) => stack.push((ind + 1, mode, inner)),
-            Doc::Group { doc: inner, forced } => {
-                let m = if *forced {
-                    Mode::Break
-                } else if mode == Mode::Flat {
-                    // Already measured as part of a flat parent.
-                    Mode::Flat
-                } else if fits(inner, width_limit.saturating_sub(pos), &stack) {
-                    Mode::Flat
-                } else {
-                    Mode::Break
-                };
-                stack.push((ind, m, inner));
-            }
-            Doc::IfBreak { broken, flat } => {
-                let pick = if mode == Mode::Break { broken } else { flat };
-                stack.push((ind, mode, pick));
-            }
-            Doc::LineSuffix(s) => {
-                suffix.push(s);
-                pending_break = true;
-            }
+impl Printer {
+    #[must_use]
+    pub fn new(width_limit: usize, indent_size: usize) -> Self {
+        Self {
+            out: String::new(),
+            pos: 0,
+            suffix: Vec::new(),
+            pending_break: false,
+            width_limit,
+            indent_size,
         }
     }
-    flush_suffix(&mut out, &mut suffix);
-    trim_line_end(&mut out);
-    out
-}
 
-/// Start a new line at `ind` levels. Indentation is always spaces, never tabs,
-/// so the output looks the same in every editor.
-fn newline(out: &mut String, suffix: &mut Vec<&str>, ind: usize, size: usize, pos: &mut usize) {
-    flush_suffix(out, suffix);
-    trim_line_end(out);
-    out.push('\n');
-    for _ in 0..ind * size {
-        out.push(' ');
+    /// Everything printed so far, with any deferred line suffix placed.
+    #[must_use]
+    pub fn finish(mut self) -> String {
+        self.flush_suffix();
+        self.trim_line_end();
+        self.out
     }
-    *pos = ind * size;
-}
 
-fn flush_suffix(out: &mut String, suffix: &mut Vec<&str>) {
-    for s in suffix.drain(..) {
-        out.push_str(s);
+    /// A line that holds nothing but indentation. `Line`/`SoftLine` breaks and
+    /// `OwnLine` do nothing on a fresh line: the newline they wanted is already
+    /// there. Only `HardLine` insists, which is how a blank line is spelled.
+    fn fresh(&self) -> bool {
+        self.suffix.is_empty()
+            && self
+                .out
+                .rsplit('\n')
+                .next()
+                .is_some_and(|l| l.trim().is_empty())
     }
-}
 
-fn trim_line_end(out: &mut String) {
-    while out.ends_with(' ') {
-        out.pop();
+    /// Start a new line at `ind` levels. Indentation is always spaces, never
+    /// tabs, so the output looks the same in every editor.
+    fn newline(&mut self, ind: usize) {
+        self.flush_suffix();
+        self.trim_line_end();
+        self.out.push('\n');
+        for _ in 0..ind * self.indent_size {
+            self.out.push(' ');
+        }
+        self.pos = ind * self.indent_size;
+        self.pending_break = false;
+    }
+
+    fn flush_suffix(&mut self) {
+        for s in self.suffix.drain(..) {
+            self.out.push_str(&s);
+        }
+    }
+
+    fn trim_line_end(&mut self) {
+        while self.out.ends_with(' ') {
+            self.out.pop();
+        }
+    }
+
+    fn push_text(&mut self, s: &str) {
+        self.out.push_str(s);
+        self.pos = match s.rfind('\n') {
+            Some(i) => width(&s[i + 1..]),
+            None => self.pos + width(s),
+        };
+    }
+
+    /// An unconditional line break at the left margin, as a `HardLine`
+    /// printed on its own would make.
+    pub fn hard_line(&mut self) {
+        self.newline(0);
+    }
+
+    /// Print `doc` after what has been printed already.
+    pub fn print(&mut self, doc: &Doc<'_>) {
+        let mut stack: Vec<(usize, Mode, &Doc<'_>)> = vec![(0, Mode::Break, doc)];
+        // `fits` runs for every group that is not already flat; its stack
+        // is kept between calls.
+        let mut scratch: Vec<(Mode, &Doc<'_>)> = Vec::new();
+
+        while let Some((ind, mode, d)) = stack.pop() {
+            match d {
+                Doc::Nil | Doc::BreakParent => {}
+                // A deferred line comment must end its line before the next
+                // code, not after it: with no break between them (`WHERE -- c`
+                // then `x`, joined by a plain space), the comment would land
+                // after `x`, and the next run would attach it there -- then lay
+                // the statement out differently. The space is dropped; the code
+                // starts the next line. A `,` or `;` still closes the line it
+                // ends, before the comment: `a, -- c` is where the next run
+                // finds that comment, so it stays put. So does a `;` set off
+                // by a space, which is one text so that the space stays too.
+                Doc::Text(s) if self.pending_break && s.trim().is_empty() => {}
+                Doc::Text(s)
+                    if self.pending_break && !matches!(s.as_ref(), "" | "," | ";" | " ;") =>
+                {
+                    self.newline(ind);
+                    self.push_text(s);
+                }
+                Doc::Text(s) => self.push_text(s),
+                Doc::Line => match mode {
+                    Mode::Flat if !self.pending_break => {
+                        self.out.push(' ');
+                        self.pos += 1;
+                    }
+                    _ => {
+                        if !self.fresh() {
+                            self.newline(ind);
+                        }
+                    }
+                },
+                Doc::SoftLine => {
+                    if (mode == Mode::Break || self.pending_break) && !self.fresh() {
+                        self.newline(ind);
+                    }
+                }
+                Doc::OwnLine => {
+                    if !self.fresh() {
+                        self.newline(ind);
+                    }
+                }
+                Doc::HardLine => self.newline(ind),
+                Doc::Concat(v) => {
+                    for part in v.iter().rev() {
+                        stack.push((ind, mode, part));
+                    }
+                }
+                Doc::Indent(inner) => stack.push((ind + 1, mode, inner)),
+                Doc::Group { doc: inner, forced } => {
+                    let m = if *forced {
+                        Mode::Break
+                    } else if mode == Mode::Flat {
+                        // Already measured as part of a flat parent.
+                        Mode::Flat
+                    } else if fits(
+                        inner,
+                        self.width_limit.saturating_sub(self.pos),
+                        &stack,
+                        &mut scratch,
+                    ) {
+                        Mode::Flat
+                    } else {
+                        Mode::Break
+                    };
+                    stack.push((ind, m, inner));
+                }
+                Doc::IfBreak { broken, flat } => {
+                    let pick = if mode == Mode::Break { broken } else { flat };
+                    stack.push((ind, mode, pick));
+                }
+                Doc::LineSuffix(s) => {
+                    self.suffix.push(s.clone());
+                    self.pending_break = true;
+                }
+            }
+        }
     }
 }
 
 /// Would `doc`, printed flat, plus whatever follows it up to the next
 /// newline, fit in `remaining` columns?
-fn fits(doc: &Doc, remaining: usize, rest: &[(usize, Mode, &Doc)]) -> bool {
+fn fits<'d, 'a>(
+    doc: &'d Doc<'a>,
+    remaining: usize,
+    rest: &[(usize, Mode, &'d Doc<'a>)],
+    stack: &mut Vec<(Mode, &'d Doc<'a>)>,
+) -> bool {
     let mut left = remaining as isize;
-    let mut stack: Vec<(Mode, &Doc)> = vec![(Mode::Flat, doc)];
+    stack.clear();
+    stack.push((Mode::Flat, doc));
     let mut rest_idx = rest.len();
     loop {
         let (mode, d) = match stack.pop() {
@@ -329,11 +391,11 @@ fn fits(doc: &Doc, remaining: usize, rest: &[(usize, Mode, &Doc)]) -> bool {
 mod tests {
     use super::*;
 
-    fn t(s: &str) -> Doc {
+    fn t(s: &str) -> Doc<'_> {
         Doc::text(s)
     }
 
-    fn list(items: &[&str]) -> Doc {
+    fn list<'a>(items: &[&'a str]) -> Doc<'a> {
         let mut parts = Vec::new();
         for (i, it) in items.iter().enumerate() {
             if i > 0 {
@@ -411,7 +473,7 @@ mod tests {
         assert_eq!(print(&tail, 9, 4), "g(a, b)))");
     }
 
-    fn inner_call() -> Doc {
+    fn inner_call() -> Doc<'static> {
         Doc::group(Doc::concat(vec![
             t("g("),
             Doc::indent(Doc::concat(vec![Doc::SoftLine, list(&["a", "b"])])),
@@ -454,6 +516,51 @@ mod tests {
             t("b"),
         ]));
         assert_eq!(print(&d, 80, 4), "a, -- one\nb");
+    }
+
+    /// What the formatter relies on to print a file a statement at a time:
+    /// documents separated by hard line breaks print the same one by one
+    /// as they do concatenated, a deferred comment and a group measured up
+    /// to the end of its line included.
+    #[test]
+    fn printing_one_by_one_is_printing_the_concatenation() {
+        let statement = |name: &'static str| {
+            Doc::concat(vec![
+                Doc::group(Doc::concat(vec![
+                    t(name),
+                    Doc::indent(Doc::concat(vec![
+                        Doc::Line,
+                        list(&["alpha", "beta", "gamma"]),
+                    ])),
+                    Doc::LineSuffix(" -- tail".into()),
+                ])),
+                t(";"),
+            ])
+        };
+        let parts = vec![
+            statement("SELECT"),
+            Doc::HardLine,
+            Doc::HardLine,
+            statement("VALUES"),
+            Doc::OwnLine,
+            t("-- footer"),
+        ];
+        for width in [8, 20, 21, 22, 80] {
+            let mut printer = Printer::new(width, 4);
+            for part in &parts {
+                printer.print(part);
+            }
+            assert_eq!(
+                printer.finish(),
+                print(&Doc::concat(parts.clone()), width, 4),
+                "width {width}"
+            );
+        }
+        let mut printer = Printer::new(80, 4);
+        printer.print(&t("a"));
+        printer.hard_line();
+        printer.print(&t("b"));
+        assert_eq!(printer.finish(), "a\nb");
     }
 
     #[test]

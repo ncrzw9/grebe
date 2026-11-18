@@ -31,8 +31,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Severity;
 
-/// Casing the formatter should render keywords in. The only one of the three
-/// format knobs exposed as a choice rather than a number.
+/// Casing the formatter should render keywords in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum KeywordCase {
     #[default]
@@ -40,14 +39,27 @@ pub enum KeywordCase {
     Lower,
 }
 
+/// Where the formatter puts a statement's terminating `;`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Semicolon {
+    #[default]
+    Attached,
+    Spaced,
+    Newline,
+}
+
 /// `[format]` (or `[tool.grebe.format]`) overrides. `None` means "use the
 /// formatter's built-in default": `indent_size` 4, `inline_threshold` 100,
-/// `keyword_case` UPPER.
+/// `keyword_case` UPPER, `function_paren_space` false,
+/// `keyword_paren_space` true, `semicolon` attached.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormatConfig {
     pub indent_size: Option<usize>,
     pub inline_threshold: Option<usize>,
     pub keyword_case: Option<KeywordCase>,
+    pub function_paren_space: Option<bool>,
+    pub keyword_paren_space: Option<bool>,
+    pub semicolon: Option<Semicolon>,
 }
 
 /// One discovered/parsed configuration file, resolved to typed fields.
@@ -398,11 +410,7 @@ fn parse_string_token(s: &str, line: usize, path: &Path) -> Result<String, Confi
 enum Value {
     Str(String),
     Int(i64),
-    // No config key is boolean-typed; the variant exists so the parser
-    // accepts `true`/`false` syntactically (per the TOML subset) and reports
-    // a proper type-mismatch error, rather than "could not understand the
-    // value", when one is used where another type belongs.
-    Bool,
+    Bool(bool),
     Array(Vec<String>),
 }
 
@@ -411,7 +419,7 @@ impl Value {
         match self {
             Value::Str(_) => "a string",
             Value::Int(_) => "an integer",
-            Value::Bool => "a boolean",
+            Value::Bool(_) => "a boolean",
             Value::Array(_) => "an array",
         }
     }
@@ -443,7 +451,7 @@ fn parse_value(raw: &str, line: usize, path: &Path) -> Result<Value, ConfigError
         return Ok(Value::Str(parse_string_token(s, line, path)?));
     }
     if s == "true" || s == "false" {
-        return Ok(Value::Bool);
+        return Ok(Value::Bool(s == "true"));
     }
     if s.starts_with('-') || s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return s
@@ -674,7 +682,15 @@ fn apply_format(
     line: usize,
     path: &Path,
 ) -> Result<(), ConfigError> {
-    if !matches!(key, "indent_size" | "inline_threshold" | "keyword_case") {
+    if !matches!(
+        key,
+        "indent_size"
+            | "inline_threshold"
+            | "keyword_case"
+            | "function_paren_space"
+            | "keyword_paren_space"
+            | "semicolon"
+    ) {
         return Err(err(path, line, format!("unknown key `{key}`")));
     }
     if !seen.insert(key.to_string()) {
@@ -737,6 +753,41 @@ fn apply_format(
                         path,
                         line,
                         "`keyword_case` must be \"upper\" or \"lower\"",
+                    ));
+                }
+            });
+        }
+        "function_paren_space" | "keyword_paren_space" => {
+            let Value::Bool(on) = value else {
+                return Err(err(
+                    path,
+                    line,
+                    format!("`{key}` must be true or false, found {}", value.type_name()),
+                ));
+            };
+            if key == "function_paren_space" {
+                config.format.function_paren_space = Some(on);
+            } else {
+                config.format.keyword_paren_space = Some(on);
+            }
+        }
+        "semicolon" => {
+            let Value::Str(s) = value else {
+                return Err(err(
+                    path,
+                    line,
+                    format!("`semicolon` must be a string, found {}", value.type_name()),
+                ));
+            };
+            config.format.semicolon = Some(match s.to_ascii_lowercase().as_str() {
+                "attached" => Semicolon::Attached,
+                "spaced" => Semicolon::Spaced,
+                "newline" => Semicolon::Newline,
+                _ => {
+                    return Err(err(
+                        path,
+                        line,
+                        "`semicolon` must be \"attached\", \"spaced\" or \"newline\"",
                     ));
                 }
             });
@@ -981,6 +1032,9 @@ mod tests {
             indent_size = 2
             inline_threshold = 80
             keyword_case = "lower"
+            function_paren_space = true
+            keyword_paren_space = false
+            semicolon = "newline"
         "#;
         let config = parse(text, &p("/repo/grebe.toml"), false).expect("should parse");
         assert_eq!(config.root, p("/repo"));
@@ -1002,6 +1056,9 @@ mod tests {
         assert_eq!(config.format.indent_size, Some(2));
         assert_eq!(config.format.inline_threshold, Some(80));
         assert_eq!(config.format.keyword_case, Some(KeywordCase::Lower));
+        assert_eq!(config.format.function_paren_space, Some(true));
+        assert_eq!(config.format.keyword_paren_space, Some(false));
+        assert_eq!(config.format.semicolon, Some(Semicolon::Newline));
     }
 
     #[test]
@@ -1186,6 +1243,36 @@ mod tests {
         let text = "[format]\ninline_threshold = 19\n";
         let e = parse(text, &p("c.toml"), false).unwrap_err();
         assert_eq!(e.line, 2);
+    }
+
+    #[test]
+    fn paren_space_and_semicolon_values_are_checked() {
+        for (text, ok) in [
+            ("[format]\nfunction_paren_space = false\n", true),
+            ("[format]\nkeyword_paren_space = true\n", true),
+            ("[format]\nsemicolon = \"Spaced\"\n", true),
+            ("[format]\nsemicolon = \"attached\"\n", true),
+            ("[format]\nfunction_paren_space = \"yes\"\n", false),
+            ("[format]\nkeyword_paren_space = 1\n", false),
+            ("[format]\nsemicolon = true\n", false),
+            ("[format]\nsemicolon = \"own line\"\n", false),
+            (
+                "[format]\nsemicolon = \"spaced\"\nsemicolon = \"newline\"\n",
+                false,
+            ),
+        ] {
+            match parse(text, &p("c.toml"), false) {
+                Ok(_) => assert!(ok, "accepted: {text:?}"),
+                Err(e) => {
+                    assert!(!ok, "rejected: {text:?}");
+                    assert_eq!(e.line, text.lines().count(), "{text:?}");
+                }
+            }
+        }
+        let config =
+            parse("[format]\nsemicolon = \"Spaced\"\n", &p("c.toml"), false).expect("should parse");
+        assert_eq!(config.format.semicolon, Some(Semicolon::Spaced));
+        assert_eq!(config.format.function_paren_space, None);
     }
 
     #[test]
