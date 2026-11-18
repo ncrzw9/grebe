@@ -516,8 +516,8 @@ impl Blocks {
                 None => (0, n),
             };
             let (mut start, mut end) = (lo, hi);
-            for i in lo..hi {
-                if self.query_parent[i] != paren
+            for (i, parent) in self.query_parent.iter().enumerate().take(hi).skip(lo) {
+                if *parent != paren
                     || !matches!(
                         upper(src, t.get(i)).as_str(),
                         "UNION" | "INTERSECT" | "EXCEPT"
