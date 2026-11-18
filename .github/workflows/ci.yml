@@ -63,3 +63,43 @@ jobs:
       # version. Every crate here keeps one version across many commits, so a
       # cached target/ would verify against an older sibling's build.
       - run: cargo package --workspace --target-dir "$RUNNER_TEMP/package"
+
+  # The extension on the other two systems people run it on. The job above
+  # is the full check; this one runs the extension's tests against a real
+  # DuckDB CLI on Windows and macOS, where paths, process handling and the
+  # CLI's own behaviour differ. (No PostgreSQL server and no browser here:
+  # those tests run above and skip themselves.)
+  extension:
+    name: extension (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@v5
+        with:
+          path: target
+          key: ci-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: VS Code extension tests
+        shell: bash
+        env:
+          DUCKDB_VERSIONS: "1.5.5 2.0.0"
+        run: |
+          set -euo pipefail
+          cargo build --bin grebe
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          for version in $DUCKDB_VERSIONS; do
+            echo "::group::DuckDB $version"
+            editors/vscode/test/fetch-duckdb.sh "$version" "$RUNNER_TEMP/duckdb-$version"
+            GREBE_BIN="$PWD/target/debug/grebe$exe" DUCKDB_CLI="$RUNNER_TEMP/duckdb-$version/duckdb$exe" \
+              node --test --test-timeout=180000 editors/vscode/test/*.test.js
+            echo "::endgroup::"
+          done

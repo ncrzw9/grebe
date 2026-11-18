@@ -139,6 +139,11 @@ live("remember: files and their mode, not in-memory attachments, not the session
   const m3 = new Sessions({ store: { get: (n) => store.get(n) || [], set: (n, r) => store.set(n, r) }, reattach: () => false });
   s = await m3.open({ cli: CLI, database: own, cwd: dir });
   assert.equal((await s.run("SELECT i FROM rw.t")).kind, "error");
+  // It stays listed, unmarked, and can be attached by hand.
+  await m3.remember();
+  assert.deepEqual(store.get("default"), [{ alias: "rw", path: path.join(dir, "rw.duckdb"), type: "duckdb", readOnly: true }]);
+  assert.equal(await m3.attach("default", "rw"), null);
+  assert.equal((await s.run("SELECT i FROM rw.t")).kind, "rows");
   m3.end();
 });
 

@@ -238,6 +238,38 @@ class Explorer {
     return this.fileSession;
   }
 
+  /**
+   * The session's connections that are not attached now: detached (and
+   * waiting to be attached again), or not brought back when the session
+   * started (a file that moved, a server that is down). Before the session
+   * starts (`idle`), also the ones it will attach when it does.
+   */
+  waiting(attached, idle = false) {
+    if (!this.deps.remembered) return [];
+    const out = [];
+    for (const rec of this.deps.remembered()) {
+      if (attached(rec.alias)) continue;
+      const where = conninfo.where(rec.path);
+      const from = rec.declared ? "\n\nDeclared in the grebe.duckdb.connections setting." : "";
+      const pending = idle && !rec.detached && !rec.error;
+      out.push(
+        node("lost", rec.alias, vscode.TreeItemCollapsibleState.None, {
+          icon: rec.error ? "warning" : pending ? "plug" : "debug-disconnect",
+          alias: rec.alias,
+          declared: !!rec.declared,
+          description: `${rec.error ? "not attached" : pending ? "attached when the session starts" : "detached"} · ${where}`,
+          tooltip: rec.error
+            ? `Could not be attached:\n${conninfo.redact(rec.error)}\n\nAttach it again to retry, or forget it.${from}`
+            : pending
+              ? `${rec.alias}: ${conninfo.redact(rec.path)}${from}`
+              : `${rec.alias}: ${conninfo.redact(rec.path)}\n\nDetached: nothing here holds it open. Attach it again when you want it back; it stays listed until you forget it.${from}`,
+          contextValue: rec.error ? "grebe.lostDb" : pending ? "grebe.pendingDb" : "grebe.detachedDb",
+        }),
+      );
+    }
+    return out;
+  }
+
   async sourceChildren(root) {
     if (!trust.trusted()) {
       return [message("Restricted Mode: trust this folder to use DuckDB", "workbench.trust.manage", "shield")];
@@ -246,7 +278,9 @@ class Explorer {
       const start = message("Start DuckDB session", "grebe.catalog.start", "play");
       start.item.description = "or run a statement";
       start.item.tooltip = "Start the session your runs use, to see what is in it.";
-      return [start];
+      // Its connections are listed before it starts: the ones that will be
+      // attached with it, and the detached ones.
+      return [start, ...this.waiting(() => false, true)];
     }
     if (root.source === "file" && this.files.get(root.alias).error) {
       return [message(this.files.get(root.alias).error)];
@@ -282,28 +316,7 @@ class Explorer {
       });
     });
     const session = isSession(root.source) ? await this.sessionGroups(sess) : [];
-    // The session's connections that are not attached now: detached (and
-    // waiting to be attached again), or not brought back when the session
-    // started (a file that moved, a server that is down).
-    if (root.source === "session" && this.deps.remembered) {
-      for (const rec of this.deps.remembered()) {
-        if (dbs.some((d) => d.db === rec.alias)) continue;
-        const where = conninfo.where(rec.path);
-        const from = rec.declared ? "\n\nDeclared in the grebe.duckdb.connections setting." : "";
-        nodes.push(
-          node("lost", rec.alias, vscode.TreeItemCollapsibleState.None, {
-            icon: rec.error ? "warning" : "debug-disconnect",
-            alias: rec.alias,
-            declared: !!rec.declared,
-            description: `${rec.error ? "not attached" : "detached"} · ${where}`,
-            tooltip: rec.error
-              ? `Could not be attached:\n${conninfo.redact(rec.error)}\n\nAttach it again to retry, or forget it.${from}`
-              : `${rec.alias}: ${conninfo.redact(rec.path)}\n\nDetached: nothing here holds it open. Attach it again when you want it back; it stays listed until you forget it.${from}`,
-            contextValue: rec.error ? "grebe.lostDb" : "grebe.detachedDb",
-          }),
-        );
-      }
-    }
+    if (root.source === "session") nodes.push(...this.waiting((alias) => dbs.some((d) => d.db === alias)));
     if (nodes.length === 0) return [message("No tables yet"), ...session];
     // One database: show its contents directly.
     return nodes.length === 1 && nodes[0].kind === "db" ? [...this.dbChildren(nodes[0]), ...session] : [...nodes, ...session];

@@ -293,9 +293,13 @@ class Sessions {
       }))
       .filter((rec) => conninfo.isConnection(rec.path) || !own || path.resolve(rec.path) !== own);
     const before = this.recs(name);
+    // With re-attaching off nothing was attached when the session started,
+    // so a connection that is not attached was not detached by anyone: it
+    // is kept as it was, and comes back if the setting is turned on again.
+    const marks = !this.deps.reattach || this.deps.reattach();
     const waiting = before
       .filter((p) => !now.some((n) => n.alias === p.alias))
-      .map(({ declared, ...p }) => (p.error || p.detached ? p : { ...p, detached: true }));
+      .map(({ declared, ...p }) => (p.error || p.detached || !marks ? p : { ...p, detached: true }));
     const next = [...now, ...waiting];
     const plain = (recs) => JSON.stringify(recs.map(({ declared, ...rec }) => rec));
     if (plain(next) !== JSON.stringify(this.store.get(name))) this.save(name, next);

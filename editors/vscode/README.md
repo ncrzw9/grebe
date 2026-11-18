@@ -139,7 +139,8 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
   file or the server, so another program can have it, and stays in the
   Catalog as *detached*. It is left alone when the session starts, and
   **Attach Again** brings it back, in the same mode. **Forget** takes a
-  connection off the list. With `grebe.duckdb.reattach: false` nothing is
+  connection off the list. The list is shown before the session starts
+  too, so you can see what it will attach. With `grebe.duckdb.reattach: false` nothing is
   attached when a session starts: every connection is listed, and attached
   when you ask.
 - **Connections in settings.** `grebe.duckdb.connections` declares
