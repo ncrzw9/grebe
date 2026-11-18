@@ -23,7 +23,9 @@ const live = CLI && fs.existsSync(CLI) ? test : test.skip;
 const PG = process.env.PG_TEST_CONN;
 const livePg = CLI && PG && fs.existsSync(CLI) ? test : test.skip;
 
-const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `grebe-index-${name}-`));
+// Where DuckDB will say the folder is: on macOS the temporary folder is
+// behind a link, and Windows may give it by its short name.
+const tmp = (name) => fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `grebe-index-${name}-`)));
 
 /** A session whose statements are recorded, and a way to run one as a
  *  user's run does: the index is told what ran. */
