@@ -62,6 +62,12 @@ const INTERRUPTIBLE = process.platform !== "win32";
 // hold the session forever.
 const CANCEL_GRACE_MS = 3000;
 
+// On Windows the CLI ends every line it writes with "\r\n". What is read
+// from it is given Unix line ends there, so the rest of this file sees the
+// same text on every system. (A line break inside a value is escaped in
+// JSON, so only the CLI's own line ends are touched.)
+const unixLines = process.platform === "win32" ? (text) => text.replace(/\r\n/g, "\n") : (text) => text;
+
 // Every session not yet ended, so they can all be ended together.
 const live = new Set();
 
@@ -533,7 +539,7 @@ class Session {
     end++;
     const all = Buffer.concat(this.chunks);
     const at = all.length - window.length + hit;
-    const out = all.subarray(0, at).toString("utf8");
+    const out = unixLines(all.subarray(0, at).toString("utf8"));
     const rest = all.subarray(all.length - window.length + end);
     this.chunks = rest.length ? [rest] : [];
     this.waiting = null;
@@ -543,7 +549,7 @@ class Session {
     // stderr for this statement was written before the marker reached
     // stdout, so it is readable by the time the event loop turns once more.
     setImmediate(() => {
-      const err = this.err;
+      const err = unixLines(this.err);
       this.err = "";
       this.collecting = false;
       w.resolve({ out, err, cancelled });
