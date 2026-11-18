@@ -102,16 +102,28 @@ pub fn selection<'a>(
 }
 
 /// Builds the `format::Options` `grebe format` runs with: the formatter's
-/// built-in defaults, with any `[format]` knob a config sets overlaid on
-/// top.
+/// built-in defaults, or the bundle `style` names, with any `[format]` knob
+/// a config sets overlaid on top.
 ///
 /// The `[format]` knobs are the whole style surface, and they live in
 /// the config file only -- no command-line flags -- so a project has one
 /// style regardless of who or what invokes the formatter.
 #[must_use]
 pub fn format_options(config: Option<&Config>) -> grebe_format::Options {
-    let mut opts = grebe_format::Options::default();
-    let Some(c) = config else { return opts };
+    use grebe_rules::config as cfg;
+    let Some(c) = config else {
+        return grebe_format::Options::default();
+    };
+    let mut opts = grebe_format::Options::for_style(match c.format.style {
+        None | Some(cfg::Style::Default) => grebe_format::Style::Default,
+        Some(cfg::Style::Dbt) => grebe_format::Style::Dbt,
+        Some(cfg::Style::Mazur) => grebe_format::Style::Mazur,
+    });
+    let name_case = |case| match case {
+        cfg::NameCase::Lower => grebe_format::NameCase::Lower,
+        cfg::NameCase::Upper => grebe_format::NameCase::Upper,
+        cfg::NameCase::Preserve => grebe_format::NameCase::Preserve,
+    };
     if let Some(n) = c.format.indent_size {
         opts.indent_size = n;
     }
@@ -135,6 +147,48 @@ pub fn format_options(config: Option<&Config>) -> grebe_format::Options {
             grebe_rules::config::Semicolon::Attached => grebe_format::Semicolon::Attached,
             grebe_rules::config::Semicolon::Spaced => grebe_format::Semicolon::Spaced,
             grebe_rules::config::Semicolon::Newline => grebe_format::Semicolon::Newline,
+        };
+    }
+    if let Some(comma) = c.format.comma {
+        opts.comma = match comma {
+            cfg::Comma::Trailing => grebe_format::Comma::Trailing,
+            cfg::Comma::Leading => grebe_format::Comma::Leading,
+        };
+    }
+    if let Some(op) = c.format.logical_operator {
+        opts.logical_operator = match op {
+            cfg::LogicalOperator::Leading => grebe_format::LogicalOperator::Leading,
+            cfg::LogicalOperator::Trailing => grebe_format::LogicalOperator::Trailing,
+        };
+    }
+    if let Some(case) = c.format.function_case {
+        opts.function_case = name_case(case);
+    }
+    if let Some(case) = c.format.type_case {
+        opts.type_case = name_case(case);
+    }
+    if let Some(style) = c.format.indent_style {
+        opts.indent_style = match style {
+            cfg::IndentStyle::Space => grebe_format::IndentStyle::Space,
+            cfg::IndentStyle::Tab => grebe_format::IndentStyle::Tab,
+        };
+    }
+    if let Some(n) = c.format.blank_lines_between_statements {
+        opts.blank_lines_between_statements = n;
+    }
+    if let Some(n) = c.format.max_blank_lines_in_statement {
+        opts.max_blank_lines_in_statement = n;
+    }
+    if let Some(layout) = c.format.list_layout {
+        opts.list_layout = match layout {
+            cfg::Layout::Auto => grebe_format::ListLayout::Auto,
+            cfg::Layout::Expanded => grebe_format::ListLayout::Expanded,
+        };
+    }
+    if let Some(layout) = c.format.case_layout {
+        opts.case_layout = match layout {
+            cfg::Layout::Auto => grebe_format::CaseLayout::Auto,
+            cfg::Layout::Expanded => grebe_format::CaseLayout::Expanded,
         };
     }
     opts

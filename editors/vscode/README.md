@@ -638,7 +638,10 @@ not in CI would be worse than none.
 server for `textDocument/formatting`, which runs the same formatter as
 `grebe format`. Layout has a few knobs and they live in `grebe.toml`'s
 `[format]` table (`indent_size`, `inline_threshold`, `keyword_case`,
-`function_paren_space`, `keyword_paren_space`, `semicolon`), found
+`function_paren_space`, `keyword_paren_space`, `semicolon`, `comma`,
+`logical_operator`, `function_case`, `type_case`, `indent_style`,
+`blank_lines_between_statements`, `max_blank_lines_in_statement`,
+`list_layout`, `case_layout`, and `style` for a named bundle of them), found
 by walking upward from the file being formatted; the editor's `tabSize` is
 ignored on purpose, so the editor and CI never disagree about a file. The
 same `grebe.toml` also supplies `select`, `[severity]` overrides and

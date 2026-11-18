@@ -692,11 +692,23 @@ fn resolve_selection<W: Write>(
 /// The formatter `Options` for `config`'s `[format]` table, falling back
 /// field-by-field to `grebe_format::Options::default()` -- a `grebe.toml`
 /// that sets only `indent_size` still gets the built-in `inline_threshold`
-/// and `keyword_case`.
+/// and `keyword_case` -- or, when the table names a `style`, to that
+/// bundle.
 fn format_options(config: Option<&Config>) -> grebe_format::Options {
-    let default = grebe_format::Options::default();
+    use grebe_rules::config as cfg;
     let Some(config) = config else {
-        return default;
+        return grebe_format::Options::default();
+    };
+    let default = grebe_format::Options::for_style(match config.format.style {
+        None | Some(cfg::Style::Default) => grebe_format::Style::Default,
+        Some(cfg::Style::Dbt) => grebe_format::Style::Dbt,
+        Some(cfg::Style::Mazur) => grebe_format::Style::Mazur,
+    });
+    let name_case = |case, default| match case {
+        Some(cfg::NameCase::Lower) => grebe_format::NameCase::Lower,
+        Some(cfg::NameCase::Upper) => grebe_format::NameCase::Upper,
+        Some(cfg::NameCase::Preserve) => grebe_format::NameCase::Preserve,
+        None => default,
     };
     grebe_format::Options {
         indent_size: config.format.indent_size.unwrap_or(default.indent_size),
@@ -722,6 +734,41 @@ fn format_options(config: Option<&Config>) -> grebe_format::Options {
             Some(grebe_rules::config::Semicolon::Spaced) => grebe_format::Semicolon::Spaced,
             Some(grebe_rules::config::Semicolon::Newline) => grebe_format::Semicolon::Newline,
             None => default.semicolon,
+        },
+        comma: match config.format.comma {
+            Some(cfg::Comma::Trailing) => grebe_format::Comma::Trailing,
+            Some(cfg::Comma::Leading) => grebe_format::Comma::Leading,
+            None => default.comma,
+        },
+        logical_operator: match config.format.logical_operator {
+            Some(cfg::LogicalOperator::Leading) => grebe_format::LogicalOperator::Leading,
+            Some(cfg::LogicalOperator::Trailing) => grebe_format::LogicalOperator::Trailing,
+            None => default.logical_operator,
+        },
+        function_case: name_case(config.format.function_case, default.function_case),
+        type_case: name_case(config.format.type_case, default.type_case),
+        indent_style: match config.format.indent_style {
+            Some(cfg::IndentStyle::Space) => grebe_format::IndentStyle::Space,
+            Some(cfg::IndentStyle::Tab) => grebe_format::IndentStyle::Tab,
+            None => default.indent_style,
+        },
+        blank_lines_between_statements: config
+            .format
+            .blank_lines_between_statements
+            .unwrap_or(default.blank_lines_between_statements),
+        max_blank_lines_in_statement: config
+            .format
+            .max_blank_lines_in_statement
+            .unwrap_or(default.max_blank_lines_in_statement),
+        list_layout: match config.format.list_layout {
+            Some(cfg::Layout::Auto) => grebe_format::ListLayout::Auto,
+            Some(cfg::Layout::Expanded) => grebe_format::ListLayout::Expanded,
+            None => default.list_layout,
+        },
+        case_layout: match config.format.case_layout {
+            Some(cfg::Layout::Auto) => grebe_format::CaseLayout::Auto,
+            Some(cfg::Layout::Expanded) => grebe_format::CaseLayout::Expanded,
+            None => default.case_layout,
         },
     }
 }
@@ -1474,6 +1521,53 @@ fn notify<W: Write>(writer: &mut W, method: &str, params: Json) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_options_overlay_the_format_table_on_its_style() {
+        let parse = |text: &str| {
+            grebe_rules::config::parse(text, std::path::Path::new("grebe.toml"), false)
+                .expect("should parse")
+        };
+        assert_eq!(format_options(None), grebe_format::Options::default());
+        assert_eq!(
+            format_options(Some(&parse(""))),
+            grebe_format::Options::default()
+        );
+        assert_eq!(
+            format_options(Some(&parse("[format]\nstyle = \"default\"\n"))),
+            grebe_format::Options::default()
+        );
+        for (name, style) in [
+            ("dbt", grebe_format::Style::Dbt),
+            ("mazur", grebe_format::Style::Mazur),
+        ] {
+            let config = parse(&format!("[format]\nstyle = \"{name}\"\n"));
+            assert_eq!(
+                format_options(Some(&config)),
+                grebe_format::Options::for_style(style)
+            );
+        }
+        // Every option set next to a style wins over it.
+        let config = parse(
+            "[format]\nstyle = \"dbt\"\nkeyword_case = \"upper\"\ncomma = \"leading\"\nlogical_operator = \"trailing\"\nfunction_case = \"preserve\"\ntype_case = \"upper\"\nindent_style = \"tab\"\nblank_lines_between_statements = 2\nmax_blank_lines_in_statement = 3\nlist_layout = \"auto\"\ncase_layout = \"expanded\"\n",
+        );
+        assert_eq!(
+            format_options(Some(&config)),
+            grebe_format::Options {
+                keyword_case: grebe_format::KeywordCase::Upper,
+                comma: grebe_format::Comma::Leading,
+                logical_operator: grebe_format::LogicalOperator::Trailing,
+                function_case: grebe_format::NameCase::Preserve,
+                type_case: grebe_format::NameCase::Upper,
+                indent_style: grebe_format::IndentStyle::Tab,
+                blank_lines_between_statements: 2,
+                max_blank_lines_in_statement: 3,
+                list_layout: grebe_format::ListLayout::Auto,
+                case_layout: grebe_format::CaseLayout::Expanded,
+                ..grebe_format::Options::default()
+            }
+        );
+    }
 
     #[test]
     fn severity_mapping_matches_registry() {

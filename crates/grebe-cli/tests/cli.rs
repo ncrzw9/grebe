@@ -256,6 +256,93 @@ fn grebe_toml_format_indent_size_changes_indentation_and_no_config_ignores_it() 
 }
 
 #[test]
+fn grebe_toml_style_and_the_options_next_to_it_reach_the_formatter() {
+    const SRC: &str = "SELECT Id, Customer_Id, COUNT(*) FROM Orders WHERE Alpha = 1 AND Beta = 2 AND Gamma = 3 GROUP BY 1;\nSELECT CAST(X AS INTEGER);\n";
+    let dir = TempDir::new("format-style");
+    dir.write("a.sql", SRC);
+
+    // A style alone is its bundle.
+    dir.write("grebe.toml", "[format]\nstyle = \"dbt\"\n");
+    let out = grebe(dir.path(), &["format", "a.sql"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        dir.read("a.sql"),
+        grebe_format::format(
+            SRC,
+            &grebe_format::Options::for_style(grebe_format::Style::Dbt)
+        )
+    );
+    assert_eq!(
+        dir.read("a.sql"),
+        "select\n    Id,\n    Customer_Id,\n    count(*)\nfrom Orders\nwhere Alpha = 1 and Beta = 2 and Gamma = 3\ngroup by 1;\n\nselect cast(X as integer);\n"
+    );
+
+    // Every option set next to a style overrides it, and the ones the
+    // style leaves alone apply as ever.
+    dir.write("a.sql", SRC);
+    dir.write(
+        "grebe.toml",
+        "[format]\nstyle = \"mazur\"\nkeyword_case = \"upper\"\nfunction_case = \"upper\"\ntype_case = \"upper\"\ncomma = \"leading\"\nlogical_operator = \"trailing\"\nindent_style = \"tab\"\nblank_lines_between_statements = 0\nmax_blank_lines_in_statement = 1\nlist_layout = \"auto\"\ncase_layout = \"expanded\"\ninline_threshold = 30\n",
+    );
+    let out = grebe(dir.path(), &["format", "a.sql"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        dir.read("a.sql"),
+        "SELECT\n\tId\n\t, Customer_Id\n\t, COUNT(*)\nFROM Orders\nWHERE Alpha = 1 AND\n\tBeta = 2 AND\n\tGamma = 3\nGROUP BY 1;\nSELECT CAST(X AS INTEGER);\n"
+    );
+    let again = grebe(dir.path(), &["format", "--check", "a.sql"]);
+    assert!(again.status.success(), "stdout: {}", stdout(&again));
+}
+
+#[test]
+fn an_unknown_style_is_a_config_error_that_names_the_styles() {
+    let dir = TempDir::new("format-bad-style");
+    dir.write("grebe.toml", "[format]\nstyle = \"sqlfluff\"\n");
+    dir.write("a.sql", MESSY_SQL);
+
+    let out = grebe(dir.path(), &["format", "a.sql"]);
+    assert_eq!(out.status.code(), Some(2), "stdout: {}", stdout(&out));
+    let message = stderr(&out);
+    for name in ["\"default\"", "\"dbt\"", "\"mazur\""] {
+        assert!(message.contains(name), "stderr: {message}");
+    }
+    assert_eq!(dir.read("a.sql"), MESSY_SQL, "nothing is written");
+}
+
+#[test]
+fn format_check_takes_a_switched_off_region_as_formatted() {
+    const SRC: &str = "SELECT 1;\n\n-- grebe: format off\nselect   a,b\n   from t ;\n-- grebe: format on\n\nSELECT 2;\n";
+    let dir = TempDir::new("format-off");
+    dir.write("a.sql", SRC);
+
+    let out = grebe(dir.path(), &["format", "--check", "a.sql"]);
+    assert!(out.status.success(), "stdout: {}", stdout(&out));
+    assert!(stdout(&out).is_empty(), "stdout: {}", stdout(&out));
+
+    // The code outside the region is still held to the style.
+    let messy = SRC.replace("SELECT 2;", "select   2;");
+    dir.write("a.sql", &messy);
+    let out = grebe(dir.path(), &["format", "--check", "a.sql"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let out = grebe(dir.path(), &["format", "a.sql"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(dir.read("a.sql"), SRC);
+
+    // A suppression comment is not a formatter marker, and a formatter
+    // marker does not silence a finding: the lint still sees the region.
+    dir.write(
+        "b.sql",
+        "-- grebe: format off\nselect   count(*) from t;\n-- grebe: format on\n-- grebe: ignore[MOD001]\nSELECT count(*)\nFROM u;\n",
+    );
+    let out = grebe(dir.path(), &["format", "--check", "b.sql"]);
+    assert!(out.status.success(), "stdout: {}", stdout(&out));
+    let out = grebe(dir.path(), &["check", "--no-config", "b.sql"]);
+    let found = stdout(&out);
+    assert_eq!(found.matches("MOD001").count(), 1, "stdout: {found}");
+    assert!(found.contains("b.sql:2:"), "stdout: {found}");
+}
+
+#[test]
 fn severity_override_promotes_a_finding_to_error() {
     let dir = TempDir::new("check-severity");
     dir.write("grebe.toml", "[severity]\nMOD001 = \"error\"\n");

@@ -129,6 +129,16 @@ keyword_case         = "upper"     # or "lower"
 function_paren_space = false       # true: count (x), coalesce (a, b)
 keyword_paren_space  = true        # false: IN(1, 2), AS(...), OVER(...)
 semicolon            = "attached"  # "spaced": n ;  "newline": ; on its own line
+comma                = "trailing"  # or "leading": the comma starts the next line
+logical_operator     = "leading"   # or "trailing": AND/OR end the line before
+function_case        = "lower"     # or "upper", "preserve"
+type_case            = "lower"     # or "upper", "preserve"
+indent_style         = "space"     # or "tab"
+blank_lines_between_statements = 1 # 0 to 10
+max_blank_lines_in_statement   = 0 # 0 to 10: blank lines kept inside a statement
+list_layout          = "auto"      # or "expanded": one select item per line, always
+case_layout          = "auto"      # or "expanded": one CASE arm per line, always
+# style              = "dbt"       # a named bundle of the above: "default", "dbt", "mazur"
 ```
 
 The values shown are the defaults. `function_paren_space` covers every call:
@@ -139,6 +149,156 @@ parameter list, and the keyword forms that read as calls (`CAST`,
 follows a keyword (`IN`, `VALUES`, `OVER`, `AS`, `EXISTS`, `USING`, `FILTER`,
 `FROM`, `ON`, ...); a parenthesis after a name, as in `INSERT INTO t (a, b)`,
 is not affected by either.
+
+The other options are the places where established style guides differ from
+the default. Each default is what the formatter did before the option
+existed.
+
+`comma` says where the comma goes in a list that breaks over lines: a select
+list, `GROUP BY` and `ORDER BY`, column definitions, `VALUES` rows,
+arguments, an `IN` list, CTEs. A list that fits on one line is `a, b` either
+way.
+
+```sql
+SELECT          -- "trailing"      SELECT          -- "leading"
+    alpha,                             alpha
+    beta                               , beta
+FROM t;                            FROM t;
+```
+
+A leading comma never lands in a comment: a `--` comment after an item, or
+after its comma, stays at the end of that item's line, and the comma starts
+the next one. Comments on lines of their own between two items stay above
+the comma. A trailing comma the source had after the last item is dropped,
+since it has no line to lead (the default keeps it in a list that breaks).
+
+`logical_operator` says where `AND` and `OR` go in a condition that breaks.
+Other operators (`||`, `+`) always start their line.
+
+```sql
+WHERE alpha = 1     -- "leading"   WHERE alpha = 1 AND    -- "trailing"
+    AND beta = 2                       beta = 2
+```
+
+With `"trailing"`, a `--` comment after an operand moves behind the operator
+that follows it (`alpha = 1 AND -- why`), so that the operator is not
+commented out.
+
+`function_case` is the case of a function name in a call: `count(x)`,
+`COUNT(x)`, or as written with `"preserve"`. It covers scalar, aggregate,
+window and table functions, and `x.lower()` where `x` is a name. It does not
+touch the keyword forms that read as calls (`CAST`, `TRY_CAST`, `COALESCE`,
+`NULLIF`, `EXTRACT`, `TRIM`, `SUBSTRING`, `POSITION`, `ROW`, `COLUMNS`,
+`GROUPING`, ...), which are keywords and follow `keyword_case`; a schema in
+front of a function; a quoted name; a method called on anything but a name
+(`f(x).g()`); or a column that happens to be called `sum`.
+
+`type_case` is the case of a type wherever one stands: `CAST(x AS integer)`,
+`x::INTEGER`, a column definition, a typed literal (`date '2024-01-01'`). It
+covers the type's name, a user-defined one included, and the keywords that
+are part of a type (`timestamp with time zone`, `double precision`,
+`struct(...)`), whatever `keyword_case` says. A column called `date` is a
+column and keeps its case, and `INTERVAL 1 DAY` is a keyword form, not a
+type.
+
+```sql
+SELECT count(*), CAST(x AS integer)   -- function_case "lower", type_case "lower"
+SELECT COUNT(*), CAST(x AS INTEGER)   -- both "upper"
+```
+
+`indent_style = "tab"` indents with one tab per level instead of
+`indent_size` spaces. A tab is counted as `indent_size` columns when a line
+is measured against `inline_threshold`, so the same lines break as with
+spaces. Nothing is aligned with spaces inside a line.
+
+`blank_lines_between_statements` is the number of blank lines between one
+statement and the next: `SELECT 1;` and `SELECT 2;` on consecutive lines
+with 0, a blank line between them with 1.
+
+`max_blank_lines_in_statement` keeps the blank lines the author left inside
+a statement, up to that many in a row, wherever the formatter breaks the
+line anyway: above a select item, a clause, a CTE, a comment. It never
+breaks a line to keep one, so a statement that fits on one line stays there.
+With 0 they are dropped. A statement's leading comments count as inside it.
+
+```sql
+SELECT        -- with 1 the blank line above beta stays,
+    alpha,    -- with 0 it goes
+
+    beta
+FROM t;
+```
+
+`list_layout = "expanded"` puts a select list, a `GROUP BY` list and a
+query's `ORDER BY` list of more than one item on one line per item, under
+the keyword, even when it would fit on one line, as the formatter does
+anyway when it does not fit; the statement around it then takes a line per
+clause. A single item, `GROUP BY ALL`, and the `ORDER BY` of a window or an
+aggregate are left to fit.
+
+```sql
+SELECT a, b FROM t;   -- "auto"    SELECT            -- "expanded"
+                                       a,
+                                       b
+                                   FROM t;
+```
+
+`case_layout = "expanded"` does the same for a `CASE` with more than one
+`WHEN`: `CASE`, each `WHEN`, `ELSE` and `END` on lines of their own.
+
+```sql
+SELECT CASE WHEN a THEN 1 WHEN b THEN 2 ELSE 3 END;   -- "auto"
+
+SELECT                                                -- "expanded"
+    CASE
+        WHEN a THEN 1
+        WHEN b THEN 2
+        ELSE 3
+    END;
+```
+
+`style` names a bundle of these options. Any option set in the same table
+overrides what the style sets.
+
+| `style` | sets |
+|---|---|
+| `"default"` | nothing: every option at its default |
+| `"dbt"` | `keyword_case = "lower"`, `function_case = "lower"`, `type_case = "lower"`, `comma = "trailing"`, `indent_style = "space"`, `indent_size = 4`, `list_layout = "expanded"` |
+| `"mazur"` | the same seven options, with the same values |
+
+`"dbt"` and `"mazur"` are in the spirit of the dbt style guide and of Matt
+Mazur's SQL style guide, and no more than that: lower-case keywords,
+functions and types, trailing commas, four spaces, one select item per line.
+They do not claim to conform to either guide, and every option they do not
+set (`inline_threshold`, `logical_operator`, `case_layout`, ...) stays at
+its default. The two are the same bundle today.
+
+```toml
+[format]
+style = "dbt"
+inline_threshold = 80   # set next to a style, an option wins
+```
+
+To leave some SQL exactly as written, put it between two comments, each on a
+line of its own:
+
+```sql
+-- grebe: format off
+SELECT  id,    name
+FROM    users ;
+-- grebe: format on
+```
+
+`-- fmt: off` and `-- fmt: on` mean the same, and letter case does not
+matter. Everything from the first line to the second is kept byte for byte;
+without an `on`, the rest of the file is. The unit is the statement: when a
+marker stands inside a statement, or a region starts or ends inside one, the
+whole statement is left as written, from its first token to its `;`. The
+statements around the region are formatted as ever, keeping the blank lines
+the author left next to the region (up to `blank_lines_between_statements`),
+and `grebe format --check` does not report a region. These comments are not
+the `-- grebe: ignore[CODE]` comments below, which silence findings and do
+not affect layout.
 
 Silence one statement with `-- grebe: ignore[CODE]`, or every code with
 `-- grebe: ignore`.

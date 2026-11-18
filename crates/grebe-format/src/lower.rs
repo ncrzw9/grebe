@@ -18,7 +18,8 @@
 //!   the file does for a top-level statement, the bracket does for a
 //!   subquery — so a subquery that lands on its own lines breaks its clauses
 //!   too, instead of re-fitting them onto one line inside the parens.
-//! - **`AND`/`OR` chains** break one condition per line, operator leading.
+//! - **`AND`/`OR` chains** break one condition per line, operator leading
+//!   unless `logical_operator` has it trail.
 //! - **`CASE`** puts each `WHEN` on a line once it no longer fits.
 //!
 //! # What never changes
@@ -42,7 +43,7 @@
 //! covered by an identifier-rule node was matched as an identifier.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -52,7 +53,10 @@ use grebe_syntax::matcher::{FlatNode, Statements, Step};
 use grebe_syntax::token::{Token, TokenKind};
 
 use crate::doc::{Doc, Printer};
-use crate::{KeywordCase, Options, Semicolon};
+use crate::{
+    CaseLayout, Comma, IndentStyle, KeywordCase, ListLayout, LogicalOperator, NameCase, Options,
+    Semicolon,
+};
 
 /// Rules whose node starts a new line in the enclosing statement group.
 const CLAUSE_RULES: &[&str] = &[
@@ -160,14 +164,12 @@ const TIGHT_BRACKET_RULES: &[&str] = &[
     "ArrayKeywordWithBounds",
 ];
 
-/// Naming rules whose identifiers are lower-cased: function and type names.
-const LOWER_NAME_RULES: &[&str] = &[
-    "FunctionName",
-    "TableFunctionName",
-    "ReservedFunctionName",
-    "TypeName",
-    "ReservedTypeName",
-];
+/// Naming rules whose identifiers are cased by `function_case`: the name of
+/// a function, aggregate, window or table function call.
+const FUNCTION_NAME_RULES: &[&str] = &["FunctionName", "TableFunctionName", "ReservedFunctionName"];
+
+/// Naming rules whose identifiers are cased by `type_case`.
+const TYPE_NAME_RULES: &[&str] = &["TypeName", "ReservedTypeName"];
 
 /// Rules implemented natively in the matcher that match a *word* as an
 /// identifier of some keyword category. Their compiled expression is a
@@ -209,7 +211,7 @@ const CLAUSE: u32 = 1;
 const STATEMENT: u32 = 1 << 1;
 const TIGHT_PAREN: u32 = 1 << 2;
 const TIGHT_BRACKET: u32 = 1 << 3;
-const LOWER_NAME: u32 = 1 << 4;
+const FUNCTION_NAME: u32 = 1 << 4;
 /// Matches words as identifiers.
 const IDENT: u32 = 1 << 5;
 const TYPE: u32 = 1 << 6;
@@ -230,6 +232,13 @@ const UPDATE_TARGET: u32 = 1 << 20;
 const UPDATE_SET_LIST: u32 = 1 << 21;
 const WHOLE_STATEMENT: u32 = 1 << 22;
 const CALL_PAREN: u32 = 1 << 23;
+const TYPE_NAME: u32 = 1 << 24;
+/// `GROUP BY` and `ORDER BY`: the lists `list_layout` expands, besides the
+/// select list.
+const EXPANDING_LIST: u32 = 1 << 25;
+const RESULT_MODIFIERS: u32 = 1 << 26;
+const ORDER_BY: u32 = 1 << 27;
+const CASE_WHEN: u32 = 1 << 28;
 
 /// The rule lists above and the rules [`Lowerer::lower`] has an opinion on,
 /// as bits.
@@ -239,7 +248,12 @@ const RULE_FLAGS: &[(u32, &[&str])] = &[
     (TIGHT_PAREN, TIGHT_PAREN_RULES),
     (CALL_PAREN, CALL_PAREN_RULES),
     (TIGHT_BRACKET, TIGHT_BRACKET_RULES),
-    (LOWER_NAME, LOWER_NAME_RULES),
+    (FUNCTION_NAME, FUNCTION_NAME_RULES),
+    (TYPE_NAME, TYPE_NAME_RULES),
+    (EXPANDING_LIST, &["GroupByClause", "OrderByClause"]),
+    (RESULT_MODIFIERS, &["ResultModifiers"]),
+    (ORDER_BY, &["OrderByClause"]),
+    (CASE_WHEN, &["CaseWhenThen"]),
     (IDENT, KEYWORD_CATEGORY_RULES),
     (TYPE, &["Type"]),
     (
@@ -378,6 +392,8 @@ enum Item {
 struct Comment<'a> {
     text: &'a str,
     line: bool,
+    /// Blank lines the author left above it, as many as are kept.
+    blank: u8,
 }
 
 /// Comment attachment, kept up one statement at a time.
@@ -400,10 +416,19 @@ struct Comments<'a> {
     last_code: Option<usize>,
     newline_since: bool,
     pending: Vec<Comment<'a>>,
+    /// `max_blank_lines_in_statement`: how many blank lines above a token
+    /// or a comment are kept. Zero keeps none and costs nothing.
+    keep_blank: usize,
+    /// By code token: the blank lines above it, where there are any to
+    /// keep. The first thing of a statement never has any: the space
+    /// between statements is not the statement's.
+    blank: HashMap<usize, u8>,
+    /// Line breaks in the white space since the last token or comment.
+    newlines: usize,
 }
 
 impl<'a> Comments<'a> {
-    fn new() -> Self {
+    fn new(keep_blank: usize) -> Self {
         Self {
             leading: HashMap::new(),
             trailing: HashMap::new(),
@@ -412,7 +437,18 @@ impl<'a> Comments<'a> {
             last_code: None,
             newline_since: true,
             pending: Vec::new(),
+            keep_blank: keep_blank.min(usize::from(u8::MAX)),
+            blank: HashMap::new(),
+            newlines: 0,
         }
+    }
+
+    /// The blank lines above the token or comment the scan has reached,
+    /// capped to what is kept.
+    fn take_blank(&mut self) -> u8 {
+        let blank = self.newlines.saturating_sub(1).min(self.keep_blank);
+        self.newlines = 0;
+        blank as u8
     }
 
     /// Attach the comments of the statement whose code tokens end before
@@ -420,18 +456,26 @@ impl<'a> Comments<'a> {
     fn attach(&mut self, src: &'a str, tokens: &[Token], end: usize) {
         self.leading.clear();
         self.trailing.clear();
+        self.blank.clear();
+        // Nothing of this statement has been reached yet, apart from the
+        // comments that lead it, which the last call left in `pending`.
+        let mut first = true;
         while let Some(t) = tokens.get(self.cursor) {
             let text = &src[t.span.start as usize..t.span.end as usize];
             match t.kind {
                 TokenKind::Whitespace => {
                     if text.contains('\n') {
                         self.newline_since = true;
+                        if self.keep_blank > 0 {
+                            self.newlines += text.bytes().filter(|b| *b == b'\n').count();
+                        }
                     }
                 }
                 TokenKind::LineComment | TokenKind::BlockComment => {
                     let c = Comment {
                         text: text.trim_end(),
                         line: t.kind == TokenKind::LineComment,
+                        blank: self.take_blank(),
                     };
                     match self.last_code {
                         Some(k) if !self.newline_since => {
@@ -461,6 +505,18 @@ impl<'a> Comments<'a> {
                                 }
                             }
                         }
+                    }
+                    let blank = self.take_blank();
+                    if first {
+                        first = false;
+                        if let Some(c) = self.pending.first_mut() {
+                            c.blank = 0;
+                        }
+                        if blank > 0 && !self.pending.is_empty() {
+                            self.blank.insert(i, blank);
+                        }
+                    } else if blank > 0 {
+                        self.blank.insert(i, blank);
                     }
                     if !self.pending.is_empty() {
                         self.leading.insert(i, std::mem::take(&mut self.pending));
@@ -532,6 +588,13 @@ struct Lowerer<'s, 'a> {
     /// comma there would print as `,;`, so it is dropped even when the list
     /// is broken.
     stmt_end: Cell<Option<usize>>,
+    /// A token whose trailing line comments are printed by the layout
+    /// rather than with the token: the last token of an operand that
+    /// `AND`/`OR` trails, where the comment has to come after the operator.
+    deferred: Cell<Option<usize>>,
+    /// Tokens whose leading comments a leading comma has printed already,
+    /// with itself; empty unless commas lead.
+    hoisted: RefCell<Vec<usize>>,
 }
 
 impl<'s, 'a> Lowerer<'s, 'a> {
@@ -601,6 +664,8 @@ impl<'s, 'a> Lowerer<'s, 'a> {
             parent,
             in_type,
             stmt_end: Cell::new(None),
+            deferred: Cell::new(None),
+            hoisted: RefCell::new(Vec::new()),
         }
     }
 
@@ -740,18 +805,24 @@ impl<'s, 'a> Lowerer<'s, 'a> {
         }
         // Is this word an identifier, by how the grammar matched it?
         if self.exact_cover_is(i, IDENT) {
-            if self.exact_cover_is(i, LOWER_NAME) {
-                return lower_case(raw);
+            if self.exact_cover_is(i, FUNCTION_NAME | TYPE_NAME) {
+                let case = if self.exact_cover_is(i, FUNCTION_NAME) {
+                    self.opts.function_case
+                } else {
+                    self.opts.type_case
+                };
+                return name_case(case, raw);
             }
             return Cow::Borrowed(raw);
         }
         if self.keywords.keyword(i) == Keyword::NONE {
             return Cow::Borrowed(raw);
         }
-        // Type names are lower even when the grammar spells them as keyword
-        // literals (`integer`, `timestamp with time zone`).
+        // Type names follow `type_case` even when the grammar spells them
+        // as keyword literals (`integer`, `timestamp with time zone`), not
+        // `keyword_case`.
         if self.in_type[self.owner[i - self.base] as usize] {
-            return lower_case(raw);
+            return name_case(self.opts.type_case, raw);
         }
         match self.opts.keyword_case {
             KeywordCase::Upper => upper_case(raw),
@@ -761,16 +832,38 @@ impl<'s, 'a> Lowerer<'s, 'a> {
 
     fn comments_leading(&self, i: usize, parts: &mut Vec<Doc<'a>>) {
         if let Some(cs) = self.comments.leading.get(&i) {
-            for c in cs {
-                if c.line {
-                    parts.push(Doc::OwnLine);
-                    parts.push(Doc::text(c.text));
-                    parts.push(Doc::OwnLine);
-                } else {
-                    parts.push(Doc::text(c.text));
-                    parts.push(Doc::text(" "));
-                }
+            if self.hoisted.borrow().contains(&i) {
+                return; // printed already, with the comma that leads the line
             }
+            for c in cs {
+                self.comment_leading(c, parts);
+            }
+        }
+    }
+
+    /// One comment that leads a token: a line comment on a line of its
+    /// own, a block comment in front of what follows.
+    fn comment_leading(&self, c: &Comment<'a>, parts: &mut Vec<Doc<'a>>) {
+        if c.line {
+            parts.push(Doc::OwnLine);
+            if c.blank > 0 {
+                parts.push(Doc::BlankLines(c.blank));
+            }
+            parts.push(Doc::text(c.text));
+            parts.push(Doc::OwnLine);
+        } else {
+            if c.blank > 0 {
+                parts.push(Doc::BlankLines(c.blank));
+            }
+            parts.push(Doc::text(c.text));
+            parts.push(Doc::text(" "));
+        }
+    }
+
+    /// The blank lines kept above a token, if any.
+    fn blank_above(&self, i: usize, parts: &mut Vec<Doc<'a>>) {
+        if let Some(&n) = self.comments.blank.get(&i) {
+            parts.push(Doc::BlankLines(n));
         }
     }
 
@@ -784,6 +877,9 @@ impl<'s, 'a> Lowerer<'s, 'a> {
                     // run would see a comment trailing `;` and keep it flat.
                     parts.push(Doc::LineSuffix(format!(" {}", c.text)));
                 } else if c.line {
+                    if self.deferred.get() == Some(i) {
+                        continue; // the layout prints it, after the operator
+                    }
                     parts.push(Doc::LineSuffix(format!(" {}", c.text)));
                     parts.push(Doc::BreakParent);
                 } else {
@@ -796,11 +892,15 @@ impl<'s, 'a> Lowerer<'s, 'a> {
     /// A token with its comments, with the given text in place of its own.
     fn tok_doc_as(&self, i: usize, text: Doc<'a>) -> Doc<'a> {
         // Nearly every token has no comment, and is just its text.
-        if self.comments.leading.is_empty() && self.comments.trailing.is_empty() {
+        if self.comments.leading.is_empty()
+            && self.comments.trailing.is_empty()
+            && self.comments.blank.is_empty()
+        {
             return text;
         }
         let mut parts = Vec::new();
         self.comments_leading(i, &mut parts);
+        self.blank_above(i, &mut parts);
         parts.push(text);
         self.comments_trailing(i, &mut parts);
         if parts.len() == 1 {
@@ -990,8 +1090,9 @@ impl<'s, 'a> Lowerer<'s, 'a> {
                         continue;
                     }
                 }
-                // Commas trail, never lead: leading-comma style exists to dodge
-                // engines that reject a trailing comma, and DuckDB accepts one.
+                // Commas trail unless `comma` says they lead. Leading-comma
+                // style exists to dodge engines that reject a trailing comma,
+                // and DuckDB accepts one.
                 if text == "," {
                     let trailing = i + 1 >= items.len();
                     if trailing {
@@ -1005,13 +1106,24 @@ impl<'s, 'a> Lowerer<'s, 'a> {
                             Doc::Nil
                         } else if makes_tuple {
                             Doc::text(",")
+                        } else if self.opts.comma == Comma::Leading {
+                            // A comma with nothing after it cannot lead a
+                            // line; in a list of leading commas it goes.
+                            Doc::Nil
                         } else {
                             Doc::if_break(Doc::text(","), Doc::Nil)
                         };
                         parts.push(self.tok_doc_as(ti, comma));
+                    } else if self.opts.comma == Comma::Leading {
+                        self.leading_comma_before(ti, &mut parts);
+                        parts.push(Doc::Line);
+                        self.leading_comma_after(ti, self.first_tok(items[i + 1]), &mut parts);
                     } else {
                         parts.push(self.tok_doc(ti));
                         parts.push(Doc::Line);
+                        // A blank line above a comma that led its line is
+                        // one above the item, now that the comma trails.
+                        self.blank_above(ti, &mut parts);
                     }
                     prev = Some(it);
                     i += 1;
@@ -1023,6 +1135,85 @@ impl<'s, 'a> Lowerer<'s, 'a> {
             i += 1;
         }
         one_or_concat(parts)
+    }
+
+    /// A comma between two items of a list whose commas lead, up to the
+    /// line break: `,` when the list stays on one line and nothing when it
+    /// breaks. A line comment that trailed the item or the comma ends the
+    /// item's line, so the comma that starts the next line is never inside
+    /// it.
+    fn leading_comma_before(&self, ti: usize, parts: &mut Vec<Doc<'a>>) {
+        parts.push(Doc::if_break(Doc::Nil, Doc::text(",")));
+        for c in self.comments.trailing.get(&ti).into_iter().flatten() {
+            if c.line {
+                parts.push(Doc::LineSuffix(format!(" {}", c.text)));
+                parts.push(Doc::BreakParent);
+            }
+        }
+    }
+
+    /// The same comma after the line break: `, ` at the start of the next
+    /// item's line when the list is broken, and with it every comment that
+    /// stood between the two items -- before the comma, after it, or above
+    /// the next item, whose first token is `next`. Whichever of the three
+    /// it was, it is printed the same way, because once the comma has
+    /// moved the next run cannot tell them apart: the comments up to the
+    /// last line comment on lines of their own above the comma, and the
+    /// block comments after that between the comma and the item.
+    ///
+    /// A blank line the author left above the comma or above the item goes
+    /// above the comma.
+    fn leading_comma_after(&self, ti: usize, next: usize, parts: &mut Vec<Doc<'a>>) {
+        let comments = &self.comments;
+        let between: Vec<&Comment<'a>> = comments
+            .leading
+            .get(&ti)
+            .into_iter()
+            .flatten()
+            .chain(
+                comments
+                    .trailing
+                    .get(&ti)
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| !c.line),
+            )
+            .chain(comments.leading.get(&next).into_iter().flatten())
+            .collect();
+        let above = between.iter().rposition(|c| c.line).map_or(0, |k| k + 1);
+        for c in &between[..above] {
+            self.comment_leading(c, parts);
+        }
+        self.blank_above(ti, parts);
+        self.blank_above(next, parts);
+        parts.push(Doc::if_break(Doc::text(", "), Doc::Nil));
+        for c in &between[above..] {
+            parts.push(Doc::text(c.text));
+            parts.push(SPACE);
+        }
+        if comments.leading.contains_key(&next) {
+            self.hoisted.borrow_mut().push(next);
+        }
+    }
+
+    /// Does this run of items hold a list of more than one item: a comma
+    /// outside brackets with something after it? A run that is one node is
+    /// that node's items.
+    fn has_many(&self, items: &[Item]) -> bool {
+        if let [Item::Node(n)] = items {
+            return self.has_many(&self.items(*n));
+        }
+        let mut depth = 0usize;
+        for (k, it) in items.iter().enumerate() {
+            let Item::Tok(i) = it else { continue };
+            match self.text(*i) {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                "," if depth == 0 && k + 1 < items.len() => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn find_close(&self, items: &[Item], open_at: usize, open: &str, close: &str) -> Option<usize> {
@@ -1070,11 +1261,11 @@ impl<'s, 'a> Lowerer<'s, 'a> {
             Layout::SelectClause => self.select_clause(id),
             Layout::KeywordList => self.keyword_list_clause(id),
             Layout::KeywordExpr => self.keyword_expr_clause(id),
-            Layout::Chain => self.chain(self.items(id)),
+            Layout::Chain => self.chain(self.items(id), true),
             Layout::LongChain => {
                 let items = self.items(id);
                 if items.len() >= 3 {
-                    self.chain(items)
+                    self.chain(items, false)
                 } else {
                     self.seq(&items)
                 }
@@ -1158,8 +1349,25 @@ impl<'s, 'a> Lowerer<'s, 'a> {
             return body;
         }
         let gap = self.after_keyword(Some(items[k - 1]), items[k], Doc::Line);
-        head.push(Doc::group(Doc::indent(Doc::concat(vec![gap, body]))));
+        let mut list = vec![gap, body];
+        if self.opts.list_layout == ListLayout::Expanded
+            && self.is(id, EXPANDING_LIST)
+            && self.is_query_clause(id)
+            && self.has_many(&items[k..])
+        {
+            list.push(Doc::BreakParent);
+        }
+        head.push(Doc::group(Doc::indent(Doc::concat(list))));
         Doc::concat(head)
+    }
+
+    /// Is this `GROUP BY` or `ORDER BY` a query's own clause, rather than
+    /// the `ORDER BY` of a window or of an aggregate's arguments?
+    fn is_query_clause(&self, id: usize) -> bool {
+        !self.is(id, ORDER_BY)
+            || self
+                .parent(id)
+                .is_some_and(|p| self.is(p, RESULT_MODIFIERS))
     }
 
     /// `SELECT [DISTINCT ...] <list>`: the distinct clause stays on the
@@ -1186,7 +1394,11 @@ impl<'s, 'a> Lowerer<'s, 'a> {
         }
         let body = self.seq(&rest);
         let gap = self.after_keyword(last_head, rest[0], Doc::Line);
-        head.push(Doc::group(Doc::indent(Doc::concat(vec![gap, body]))));
+        let mut list = vec![gap, body];
+        if self.opts.list_layout == ListLayout::Expanded && self.has_many(&rest[..1]) {
+            list.push(Doc::BreakParent);
+        }
+        head.push(Doc::group(Doc::indent(Doc::concat(list))));
         Doc::concat(head)
     }
 
@@ -1218,10 +1430,16 @@ impl<'s, 'a> Lowerer<'s, 'a> {
     }
 
     /// `a AND b AND c` → one condition per line, operator leading, once it
-    /// no longer fits.
-    fn chain(&self, items: Vec<Item>) -> Doc<'a> {
+    /// no longer fits. `logical` is `AND`/`OR`, whose operator trails its
+    /// line instead when `logical_operator` says so.
+    fn chain(&self, items: Vec<Item>, logical: bool) -> Doc<'a> {
         if items.len() < 2 {
             return self.seq(&items);
+        }
+        if logical && self.opts.logical_operator == LogicalOperator::Trailing {
+            if let Some(doc) = self.chain_trailing(&items) {
+                return doc;
+            }
         }
         let mut parts = vec![self.lower_item(items[0])];
         let mut tail = Vec::new();
@@ -1233,10 +1451,89 @@ impl<'s, 'a> Lowerer<'s, 'a> {
                 continue;
             };
             tail.push(Doc::Line);
+            if !self.comments.blank.is_empty() {
+                // A blank line above the operand, from when the operator
+                // trailed, is one above the operator that now leads.
+                if let Some(&operand) = self.items(n).get(1) {
+                    self.blank_above(self.first_tok(operand), &mut tail);
+                }
+            }
             tail.push(self.generic(n));
         }
         parts.push(Doc::indent(Doc::concat(tail)));
         Doc::group(Doc::concat(parts))
+    }
+
+    /// `a AND` / `b AND` / `c`: the chain with each operator at the end of
+    /// the line it joins to the next. `None` when a tail is not an operator
+    /// token and an operand, which the grammar does not produce.
+    fn chain_trailing(&self, items: &[Item]) -> Option<Doc<'a>> {
+        let mut tails: Vec<(usize, Vec<Item>)> = Vec::with_capacity(items.len() - 1);
+        for &it in &items[1..] {
+            let Item::Node(n) = it else { return None };
+            let mut inner = self.items(n);
+            let Some(&Item::Tok(op)) = inner.first() else {
+                return None;
+            };
+            if inner.len() < 2 || !self.is_keyword(op) {
+                return None;
+            }
+            inner.remove(0);
+            tails.push((op, inner));
+        }
+        let mut parts = Vec::new();
+        let mut tail = Vec::new();
+        for k in 0..=tails.len() {
+            let last = if k == 0 {
+                self.last_tok(items[0])
+            } else {
+                self.last_tok(*tails[k - 1].1.last()?)
+            };
+            // A line comment after the operand would swallow the operator
+            // that follows it: it goes after the operator, which is where
+            // the next run finds it.
+            let moved = match tails.get(k) {
+                Some(_) => self
+                    .comments
+                    .trailing
+                    .get(&last)
+                    .is_some_and(|cs| cs.iter().any(|c| c.line)),
+                None => false,
+            };
+            let outer = self.deferred.get();
+            if moved {
+                self.deferred.set(Some(last));
+            }
+            let operand = if k == 0 {
+                self.lower_item(items[0])
+            } else {
+                self.seq(&tails[k - 1].1)
+            };
+            self.deferred.set(outer);
+            if k == 0 {
+                parts.push(operand);
+            } else {
+                tail.push(operand);
+            }
+            if let Some(&(op, _)) = tails.get(k) {
+                tail.push(SPACE);
+                tail.push(self.tok_doc(op));
+                if moved {
+                    for c in self.comments.trailing.get(&last).into_iter().flatten() {
+                        if c.line {
+                            tail.push(Doc::LineSuffix(format!(" {}", c.text)));
+                            tail.push(Doc::BreakParent);
+                        }
+                    }
+                }
+                tail.push(Doc::Line);
+                // A blank line above an operator that led its line is one
+                // above the operand, now that the operator trails.
+                self.blank_above(op, &mut tail);
+            }
+        }
+        parts.push(Doc::indent(Doc::concat(tail)));
+        Some(Doc::group(Doc::concat(parts)))
     }
 
     /// `CASE [x] WHEN ... THEN ... [ELSE ...] END`.
@@ -1244,6 +1541,7 @@ impl<'s, 'a> Lowerer<'s, 'a> {
         let items = self.items(id);
         let mut parts = Vec::new();
         let mut arms = Vec::new();
+        let mut whens = 0usize;
         let mut end = Doc::Nil;
         for (k, &it) in items.iter().enumerate() {
             match it {
@@ -1256,6 +1554,9 @@ impl<'s, 'a> Lowerer<'s, 'a> {
                 }
                 Item::Node(n) => {
                     if self.is(n, CASE_ARM) {
+                        if self.is(n, CASE_WHEN) {
+                            whens += 1;
+                        }
                         arms.push(Doc::Line);
                         arms.push(self.lower(n));
                     } else {
@@ -1267,6 +1568,9 @@ impl<'s, 'a> Lowerer<'s, 'a> {
                     }
                 }
             }
+        }
+        if self.opts.case_layout == CaseLayout::Expanded && whens > 1 {
+            arms.push(Doc::BreakParent);
         }
         parts.push(Doc::indent(Doc::concat(arms)));
         parts.push(Doc::Line);
@@ -1281,17 +1585,33 @@ impl<'s, 'a> Lowerer<'s, 'a> {
         let mut parts = Vec::new();
         let mut seen_cte = false;
         let mut prev: Option<Item> = None;
-        for it in items {
+        // A comma that leads the next CTE's line, once that line starts.
+        let mut leading: Option<usize> = None;
+        for (k, &it) in items.iter().enumerate() {
             let is_cte = matches!(it, Item::Node(n) if self.is(n, WITH_STATEMENT));
             if self.is_tok(it, ",") {
                 let Item::Tok(i) = it else { unreachable!() };
-                parts.push(self.tok_doc(i));
+                let cte_next = matches!(
+                    items.get(k + 1),
+                    Some(Item::Node(n)) if self.is(*n, WITH_STATEMENT)
+                );
+                if self.opts.comma == Comma::Leading && seen_cte && cte_next {
+                    self.leading_comma_before(i, &mut parts);
+                    leading = Some(i);
+                } else {
+                    parts.push(self.tok_doc(i));
+                }
                 prev = Some(it);
                 continue;
             }
             if let Some(p) = prev {
                 if is_cte && seen_cte {
                     parts.push(Doc::Line);
+                    if let Some(i) = leading.take() {
+                        self.leading_comma_after(i, self.first_tok(it), &mut parts);
+                    } else if let Some(Item::Tok(i)) = prev {
+                        self.blank_above(i, &mut parts);
+                    }
                 } else {
                     self.push_sep(&mut parts, p, it);
                 }
@@ -1531,9 +1851,12 @@ pub(crate) struct Formatted {
     pub(crate) has_statement: bool,
 }
 
-/// The whole program: statements separated by one blank line, each
-/// terminated by `;`, file-trailing comments at the end. Blank lines in
-/// the input are not preserved; vertical space is the layout's to decide.
+/// The whole program: statements separated by one blank line, or as many
+/// as `blank_lines_between_statements` says, each terminated by `;`,
+/// file-trailing comments at the end. Blank lines in the input are not
+/// preserved, except inside a statement where
+/// `max_blank_lines_in_statement` keeps some; vertical space is the
+/// layout's to decide.
 ///
 /// An empty statement (a bare `;`) is dropped, and the comments it
 /// carried are laid out exactly as a second formatting pass will see them: as
@@ -1545,8 +1868,9 @@ pub(crate) struct Formatted {
 /// `Doc`, not the file's. `None` when a statement does not parse.
 pub(crate) fn format_statements(src: &str, opts: &Options) -> Option<Formatted> {
     let mut parser = Statements::new(src);
-    let mut printer = Printer::new(opts.inline_threshold, opts.indent_size);
-    let mut comments = Comments::new();
+    let mut printer = Printer::new(opts.inline_threshold, opts.indent_size)
+        .with_tabs(opts.indent_style == IndentStyle::Tab);
+    let mut comments = Comments::new(opts.max_blank_lines_in_statement);
     let mut tables = Tables::default();
     let mut pending: Vec<Doc<'_>> = Vec::new();
     let mut printed = false;
@@ -1565,8 +1889,9 @@ pub(crate) fn format_statements(src: &str, opts: &Options) -> Option<Formatted> 
         tables = lowerer.into_tables();
         if let Some(doc) = stmt {
             if printed {
-                printer.hard_line();
-                printer.hard_line();
+                for _ in 0..=opts.blank_lines_between_statements {
+                    printer.hard_line();
+                }
             }
             for d in pending.drain(..) {
                 printer.print(&d);
@@ -1597,6 +1922,15 @@ fn lower_case(raw: &str) -> Cow<'_, str> {
         Cow::Owned(raw.to_ascii_lowercase())
     } else {
         Cow::Borrowed(raw)
+    }
+}
+
+/// A function or type name in the case its option asks for.
+fn name_case(case: NameCase, raw: &str) -> Cow<'_, str> {
+    match case {
+        NameCase::Lower => lower_case(raw),
+        NameCase::Upper => upper_case(raw),
+        NameCase::Preserve => Cow::Borrowed(raw),
     }
 }
 
