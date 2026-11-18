@@ -1,4 +1,4 @@
-//! An optional catalog snapshot, and the two `CAT` rules that read it.
+//! An optional catalog snapshot, and the `CAT` rules that read it.
 //!
 //! grebe embeds no engine and needs no catalog: every `MOD` rule is a pure
 //! function of the source. A catalog is something a caller may *hand in* --
@@ -10,6 +10,11 @@
 //!   that the catalog does not have.
 //! - **CAT002 unknown-column**: `alias.column` where `alias` is a catalog
 //!   table in the statement and the table has no such column.
+//!
+//! CAT003 to CAT010 read what a snapshot says of a table beyond its
+//! columns (types, nullability, row estimate, keys, indexes) and are in
+//! the `meta` module. Each is silent when the snapshot does not carry what
+//! it needs.
 //!
 //! # The snapshot
 //!
@@ -27,8 +32,9 @@
 //!
 //! An object is accepted too: `{"columns": [...], "tables": [...],
 //! "functions": [{"name", "kind"}]}`. The functions only feed completion.
-//! `"tables"` says what is known of each table beyond its columns, which no
-//! `CAT` rule needs and a rule about keys or sizes can read (see [`Table`]):
+//! `"tables"` says what is known of each table beyond its columns, which
+//! CAT001 and CAT002 do not need and CAT003 to CAT010 read (see
+//! [`Table`]):
 //!
 //! ```json
 //! {"database":"memory","schema":"main","table":"orders","kind":"table",
@@ -70,6 +76,8 @@ use grebe_syntax::token::{Token, TokenKind};
 
 use crate::detect::{Finding, Fix};
 use crate::json::Json;
+
+mod meta;
 
 /// The query whose `-json` output is a snapshot.
 pub const SNAPSHOT_SQL: &str = "SELECT database_name AS database, schema_name AS schema, \
@@ -160,7 +168,38 @@ impl Table {
         }
     }
 
+    /// Build the name index. A column named twice (any case) keeps its
+    /// first mention: the readers push every column they see and leave the
+    /// duplicates to be found here, in one sort, instead of searching the
+    /// table for each one (which made a table of 100,000 columns take
+    /// seconds to load).
     fn index(&mut self) {
+        let mut order = self.sorted();
+        let same = |a: u32, b: u32| {
+            cmp_lower(
+                &self.columns[a as usize].name,
+                &self.columns[b as usize].name,
+            )
+            .is_eq()
+        };
+        if order.windows(2).any(|w| same(w[0], w[1])) {
+            let mut drop = vec![false; self.columns.len()];
+            for w in order.windows(2) {
+                if same(w[0], w[1]) {
+                    drop[w[1] as usize] = true;
+                }
+            }
+            let mut at = 0;
+            self.columns.retain(|_| {
+                at += 1;
+                !drop[at - 1]
+            });
+            order = self.sorted();
+        }
+        self.by_name = order;
+    }
+
+    fn sorted(&self) -> Vec<u32> {
         let mut order: Vec<u32> = (0..self.columns.len() as u32).collect();
         order.sort_by(|&a, &b| {
             cmp_lower(
@@ -169,7 +208,7 @@ impl Table {
             )
             .then(a.cmp(&b))
         });
-        self.by_name = order;
+        order
     }
 
     /// The column called `name` (any case).
@@ -312,11 +351,7 @@ impl Part {
             if let Some(&i) = index.get(&key) {
                 let have = &mut part.tables[i];
                 have.by_name.clear();
-                for c in t.columns {
-                    if !have.has_column(&c.name) {
-                        have.columns.push(c);
-                    }
-                }
+                have.columns.extend(t.columns);
                 have.is_view |= t.is_view;
                 have.rows = have.rows.or(t.rows);
                 if have.primary_key.is_empty() {
@@ -546,16 +581,15 @@ impl RowReader {
             table.is_view = true;
         }
         if let Some(column) = field("column") {
-            if !table.has_column(column) {
-                table.columns.push(Column {
-                    name: column.to_string(),
-                    data_type: field("type").unwrap_or("").to_string(),
-                    nullable: match row.get("nullable") {
-                        Some(Json::Bool(b)) => Some(*b),
-                        _ => None,
-                    },
-                });
-            }
+            // A repeated column is dropped when the table is indexed.
+            table.columns.push(Column {
+                name: column.to_string(),
+                data_type: field("type").unwrap_or("").to_string(),
+                nullable: match row.get("nullable") {
+                    Some(Json::Bool(b)) => Some(*b),
+                    _ => None,
+                },
+            });
         }
         Ok(())
     }
@@ -1440,21 +1474,65 @@ fn target_alias(tree: &Tree, src: &str, target: NodeId, base: NodeId) -> Option<
         .map(|t| ident(text(src, &t)))
 }
 
-/// Run both `CAT` rules over every statement of `tree`.
+/// What a caller can set about the `CAT` rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// A table with at least this many rows (by the snapshot's estimate) is
+    /// large to CAT003 unbounded-scan.
+    pub large_table_rows: u64,
+}
+
+/// [`Options::large_table_rows`] when nothing sets it.
+pub const DEFAULT_LARGE_TABLE_ROWS: u64 = 1_000_000;
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            large_table_rows: DEFAULT_LARGE_TABLE_ROWS,
+        }
+    }
+}
+
+/// A `MOD` finding the catalog has something to say about: the rule `code`
+/// would report at exactly `span`, and should not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Override {
+    pub code: &'static str,
+    pub span: Span,
+    /// `None`: the catalog proves the `MOD` finding wrong, whatever else is
+    /// reported. `Some(code)`: this `CAT` rule reports the same thing with
+    /// the evidence, so the `MOD` finding goes only where that one stays.
+    pub replaced_by: Option<&'static str>,
+}
+
+/// What [`check`] found.
+#[derive(Clone, Debug, Default)]
+pub struct Checked {
+    pub findings: Vec<Finding>,
+    pub overrides: Vec<Override>,
+}
+
+/// Run the `CAT` rules over every statement of `tree`.
 ///
 /// `file` is the scan of the whole file the tree came from, not of the
 /// tree's own text: on the per-statement fallback path the tree is one
 /// statement and the file is still the file.
 #[must_use]
-pub fn check(tree: &Tree, src: &str, catalog: &Catalog, file: &FileContext) -> Vec<Finding> {
+pub fn check(
+    tree: &Tree,
+    src: &str,
+    catalog: &Catalog,
+    file: &FileContext,
+    options: &Options,
+) -> Checked {
+    let mut out = Checked::default();
     if !file.checkable(catalog) {
-        return Vec::new();
+        return out;
     }
-    let mut out = Vec::new();
     for &stmt in tree.children(tree.root()) {
-        check_statement(tree, src, stmt, catalog, file, &mut out);
+        check_statement(tree, src, stmt, catalog, file, options, &mut out);
     }
-    out.sort_by_key(|f| (f.span.start, f.code));
+    out.findings.sort_by_key(|f| (f.span.start, f.code));
     out
 }
 
@@ -1464,8 +1542,10 @@ fn check_statement(
     stmt: NodeId,
     catalog: &Catalog,
     file: &FileContext,
-    out: &mut Vec<Finding>,
+    options: &Options,
+    checked: &mut Checked,
 ) {
+    let out = &mut checked.findings;
     let nodes = tree.descendants(stmt);
 
     // First pass: what the statement defines for itself.
@@ -1473,6 +1553,9 @@ fn check_statement(
     // Names that may shadow a table alias in an expression: lambda
     // parameters and select-list aliases.
     let mut shadows: HashSet<String> = HashSet::new();
+    // The lambda parameters alone: an unqualified name that is one of
+    // these is never a column.
+    let mut lambdas: HashSet<String> = HashSet::new();
     let mut check_columns = true;
     for &n in &nodes {
         match rule(tree, n) {
@@ -1491,6 +1574,7 @@ fn check_statement(
                 for &c in tree.children(n) {
                     if rule(tree, c) == "ColIdOrString" {
                         shadows.insert(ident(tree.text(c, src)));
+                        lambdas.insert(ident(tree.text(c, src)));
                     }
                 }
             }
@@ -1502,6 +1586,7 @@ fn check_statement(
                         for t in tokens_in(tree, tree.node(left).span) {
                             if matches!(t.kind, TokenKind::Word | TokenKind::QuotedIdent) {
                                 shadows.insert(ident(text(src, &t)));
+                                lambdas.insert(ident(text(src, &t)));
                             }
                         }
                     }
@@ -1528,6 +1613,8 @@ fn check_statement(
     // Second pass: the relations in scope, and the table names to check.
     let mut tables: Vec<&Table> = Vec::new();
     let mut bindings: Vec<(String, Relation)> = Vec::new();
+    // Beside `bindings`: the node that brings each relation in.
+    let mut binding_nodes: Vec<NodeId> = Vec::new();
     for &n in &nodes {
         match rule(tree, n) {
             "BaseTableName" => {
@@ -1571,6 +1658,7 @@ fn check_statement(
                                     replacement: quote_ident(s),
                                 });
                             out.push(Finding {
+                                detail: None,
                                 code: "CAT001",
                                 span,
                                 fix,
@@ -1609,6 +1697,7 @@ fn check_statement(
                     }
                     None => bindings.push((last, relation)),
                 }
+                binding_nodes.push(parent);
             }
             "TableSubquery"
             | "ValuesRef"
@@ -1619,11 +1708,17 @@ fn check_statement(
             | "TableFunctionAliasColon" => {
                 if let Some((alias, _)) = alias_of(tree, src, n) {
                     bindings.push((alias, Relation::Opaque));
-                } else if let Some(f) = first_descendant(tree, n, &["TableFunctionName"]) {
-                    // `FROM range(3)`: the function's name is the alias.
-                    if rule(tree, n).starts_with("TableFunction") {
-                        bindings.push((ident(tree.text(f, src)), Relation::Opaque));
-                    }
+                    binding_nodes.push(n);
+                } else if rule(tree, n) != "ParensTableRef" {
+                    // Unnamed, and still a relation of its FROM: `FROM
+                    // range(3)` is called after the function, a subquery
+                    // without an alias has no name to be called by.
+                    let name = first_descendant(tree, n, &["TableFunctionName"])
+                        .filter(|_| rule(tree, n).starts_with("TableFunction"))
+                        .map(|f| ident(tree.text(f, src)))
+                        .unwrap_or_default();
+                    bindings.push((name, Relation::Opaque));
+                    binding_nodes.push(n);
                 }
             }
             _ => {}
@@ -1686,11 +1781,27 @@ fn check_statement(
             replacement: quote_ident(s),
         });
         out.push(Finding {
+            detail: None,
             code: "CAT002",
             span,
             fix,
         });
     }
+
+    meta::check(
+        &meta::Statement {
+            tree,
+            src,
+            nodes: &nodes,
+            tables: &tables,
+            bindings: &bindings,
+            binding_nodes: &binding_nodes,
+            shadows: &shadows,
+            lambdas: &lambdas,
+            options,
+        },
+        checked,
+    );
 }
 
 /// How many edits away a suggestion for `name` may be: one for a short
@@ -1779,9 +1890,11 @@ fn distance(
     prev[b.len()]
 }
 
-/// The message for a `CAT` finding, naming what was not found and, when
-/// there is a near name, what was probably meant. `MOD` messages are fixed
-/// prose in the registry; these two are about one name each.
+/// The message for a `CAT` finding: for CAT001 and CAT002 what was not
+/// found and, when there is a near name, what was probably meant; for the
+/// others the registry's prose and then what the catalog says that makes
+/// it so ([`Finding::detail`]). `MOD` messages are fixed prose in the
+/// registry.
 #[must_use]
 pub fn message(f: &Finding, src: &str) -> String {
     let name = src
@@ -1790,7 +1903,13 @@ pub fn message(f: &Finding, src: &str) -> String {
     let mut m = match f.code {
         "CAT001" => format!("Table or view {name} is not in the catalog."),
         "CAT002" => format!("Column {name} is not in the table it is qualified with."),
-        _ => return crate::lookup(f.code).map_or_else(String::new, |r| r.message.to_string()),
+        _ => {
+            let prose = crate::lookup(f.code).map_or("", |r| r.message);
+            return match &f.detail {
+                Some(d) => format!("{prose} By the catalog, {d}."),
+                None => prose.to_string(),
+            };
+        }
     };
     if let Some(fix) = &f.fix {
         m.push_str(&format!(" Did you mean {}?", fix.replacement));

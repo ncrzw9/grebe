@@ -226,6 +226,7 @@ pub fn wrapped_date_filter(tree: &Tree, src: &str) -> Vec<Finding> {
         };
         if flagged {
             out.push(Finding {
+                detail: None,
                 code: "MOD035",
                 span: tree.node(op_expr).span,
                 fix: None,
@@ -257,6 +258,7 @@ pub fn wrapped_date_filter(tree: &Tree, src: &str) -> Vec<Finding> {
         }
         if wrap_of(tree, subject, src).is_some() {
             out.push(Finding {
+                detail: None,
                 code: "MOD035",
                 span: tree.node(between).span,
                 fix: None,
@@ -322,6 +324,7 @@ pub fn row_at_a_time_insert(tree: &Tree, src: &str) -> Vec<Finding> {
             if let Some((_, first, len)) = run.take() {
                 if len >= INSERT_RUN_THRESHOLD {
                     out.push(Finding {
+                        detail: None,
                         code: "MOD036",
                         span: tree.node(first).span,
                         fix: None,
@@ -444,6 +447,7 @@ pub fn order_by_random_sample(tree: &Tree, src: &str) -> Vec<Finding> {
             .any(|&d| tree.rule_name(d) == "FromClause");
         if !filters_or_groups && !reshapes_rows && has_from {
             out.push(Finding {
+                detail: None,
                 code: "MOD037",
                 span: tree.node(modifiers).span,
                 fix: None,
@@ -480,6 +484,7 @@ pub fn sample_before_where(tree: &Tree, _src: &str) -> Vec<Finding> {
                 .any(|&d| tree.rule_name(d) == "SamplePercentage");
         if has_where && counts_rows {
             out.push(Finding {
+                detail: None,
                 code: "MOD038",
                 span: tree.node(sample).span,
                 fix: None,
@@ -575,6 +580,7 @@ pub fn delete_then_insert(tree: &Tree, src: &str) -> Vec<Finding> {
                 .any(|name| Some(last(name)) != target);
             if shared {
                 out.push(Finding {
+                    detail: None,
                     code: "MOD039",
                     span: tree.node(delete).span,
                     fix: None,
@@ -622,6 +628,7 @@ pub fn csv_full_sniff(tree: &Tree, src: &str) -> Vec<Finding> {
         });
         if whole_file {
             out.push(Finding {
+                detail: None,
                 code: "MOD040",
                 span: tree.node(function).span,
                 fix: None,

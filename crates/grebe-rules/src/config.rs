@@ -91,6 +91,22 @@ pub struct Config {
     /// resolved against the config file's directory. `None`: no catalog,
     /// and those rules do not run.
     pub catalog: Option<PathBuf>,
+    /// `large-table-rows`: the row estimate at which CAT003 unbounded-scan
+    /// calls a table large. `None`: the default,
+    /// [`crate::catalog::DEFAULT_LARGE_TABLE_ROWS`].
+    pub large_table_rows: Option<u64>,
+}
+
+impl Config {
+    /// What the `CAT` rules read from this config besides the catalog.
+    #[must_use]
+    pub fn catalog_options(&self) -> crate::catalog::Options {
+        let mut o = crate::catalog::Options::default();
+        if let Some(n) = self.large_table_rows {
+            o.large_table_rows = n;
+        }
+        o
+    }
 }
 
 /// A problem found while parsing a config file: where, and in plain English.
@@ -454,7 +470,9 @@ fn parse_value(raw: &str, line: usize, path: &Path) -> Result<Value, ConfigError
         return Ok(Value::Bool(s == "true"));
     }
     if s.starts_with('-') || s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        // TOML's `1_000_000` too.
         return s
+            .replace('_', "")
             .parse::<i64>()
             .map(Value::Int)
             .map_err(|_| err(path, line, format!("expected an integer, found `{s}`")));
@@ -603,6 +621,7 @@ fn apply_top(
         "select" => "select",
         "foreign-heads" | "foreign_heads" => "foreign-heads",
         "catalog" => "catalog",
+        "large-table-rows" | "large_table_rows" => "large-table-rows",
         other => return Err(err(path, line, format!("unknown key `{other}`"))),
     };
     if !seen.insert(canonical.to_string()) {
@@ -635,6 +654,16 @@ fn apply_top(
                     path,
                     line,
                     "`catalog` must be a path to a catalog snapshot file",
+                ));
+            }
+        },
+        "large-table-rows" => match value {
+            Value::Int(n) if n > 0 => config.large_table_rows = Some(n as u64),
+            _ => {
+                return Err(err(
+                    path,
+                    line,
+                    "`large-table-rows` must be a positive integer",
                 ));
             }
         },
@@ -1011,6 +1040,26 @@ mod tests {
     }
 
     // -- parse: a full example, every top-level key exercised -----------
+
+    #[test]
+    fn reads_large_table_rows() {
+        let config = parse(
+            "catalog = \"c.json\"\nlarge-table-rows = 5_000_000\n",
+            &p("/repo/grebe.toml"),
+            false,
+        )
+        .expect("should parse");
+        assert_eq!(config.large_table_rows, Some(5_000_000));
+        assert_eq!(config.catalog_options().large_table_rows, 5_000_000);
+        let default = parse("", &p("/repo/grebe.toml"), false).unwrap();
+        assert_eq!(
+            default.catalog_options().large_table_rows,
+            crate::catalog::DEFAULT_LARGE_TABLE_ROWS
+        );
+        for bad in ["large-table-rows = 0", "large-table-rows = \"many\""] {
+            assert!(parse(bad, &p("/repo/grebe.toml"), false).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_a_full_example() {

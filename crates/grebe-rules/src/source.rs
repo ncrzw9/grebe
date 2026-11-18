@@ -305,6 +305,7 @@ pub fn classify_unparsed_with(stmt: &str, offset: u32, extra_heads: &[String]) -
 
     if has_template_markup(stmt) {
         return vec![Finding {
+            detail: None,
             code: "SRC002",
             span: Span::new(offset, offset + stmt.len() as u32),
             fix: None,
@@ -313,6 +314,7 @@ pub fn classify_unparsed_with(stmt: &str, offset: u32, extra_heads: &[String]) -
 
     if let Some(local) = foreign_head(stmt, extra_heads) {
         return vec![Finding {
+            detail: None,
             code: "SRC003",
             span: Span::new(offset + local.start, offset + local.end),
             fix: None,
@@ -321,6 +323,7 @@ pub fn classify_unparsed_with(stmt: &str, offset: u32, extra_heads: &[String]) -
 
     let local = far_span(stmt, far);
     vec![Finding {
+        detail: None,
         code: "PRS001",
         span: Span::new(offset + local.start, offset + local.end),
         fix: None,

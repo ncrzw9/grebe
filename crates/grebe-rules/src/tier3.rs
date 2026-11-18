@@ -151,6 +151,7 @@ pub fn select_star_outer(tree: &Tree, _src: &str) -> Vec<Finding> {
         });
         if let Some(star) = hit {
             out.push(Finding {
+                detail: None,
                 code: "MOD025",
                 span: tree.node(star).span,
                 // No fix: can't mechanically know the real column names.
@@ -344,6 +345,7 @@ pub fn qualify_rewrite(tree: &Tree, src: &str) -> Vec<Finding> {
                 .map(|t| t.span)
                 .unwrap_or_else(|| tree.node(where_clause).span);
             out.push(Finding {
+                detail: None,
                 code: "MOD021",
                 span: kw_span,
                 fix: None,

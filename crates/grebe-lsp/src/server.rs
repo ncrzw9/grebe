@@ -584,6 +584,7 @@ struct Resolved {
     severity: Vec<(String, Severity)>,
     foreign_heads: Vec<String>,
     catalog: Option<Rc<Catalog>>,
+    catalog_options: grebe_rules::catalog::Options,
 }
 
 impl Resolved {
@@ -593,6 +594,7 @@ impl Resolved {
             severity: &self.severity,
             foreign_heads: &self.foreign_heads,
             catalog: self.catalog.as_deref(),
+            catalog_options: self.catalog_options,
         }
     }
 }
@@ -683,6 +685,7 @@ fn resolve_selection<W: Write>(
         severity,
         foreign_heads,
         catalog,
+        catalog_options: config.map(Config::catalog_options).unwrap_or_default(),
     }
 }
 

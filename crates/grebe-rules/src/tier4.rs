@@ -91,6 +91,7 @@ pub fn limit_without_order_by(tree: &Tree, _src: &str) -> Vec<Finding> {
             continue;
         }
         out.push(Finding {
+            detail: None,
             code: "MOD026",
             span: tree.node(limit).span,
             fix: None,
@@ -178,6 +179,7 @@ pub fn window_without_order_by(tree: &Tree, src: &str) -> Vec<Finding> {
             continue;
         }
         out.push(Finding {
+            detail: None,
             code: "MOD027",
             span: tree.node(func_expr).span,
             fix: None,
@@ -263,6 +265,7 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
             .find(|&n| tree.rule_name(n) == "InSelectStatement");
         if subquery.is_some_and(|sub| !excludes_nulls(tree, sub, src)) {
             out.push(Finding {
+                detail: None,
                 code: "MOD028",
                 span: tree.node(op).span,
                 fix: None,
@@ -276,7 +279,7 @@ pub fn not_in_subquery(tree: &Tree, src: &str) -> Vec<Finding> {
 /// one column whose own top-level `WHERE` requires `<that column> IS NOT
 /// NULL`? Then its result has no `NULL` and `NOT IN` is safe. A `UNION`,
 /// an `OR`, or anything but a bare column keeps the finding.
-fn excludes_nulls(tree: &Tree, subquery: NodeId, src: &str) -> bool {
+pub(crate) fn excludes_nulls(tree: &Tree, subquery: NodeId, src: &str) -> bool {
     let selects: Vec<NodeId> = tree
         .descendants(subquery)
         .into_iter()
@@ -413,6 +416,7 @@ pub fn filter_defeats_outer_join(tree: &Tree, src: &str) -> Vec<Finding> {
             if let Some(target) = defeated_join(tree, operand, &targets, src) {
                 let _ = target; // named in the message only, not matched on.
                 out.push(Finding {
+                    detail: None,
                     code: "MOD029",
                     span: tree.node(operand).span,
                     fix: None,
@@ -740,6 +744,7 @@ pub fn not_in_null_list(tree: &Tree, src: &str) -> Vec<Finding> {
                 .parent(op)
                 .map_or(tree.node(op).span, |p| tree.node(p).span);
             out.push(Finding {
+                detail: None,
                 code: "MOD032",
                 span,
                 fix: None,

@@ -11,9 +11,12 @@
 //! - **opt-in (`off` until `[severity]` enables them):** MOD010, MOD017-020,
 //!   MOD022-023, MOD025, MOD031, MOD033-034, MOD041
 //!
-//! And two rules that need something the source does not hold, a catalog
+//! And rules that need something the source does not hold, a catalog
 //! snapshot, and run only when a caller supplies one (see [`catalog`]):
-//! CAT001 unknown-table and CAT002 unknown-column.
+//! CAT001 unknown-table and CAT002 unknown-column, and CAT003-010, which
+//! read what the snapshot says of a table beyond its columns (row
+//! estimate, keys, indexes, types, nullability) and stay silent when it
+//! does not say.
 //!
 //! A rule is opt-in when its premise is real but it is noisy on idiomatic
 //! DuckDB code, its payoff is unproven, or it is house style by nature. A CST
@@ -83,11 +86,12 @@ pub mod tier5;
 /// clean. Add a code here in the same commit that adds its detector; the
 /// test below fails if a code here has no registry row.
 pub const IMPLEMENTED: &[&str] = &[
-    "CAT001", "CAT002", "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007",
-    "MOD008", "MOD009", "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016",
-    "MOD017", "MOD018", "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD025", "MOD026",
-    "MOD027", "MOD028", "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "MOD035",
-    "MOD036", "MOD037", "MOD038", "MOD039", "MOD040", "MOD041", "PRS001", "SRC002", "SRC003",
+    "CAT001", "CAT002", "CAT003", "CAT004", "CAT005", "CAT006", "CAT007", "CAT008", "CAT009",
+    "CAT010", "MOD001", "MOD002", "MOD003", "MOD004", "MOD005", "MOD006", "MOD007", "MOD008",
+    "MOD009", "MOD010", "MOD011", "MOD012", "MOD013", "MOD014", "MOD015", "MOD016", "MOD017",
+    "MOD018", "MOD019", "MOD020", "MOD021", "MOD022", "MOD023", "MOD025", "MOD026", "MOD027",
+    "MOD028", "MOD029", "MOD030", "MOD031", "MOD032", "MOD033", "MOD034", "MOD035", "MOD036",
+    "MOD037", "MOD038", "MOD039", "MOD040", "MOD041", "PRS001", "SRC002", "SRC003",
 ];
 
 /// Does `code` have a detector?

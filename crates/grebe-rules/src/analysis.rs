@@ -44,6 +44,9 @@ pub struct Selection<'a> {
     /// A catalog snapshot. `None` (the default) means the `CAT` rules do
     /// not run at all: grebe needs no catalog, it only uses one it is given.
     pub catalog: Option<&'a crate::catalog::Catalog>,
+    /// What the `CAT` rules read beside the catalog: the row count at which
+    /// a table is large.
+    pub catalog_options: crate::catalog::Options,
 }
 
 impl Selection<'_> {
@@ -98,17 +101,40 @@ pub fn analyze(src: &str, selection: &Selection<'_>) -> Vec<Finding> {
     let catalog = selection
         .catalog
         .map(|c| (c, crate::catalog::FileContext::scan(src)));
-    let cat = |tree: &grebe_syntax::cst::Tree, text: &str| match &catalog {
-        Some((c, file)) => crate::catalog::check(tree, text, c, file),
-        None => Vec::new(),
+    // Both kinds of finding for one tree, with the MOD findings the catalog
+    // overrides taken out. A MOD finding a CAT rule replaces stays when that
+    // rule does not run or is suppressed where it would report, so turning
+    // the CAT rule off gives the MOD finding back.
+    let lint = |tree: &grebe_syntax::cst::Tree, text: &str, offset: u32| -> Vec<Finding> {
+        let mod_findings = crate::detect::analyze(tree, text);
+        let Some((c, file)) = &catalog else {
+            return mod_findings;
+        };
+        let checked = crate::catalog::check(tree, text, c, file, &selection.catalog_options);
+        let overridden = |f: &Finding| {
+            checked.overrides.iter().any(|o| {
+                o.code == f.code
+                    && o.span == f.span
+                    && o.replaced_by.is_none_or(|by| {
+                        checked.findings.iter().any(|cf| {
+                            cf.code == by
+                                && cf.span == o.span
+                                && keep(cf.code, offset + cf.span.start)
+                        })
+                    })
+            })
+        };
+        let mut out: Vec<Finding> = mod_findings
+            .into_iter()
+            .filter(|f| !overridden(f))
+            .collect();
+        out.extend(checked.findings);
+        out
     };
 
     // Whole-file parse is the fast path.
     if let Some(tree) = grebe_syntax::matcher::parse(src) {
-        for f in crate::detect::analyze(&tree, src)
-            .into_iter()
-            .chain(cat(&tree, src))
-        {
+        for f in lint(&tree, src, 0) {
             if keep(f.code, f.span.start) {
                 findings.push(f);
             }
@@ -119,15 +145,13 @@ pub fn analyze(src: &str, selection: &Selection<'_>) -> Vec<Finding> {
             let stmt = &src[sp.start as usize..sp.end as usize];
             match grebe_syntax::matcher::parse(stmt) {
                 Some(tree) => {
-                    for f in crate::detect::analyze(&tree, stmt)
-                        .into_iter()
-                        .chain(cat(&tree, stmt))
-                    {
+                    for f in lint(&tree, stmt, sp.start) {
                         let at = sp.start + f.span.start;
                         if !keep(f.code, at) {
                             continue;
                         }
                         findings.push(Finding {
+                            detail: f.detail,
                             code: f.code,
                             span: Span::new(at, sp.start + f.span.end),
                             // The fix span needs the same offset as the finding
@@ -267,6 +291,7 @@ mod tests {
             severity: &off,
             foreign_heads: &[],
             catalog: None,
+            catalog_options: crate::catalog::Options::default(),
         };
         assert!(
             analyze("SELECT count(*) FROM t;", &sel)

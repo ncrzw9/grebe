@@ -1,4 +1,5 @@
-[
+{
+"columns": [
 {"database":"shop","schema":"main","table":"orders","column":"id","type":"BIGINT"},
 {"database":"shop","schema":"main","table":"orders","column":"customer_id","type":"BIGINT"},
 {"database":"shop","schema":"main","table":"orders","column":"total","type":"DECIMAL(10,2)"},
@@ -16,5 +17,39 @@
 {"database":"shop","schema":"raw","table":"events","column":"ts","type":"TIMESTAMP"},
 {"database":"shop","schema":"raw","table":"events","column":"payload","type":"JSON"},
 {"database":"lake","schema":"main","table":"clicks","column":"user_id","type":"BIGINT"},
-{"database":"lake","schema":"main","table":"clicks","column":"url","type":"VARCHAR"}
+{"database":"lake","schema":"main","table":"clicks","column":"url","type":"VARCHAR"},
+{"database":"shop","schema":"main","table":"users","column":"id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"users","column":"email","type":"VARCHAR","nullable":true},
+{"database":"shop","schema":"main","table":"users","column":"name","type":"VARCHAR","nullable":true},
+{"database":"shop","schema":"main","table":"users","column":"created","type":"TIMESTAMP","nullable":true},
+{"database":"shop","schema":"main","table":"users","column":"score","type":"DOUBLE","nullable":true},
+{"database":"shop","schema":"main","table":"users","column":"active","type":"BOOLEAN","nullable":true},
+{"database":"shop","schema":"main","table":"users","column":"team_id","type":"BIGINT","nullable":true},
+{"database":"shop","schema":"main","table":"payments","column":"id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"payments","column":"order_id","type":"BIGINT","nullable":true},
+{"database":"shop","schema":"main","table":"payments","column":"customer_id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"payments","column":"amount","type":"DECIMAL(10,2)","nullable":true},
+{"database":"shop","schema":"main","table":"payments","column":"note","type":"VARCHAR","nullable":true},
+{"database":"shop","schema":"main","table":"refunds","column":"id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"refunds","column":"customer_id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"refunds","column":"amount","type":"DECIMAL(10,2)","nullable":true},
+{"database":"shop","schema":"main","table":"refunds","column":"note","type":"VARCHAR","nullable":true},
+{"database":"shop","schema":"main","table":"tags","column":"name","type":"VARCHAR","nullable":false},
+{"database":"shop","schema":"main","table":"tags","column":"code","type":"VARCHAR","nullable":true},
+{"database":"shop","schema":"main","table":"tags","column":"label","type":"VARCHAR","nullable":true},
+{"database":"shop","schema":"main","table":"teams","column":"id","type":"BIGINT","nullable":false},
+{"database":"shop","schema":"main","table":"teams","column":"name","type":"VARCHAR","nullable":false},
+{"database":"shop","schema":"main","table":"logs","column":"ts","type":"TIMESTAMP","nullable":true},
+{"database":"shop","schema":"main","table":"logs","column":"msg","type":"VARCHAR","nullable":true}
+],
+"tables": [
+{"database":"shop","schema":"main","table":"orders","kind":"table","rows":2400000,"primary_key":["id"],"indexes":[["customer_id","placed"]]},
+{"database":"shop","schema":"main","table":"customers","kind":"table","rows":1000,"primary_key":["id"]},
+{"database":"shop","schema":"main","table":"users","kind":"table","rows":5000000,"primary_key":["id"],"unique":[["email"]],"indexes":[["created"]]},
+{"database":"shop","schema":"main","table":"payments","kind":"table","rows":3000000,"primary_key":["id"]},
+{"database":"shop","schema":"main","table":"refunds","kind":"table","rows":20000,"primary_key":["id"]},
+{"database":"shop","schema":"main","table":"tags","kind":"table","rows":50,"primary_key":["name"],"unique":[["code"]]},
+{"database":"shop","schema":"main","table":"teams","kind":"table","rows":12,"primary_key":["id"],"unique":[["name"]]},
+{"database":"shop","schema":"main","table":"logs","kind":"table","rows":50000000}
 ]
+}
