@@ -133,8 +133,29 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
   (read-only or not), after a restart or in a new window. Passwords are
   never kept: a server that needs one asks again. One that cannot be
   brought back (a file that moved, a server that is down) stays in the
-  Catalog as *not attached*, with the reason; **Forget** drops it.
-  `grebe.duckdb.reattach: false` turns this off.
+  Catalog as *not attached*, with the reason.
+- **Detaching does not lose a connection.** A database you detach -- with
+  **Detach** in the Catalog or a `DETACH` in your SQL -- lets go of the
+  file or the server, so another program can have it, and stays in the
+  Catalog as *detached*. It is left alone when the session starts, and
+  **Attach Again** brings it back, in the same mode. **Forget** takes a
+  connection off the list. With `grebe.duckdb.reattach: false` nothing is
+  attached when a session starts: every connection is listed, and attached
+  when you ask.
+- **Connections in settings.** `grebe.duckdb.connections` declares
+  connections for the shared session, in your user or workspace settings:
+
+  ```json
+  "grebe.duckdb.connections": [
+    { "alias": "sales", "path": "data/sales.duckdb" },
+    { "alias": "warehouse", "path": "postgresql://me@db.example.com/warehouse", "type": "postgres", "readOnly": true }
+  ]
+  ```
+
+  They behave like any other connection (attached at start, detached and
+  attached again from the Catalog), and stay listed for as long as the
+  setting names them. Do not put a password there: one in a connection
+  string is ignored, and the server asks when it needs one.
 
 ## Stopping a long query
 
@@ -250,10 +271,11 @@ into Editor**.
 right-click a `.duckdb` or `.sqlite` file in the Explorer) attaches a file
 to the session, read-only or read-write, under a name taken from the file:
 `warehouse.duckdb` becomes `warehouse`, so `FROM warehouse.orders` works in
-your SQL. **Detach** (on an attached database) removes it. An attachment is
-[attached again](#sessions) when the session restarts, the same as an
-`ATTACH` in your own SQL; detach it to stop that. The files you browse are
-kept with the workspace too.
+your SQL. **Detach** (on an attached database) lets go of it and leaves it
+in the Catalog as *detached*; **Attach Again** brings it back and **Forget**
+removes it from the list. An attachment is [attached again](#sessions) when
+the session restarts, the same as an `ATTACH` in your own SQL; detach it to
+stop that. The files you browse are kept with the workspace too.
 
 ### The catalog in the editor
 
@@ -379,7 +401,9 @@ timing, and on a failure the whole statement and where DuckDB stopped),
   database kept with the workspace, see [Sessions](#sessions)) or a
   database file; relative paths resolve against the workspace folder.
 - `grebe.duckdb.reattach`: attach again what a session had attached when
-  it starts (default on).
+  it starts (default on). Off: connections stay listed, detached.
+- `grebe.duckdb.connections`: connections the shared session always lists,
+  as `{ alias, path, type?, readOnly? }` (see [Sessions](#sessions)).
 - `grebe.duckdb.catalogInEditor`: give the language server the session's
   tables and columns for completion and the `CAT` checks (default on).
 - `grebe.duckdb.maxRows`: most rows a query shows, and read from a data file

@@ -627,6 +627,30 @@ const rememberAttachments = (name = currentName) => manager.remember(name);
 /** What the current session attaches when it starts. */
 const rememberedAttachments = () => (manager ? manager.remembered(currentName) : []);
 const forgetAttachment = (alias) => manager.forget(currentName, alias);
+/** Attach a listed connection of the current session again. The error as
+ *  text, or null. */
+const attachAgain = (alias) => manager.attach(currentName, alias);
+
+/**
+ * The connections the settings declare (`grebe.duckdb.connections`), as the
+ * session keeps them. A password in a connection string is dropped, not
+ * used: the server asks when it wants one. A relative file is in the
+ * workspace folder.
+ */
+function declaredConnections() {
+  const list = vscode.workspace.getConfiguration("grebe.duckdb").get("connections", []);
+  if (!Array.isArray(list)) return [];
+  const folder = (vscode.workspace.workspaceFolders || [])[0];
+  const out = [];
+  for (const c of list) {
+    if (!c || typeof c.alias !== "string" || typeof c.path !== "string" || !c.alias || !c.path) continue;
+    if (out.some((o) => o.alias === c.alias)) continue;
+    let target = conninfo.withoutPassword(c.path);
+    if (!conninfo.isConnection(target) && !path.isAbsolute(target) && folder) target = path.join(folder.uri.fsPath, target);
+    out.push({ alias: c.alias, path: target, type: typeof c.type === "string" && c.type ? c.type : "duckdb", readOnly: c.readOnly === true });
+  }
+  return out;
+}
 
 /** Every running session: `[{ name, session }]`. */
 const liveSessions = () => (manager ? manager.names().map((name) => ({ name, session: manager.live(name) })) : []);
@@ -756,6 +780,7 @@ function activate(context, clientReady) {
       },
     },
     reattach: () => settings().reattach,
+    declared: declaredConnections,
     askPassword: (rec) =>
       vscode.window.showInputBox({
         title: `Password for ${conninfo.where(rec.path)}`,
@@ -865,6 +890,7 @@ module.exports = {
   rememberAttachments,
   rememberedAttachments,
   forgetAttachment,
+  attachAgain,
   onDidRun,
   settings,
   cwdFor,
