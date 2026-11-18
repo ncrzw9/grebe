@@ -21,10 +21,17 @@ case "$(uname -s)" in
   *) echo "fetch-duckdb: no DuckDB CLI build for $(uname -s)" >&2; exit 1 ;;
 esac
 base="https://github.com/duckdb/duckdb/releases/download/v$version"
+# Already there (a cache restored it): nothing to fetch.
+if [ -x "$exe" ] && DUCKDB_AGENT_MODE=0 "$exe" -no-init -version 2>/dev/null | grep -q "^v$version "; then
+  echo "fetch-duckdb: v$version already in $dir" >&2
+  exit 0
+fi
+# Unpacked from inside the directory: given a path with a drive letter, tar
+# on Windows takes "D:" for the name of another machine.
 if curl -fsSL --retry 3 -o "$dir/duckdb.tar.gz" "$base/duckdb-cli-$platform.tar.gz" 2>/dev/null; then
-  tar xzf "$dir/duckdb.tar.gz" -C "$dir"
+  (cd "$dir" && tar xzf duckdb.tar.gz)
 elif curl -fsSL --retry 3 -o "$dir/duckdb.zip" "$base/duckdb_cli-$platform.zip"; then
-  unzip -qo "$dir/duckdb.zip" -d "$dir"
+  (cd "$dir" && unzip -qo duckdb.zip)
 else
   echo "fetch-duckdb: v$version has neither duckdb-cli-$platform.tar.gz nor duckdb_cli-$platform.zip at $base" >&2
   exit 1

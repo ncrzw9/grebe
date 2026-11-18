@@ -100,8 +100,8 @@ live("remember: files and their mode, not in-memory attachments, not the session
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-sessions-"));
   const own = path.join(dir, "own.duckdb");
   // DuckDB reports a database where it really is (on macOS the temporary
-  // folder is behind a link).
-  const real = fs.realpathSync(dir);
+  // folder is behind a link, on Windows it may be given by its short name).
+  const real = fs.realpathSync.native(dir);
   const store = new Map();
   const m = new Sessions({ store: { get: (n) => store.get(n) || [], set: (n, r) => store.set(n, r) } });
   let s = await m.open({ cli: CLI, database: own, cwd: dir });

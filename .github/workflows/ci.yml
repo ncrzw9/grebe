@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -41,6 +46,11 @@ jobs:
           "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps --only-shell chromium
       # Against the grebe just built and a real DuckDB CLI, so running SQL,
       # the catalog and data files are tested end to end.
+      - name: DuckDB CLIs for the tests (cached)
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/duckdb-*
+          key: duckdb-cli-${{ runner.os }}-${{ runner.arch }}-1.5.5-2.0.0
       - name: VS Code extension tests
         env:
           GREBE_BROWSER_TESTS: required
@@ -87,6 +97,11 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - name: DuckDB CLIs for the tests (cached)
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/duckdb-*
+          key: duckdb-cli-${{ runner.os }}-${{ runner.arch }}-1.5.5-2.0.0
       - name: VS Code extension tests
         shell: bash
         env:

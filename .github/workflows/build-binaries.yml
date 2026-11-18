@@ -28,6 +28,12 @@ on:
       - "editors/vscode/package.json"
       - "editors/vscode/package-targets.js"
 
+# A newer push to the same pull request replaces the run in progress. A
+# release's build and the weekly run are never cancelled.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -40,7 +46,7 @@ env:
 jobs:
   build:
     name: build (${{ matrix.target }})
-    timeout-minutes: 20
+    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -80,9 +86,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # The package mirror is sometimes slow: fifty megabytes took over five
+      # minutes once, and the limit that was here cancelled the build.
       - name: Install aarch64-linux-gnu cross tools
         if: matrix.aarch64_gnu
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
