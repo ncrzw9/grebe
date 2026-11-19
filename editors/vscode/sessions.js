@@ -1,5 +1,5 @@
-// The DuckDB sessions of one window, and what each should hold when it
-// starts. No `vscode` import, so it can be tested with plain Node.
+// The DuckDB sessions of one window, and the connections each attaches. No
+// `vscode` import, so it can be tested with plain Node.
 //
 //   - One session by default, shared by every file. A file may ask for a
 //     session of its own with a comment in its leading comment block,
@@ -12,14 +12,15 @@
 //   - `:workspace:` as the database is a file in the editor's own storage for
 //     this workspace: tables survive a window reload, a crash and a restart,
 //     with nothing added to the project folder.
-//   - What was attached to a session (from the Catalog or by an ATTACH in
-//     SQL) is remembered, without passwords, and attached again when the
-//     session next starts. Detaching does not lose it: the connection stays
-//     listed as detached, is left alone when the session starts, and is
-//     attached again when asked. Only forgetting removes it.
-//   - Connections can also be declared in settings
-//     (`grebe.duckdb.connections`); those are part of the default session's
-//     list for as long as the setting names them.
+//   - The connections a session attaches are the entries of the
+//     `grebe.duckdb.connections` setting for it (connections.js). Starting
+//     a session never waits for one: the local files are attached right
+//     after it starts, in the background and without asking anything, and
+//     a server is attached when it is first needed (a statement refers to
+//     it, its Catalog node is opened, Attach Again). Only then is a
+//     password asked for. Each attach has a time limit, so a server that
+//     does not answer holds up nothing for longer than that.
+//   - An ATTACH typed in SQL is not saved: it lasts as long as the session.
 
 "use strict";
 
@@ -27,10 +28,19 @@ const fs = require("fs");
 const path = require("path");
 const { Session } = require("./duckdb-session");
 const conninfo = require("./conninfo");
+const connections = require("./connections");
 
 const DEFAULT = "default";
 const MEMORY = ":memory:";
 const WORKSPACE = ":workspace:";
+
+// The longest one attach may take before it is cancelled and reported.
+const ATTACH_TIMEOUT_MS = 20000;
+// libpq gives up on a server that does not answer after this long (it can
+// try twice, with and without SSL), well inside ATTACH_TIMEOUT_MS: an
+// interrupt does not stop a connection attempt, so without it the session
+// would have to be ended.
+const CONNECT_TIMEOUT_S = 8;
 
 /** Where a file really is: DuckDB reports a database by its resolved path
  *  (on macOS the temporary folder is behind a link), and Windows does not
@@ -91,38 +101,62 @@ function resolveDatabase(database, { cwd, name = DEFAULT, storageDir = null } = 
   return path.isAbsolute(database) || !cwd ? database : path.join(cwd, database);
 }
 
-// Every database of a session that lives somewhere. An in-memory one has
-// no path and nothing to come back to; the session's own file is told
-// apart by its path, not by being the current database, which `USE` moves.
-const ATTACHED = `SELECT database_name AS alias, path, type, readonly FROM duckdb_databases() WHERE NOT internal AND path IS NOT NULL`;
+// The databases a session has attached, its own and the in-memory ones
+// left out by the caller where that matters.
+const ATTACHED = `SELECT database_name AS alias, path, type, readonly FROM duckdb_databases() WHERE NOT internal`;
 
-/** The ATTACH that brings `rec` back. */
+/** The ATTACH for `rec`. A PostgreSQL connection is given a connect
+ *  timeout (see CONNECT_TIMEOUT_S). */
 function attachSql(rec, password) {
-  const target = password === undefined ? rec.path : conninfo.withPassword(rec.path, password);
+  let target = rec.path;
+  if (rec.type === "postgres" && conninfo.isConnection(target)) target = conninfo.withConnectTimeout(target, CONNECT_TIMEOUT_S);
+  if (password !== undefined) target = conninfo.withPassword(target, password);
   const opts = [rec.type && rec.type !== "duckdb" ? `TYPE ${rec.type}` : null, rec.readOnly ? "READ_ONLY" : null].filter(Boolean);
   return `ATTACH ${lit(target)} AS ${ident(rec.alias)}${opts.length ? ` (${opts.join(", ")})` : ""}`;
 }
+
+const yes = (v) => v === true || v === "true";
 
 class Sessions {
   /**
    * @param {{
    *   storageDir?: string|null,
-   *   store?: { get(name: string): object[], set(name: string, recs: object[]): void },
    *   reattach?: () => boolean,
-   *   declared?: () => object[],
-   *   askPassword?: (rec: object) => Promise<string|undefined>,
+   *   connections?: () => object[],
+   *   askPassword?: (entry: object) => Promise<string|undefined>,
    *   onStderr?: (text: string) => void,
    *   onExit?: (name: string, reason: string, session: Session) => void,
-   *   onReattach?: (name: string, rec: object, error: string|null) => void,
+   *   onChange?: (name: string) => void,
    *   log?: (line: string) => void,
    * }} deps
+   * `connections` gives the setting's entries (connections.merge), of every
+   * session. `onChange` is told when a connection of session `name` starts
+   * or stops being attached, or failed to be.
    */
   constructor(deps = {}) {
     this.deps = deps;
     this.sessions = new Map(); // name -> Session
     this.opening = new Map(); // name -> Promise<Session>
-    const mem = new Map();
-    this.store = deps.store || { get: (n) => mem.get(n) || [], set: (n, r) => mem.set(n, r) };
+    this.pending = new Map(); // session \0 alias -> Promise<error|null>: attaches under way
+    this.errors = new Map(); // session \0 alias -> why its last attach failed
+    this.applied = this.all(); // the entries reconcile() last saw
+    this.reconciling = Promise.resolve();
+  }
+
+  /** Every entry of the setting. */
+  all() {
+    return this.deps.connections ? this.deps.connections() : [];
+  }
+
+  /** The entries of session `name`. */
+  entries(name = DEFAULT) {
+    return this.all().filter((e) => connections.sessionOf(e) === name);
+  }
+
+  /** The entry of session `name` called `alias`, in any case. */
+  entry(name, alias) {
+    const k = connections.keyOf({ session: name, alias });
+    return this.entries(name).find((e) => connections.keyOf(e) === k) || null;
   }
 
   /** The running session called `name`, or null. Never starts one. */
@@ -139,8 +173,8 @@ class Sessions {
   /**
    * The session called `name` for this CLI and database, started if it is
    * not running (or was running something else), with `cwd` as its working
-   * directory. Two callers asking at once get the same session, after its
-   * start-up and re-attaching are done.
+   * directory. Two callers asking at once get the same session. Resolves
+   * as soon as the duckdb process is up: connections are attached after.
    */
   async open({ name = DEFAULT, cli, database, cwd }) {
     for (;;) {
@@ -160,31 +194,6 @@ class Sessions {
     } finally {
       this.opening.delete(name);
     }
-  }
-
-  /**
-   * The connections of `name`: what is stored for it and, for the default
-   * session, what the settings declare. A declared connection takes its
-   * place and options from the settings and its state (detached, the error
-   * of a failed attach) from what is stored.
-   */
-  recs(name = DEFAULT) {
-    const stored = this.store.get(name);
-    const declared = name === DEFAULT && this.deps.declared ? this.deps.declared() : [];
-    if (!declared.length) return stored;
-    const out = declared.map((d) => {
-      const had = stored.find((r) => r.alias === d.alias);
-      const rec = { alias: d.alias, path: d.path, type: d.type || "duckdb", readOnly: !!d.readOnly };
-      if (had && had.detached) rec.detached = true;
-      if (had && had.error && had.path === d.path) rec.error = had.error;
-      rec.declared = true;
-      return rec;
-    });
-    return [...out, ...stored.filter((r) => !declared.some((d) => d.alias === r.alias))];
-  }
-
-  save(name, recs) {
-    this.store.set(name, recs.map(({ declared, ...rec }) => rec));
   }
 
   async start({ name, cli, database, cwd }) {
@@ -212,122 +221,197 @@ class Sessions {
       if (this.sessions.get(name) === sess) this.sessions.delete(name);
       throw e;
     }
-    await this.reattach(name, sess);
+    for (const k of [...this.errors.keys()]) if (k.startsWith(`${name}\u0000`)) this.errors.delete(k);
+    sess.attaching = this.attachLocal(name, sess);
     return sess;
   }
 
-  /** Attach again what this session had attached when it was last seen. */
-  async reattach(name, sess) {
-    if (this.deps.reattach && !this.deps.reattach()) return;
-    const recs = this.recs(name);
-    if (!recs.length) return;
+  /** Attach the local files of `name` that are not marked detached, in the
+   *  background, asking nothing. Servers wait until they are needed. With
+   *  grebe.duckdb.reattach off, nothing. */
+  attachLocal(name, sess) {
+    if (this.deps.reattach && !this.deps.reattach()) return Promise.resolve();
     const own = sess.opts.database === MEMORY ? null : real(sess.opts.database);
-    const out = [];
-    for (const rec of recs) {
-      // Detached on purpose: it waits to be asked for.
-      if (rec.detached) {
-        out.push(rec);
-        continue;
-      }
-      // The session's own file, remembered while another database was in
-      // USE: it is open already.
-      if (own && !conninfo.isConnection(rec.path) && real(rec.path) === own) continue;
-      const error = await this.bring(sess, rec);
-      out.push(error ? { ...rec, error } : { alias: rec.alias, path: rec.path, type: rec.type, readOnly: rec.readOnly });
-      this.say(error ? `could not re-attach ${rec.alias}: ${error}` : `re-attached ${rec.alias} (${conninfo.where(rec.path)})`);
-      if (this.deps.onReattach) this.deps.onReattach(name, rec, error);
+    const jobs = [];
+    for (const e of this.entries(name)) {
+      if (e.detached || connections.isServer(e)) continue;
+      // The session's own file is open already.
+      if (own && real(e.path) === own) continue;
+      jobs.push(this.ensure(name, e.alias, { prompt: false, check: false }));
     }
-    this.save(name, out);
+    return Promise.all(jobs).then(() => {});
   }
 
-  /** ATTACH `rec` to `sess`, asking for a password when the server wants
-   *  one. The error as text, or null. */
-  async bring(sess, rec) {
-    let r;
-    try {
-      r = await sess.run(attachSql(rec));
-      if (r.kind === "error" && /password/i.test(r.message) && this.deps.askPassword && conninfo.isConnection(rec.path)) {
-        const password = await this.deps.askPassword(rec);
-        if (password !== undefined) r = await sess.run(attachSql(rec, password));
+  /** What the Catalog shows of `alias`: whether an attach is under way,
+   *  and why the last one failed. */
+  state(name, alias) {
+    const k = connections.keyOf({ session: name, alias });
+    return { attaching: this.pending.has(k), error: this.errors.get(k) || null };
+  }
+
+  /**
+   * Attach the entry `alias` of session `name` unless it is attached. A
+   * second call while one is under way joins it. `prompt`: a server that
+   * asks for a password may ask the user (their own action asked for the
+   * connection). `check`: look first whether it is attached. Resolves to
+   * the error as text, or null.
+   */
+  ensure(name, alias, { prompt = true, check = true } = {}) {
+    const sess = this.live(name);
+    if (!sess) return Promise.resolve("the session is not running");
+    const e = this.entry(name, alias);
+    if (!e) return Promise.resolve(`no connection called ${alias}`);
+    const k = connections.keyOf(e);
+    if (this.pending.has(k)) return this.pending.get(k);
+    const job = (async () => {
+      if (check && (await this.attachedNow(sess)).has(e.alias.toLowerCase())) return null;
+      this.changed(name);
+      const error = await this.bring(sess, e, prompt);
+      this.say(error ? `could not attach ${e.alias}: ${error}` : `attached ${e.alias} (${conninfo.where(e.path)})`);
+      return error;
+    })()
+      .catch((err) => String(err.message ?? err))
+      .then((error) => {
+        if (error) this.errors.set(k, error);
+        else this.errors.delete(k);
+        return error;
+      })
+      .finally(() => {
+        this.pending.delete(k);
+        this.changed(name);
+      });
+    this.pending.set(k, job);
+    return job;
+  }
+
+  /** ATTACH `e` to `sess`, within ATTACH_TIMEOUT_MS. With `prompt`, a
+   *  server that wants a password is given one asked of the user; the
+   *  session is free while they type. The error as text, or null. */
+  async bring(sess, e, prompt) {
+    const attempt = async (password) => {
+      try {
+        return await sess.run(attachSql(e, password), { timeoutMs: ATTACH_TIMEOUT_MS });
+      } catch (err) {
+        return { kind: "error", type: "Session", message: String(err.message ?? err) };
       }
-    } catch (e) {
-      r = { kind: "error", type: "Session", message: String(e.message ?? e) };
+    };
+    let r = await attempt();
+    if (r.kind === "error" && /password/i.test(r.message) && prompt && this.deps.askPassword && conninfo.isConnection(e.path)) {
+      const password = await this.deps.askPassword(e);
+      if (password === undefined) return "no password was given";
+      r = await attempt(password);
     }
+    if (r.kind === "cancelled") return `no answer within ${ATTACH_TIMEOUT_MS / 1000} s; the attach was cancelled`;
     // DuckDB repeats the connection string in its error, password and
     // all: what is kept (and logged, and shown) has it taken out.
     return r.kind === "error" ? conninfo.redact(`${r.type} Error: ${r.message}`) : null;
   }
 
-  /**
-   * Attach a listed connection that is not attached now: one that was
-   * detached, or one that could not be brought back. The error as text, or
-   * null when it is attached.
-   */
-  async attach(name, alias) {
-    const sess = this.live(name);
-    if (!sess) return "the session is not running";
-    const rec = this.recs(name).find((r) => r.alias === alias);
-    if (!rec) return `no connection called ${alias}`;
-    const error = await this.bring(sess, rec);
-    this.say(error ? `could not attach ${alias}: ${error}` : `attached ${alias} (${conninfo.where(rec.path)})`);
-    if (error) {
-      this.save(name, this.recs(name).map((r) => (r.alias === alias ? { ...r, error } : r)));
-      return error;
-    }
-    await this.remember(name);
-    return null;
-  }
-
-  /**
-   * Note what the session has attached now, so it can be attached again.
-   * Called after a run and after the Catalog attaches or detaches. A
-   * connection that is no longer attached stays listed, as detached (or
-   * with the reason it could not be brought back), until it is attached
-   * again or forgotten.
-   */
-  async remember(name = DEFAULT) {
-    const sess = this.live(name);
-    if (!sess || sess.busy) return;
+  /** What `sess` has attached now: lower-cased alias -> `{ alias, path,
+   *  type, readOnly }`. Empty when it cannot be asked. */
+  async attachedNow(sess) {
+    const out = new Map();
     let r;
     try {
       r = await sess.run(ATTACHED);
     } catch {
-      return;
+      return out;
     }
-    if (r.kind !== "rows") return;
+    if (r.kind !== "rows") return out;
     const at = (c) => r.columns.indexOf(c);
-    const own = sess.opts.database === MEMORY ? null : real(sess.opts.database);
-    const now = r.rows
-      .map((row) => ({
-        alias: row[at("alias")],
-        path: conninfo.withoutPassword(String(row[at("path")])),
+    for (const row of r.rows) {
+      const alias = String(row[at("alias")]);
+      const p = row[at("path")];
+      out.set(alias.toLowerCase(), {
+        alias,
+        path: p === null || p === undefined ? null : conninfo.plain(String(p)),
         type: row[at("type")] || "duckdb",
-        readOnly: row[at("readonly")] === true || row[at("readonly")] === "true",
-      }))
-      .filter((rec) => conninfo.isConnection(rec.path) || !own || real(rec.path) !== own);
-    const before = this.recs(name);
-    // With re-attaching off nothing was attached when the session started,
-    // so a connection that is not attached was not detached by anyone: it
-    // is kept as it was, and comes back if the setting is turned on again.
-    const marks = !this.deps.reattach || this.deps.reattach();
-    const waiting = before
-      .filter((p) => !now.some((n) => n.alias === p.alias))
-      .map(({ declared, ...p }) => (p.error || p.detached || !marks ? p : { ...p, detached: true }));
-    const next = [...now, ...waiting];
-    const plain = (recs) => JSON.stringify(recs.map(({ declared, ...rec }) => rec));
-    if (plain(next) !== JSON.stringify(this.store.get(name))) this.save(name, next);
+        readOnly: yes(row[at("readonly")]),
+      });
+    }
+    return out;
   }
 
-  /** The connections of `name`:
-   *  `[{ alias, path, type, readOnly, detached?, error?, declared? }]`. */
-  remembered(name = DEFAULT) {
-    return this.recs(name);
+  /** DETACH `alias` from session `name`, after any attach of it under way.
+   *  The error as text, or null (also when it was not attached). */
+  async detach(name, alias) {
+    const k = connections.keyOf({ session: name, alias });
+    if (this.pending.has(k)) await this.pending.get(k);
+    this.errors.delete(k);
+    const sess = this.live(name);
+    if (!sess) return null;
+    let r;
+    try {
+      r = await sess.run(`DETACH DATABASE IF EXISTS ${ident(alias)}`);
+    } catch (err) {
+      return String(err.message ?? err);
+    }
+    this.changed(name);
+    if (r.kind === "error") return `${r.type} Error: ${r.message}`;
+    this.say(`detached ${alias}`);
+    return null;
   }
 
-  /** Take `alias` off the list. (One the settings declare stays while they
-   *  do.) */
-  forget(name, alias) {
-    this.store.set(name, this.store.get(name).filter((r) => r.alias !== alias));
+  /**
+   * Before `sql` runs in session `name`: attach the connections it refers
+   * to that are not attached (and not marked detached). Each within its
+   * time limit; a server may ask for a password, the run being the user's
+   * own. Resolves to `[{ alias, error }]` for those that could not be.
+   */
+  async prepare(name, sql) {
+    const candidates = this.entries(name).filter((e) => !e.detached);
+    if (!candidates.length) return [];
+    const wanted = connections.references(sql, candidates.map((e) => e.alias));
+    if (!wanted.length) return [];
+    const sess = this.live(name);
+    if (!sess) return [];
+    const have = await this.attachedNow(sess);
+    const out = [];
+    for (const a of wanted) {
+      if (have.has(a)) continue;
+      const e = this.entry(name, a);
+      const error = await this.ensure(name, e.alias, { check: false });
+      if (error) out.push({ alias: e.alias, error });
+    }
+    return out;
+  }
+
+  /**
+   * The setting changed: bring every running session in line with it
+   * (connections.plan), against what each has attached now. Safe to call
+   * for a change this extension made itself: what is attached already is
+   * left alone. Calls run one after another.
+   */
+  reconcile() {
+    const job = this.reconciling.then(() => this.reconcileNow());
+    this.reconciling = job.catch(() => {});
+    return job;
+  }
+
+  async reconcileNow() {
+    const prev = this.applied;
+    const next = this.all();
+    this.applied = next;
+    const mine = (list, name) => list.filter((e) => connections.sessionOf(e) === name);
+    const plainOf = (list) => JSON.stringify(list.map(({ scope, ...e }) => e));
+    for (const name of this.names()) {
+      const p = mine(prev, name);
+      const n = mine(next, name);
+      if (plainOf(p) === plainOf(n)) continue;
+      // An entry that changed or went: its old failure says nothing now.
+      for (const e of p) {
+        const was = n.find((x) => connections.keyOf(x) === connections.keyOf(e));
+        if (!was || !connections.sameTarget(was, e)) this.errors.delete(connections.keyOf(e));
+      }
+      const sess = this.live(name);
+      if (!sess) continue;
+      const actions = connections.plan(p, n, await this.attachedNow(sess));
+      for (const a of actions) {
+        if (a.do === "detach") await this.detach(name, a.alias);
+        else await this.ensure(name, a.entry.alias, { prompt: false, check: false });
+      }
+      this.changed(name);
+    }
   }
 
   /** End the session called `name` (every session when null). The next
@@ -340,9 +424,13 @@ class Sessions {
     }
   }
 
+  changed(name) {
+    if (this.deps.onChange) this.deps.onChange(name);
+  }
+
   say(line) {
     if (this.deps.log) this.deps.log(line);
   }
 }
 
-module.exports = { Sessions, directive, databaseFor, resolveDatabase, attachSql, DEFAULT, MEMORY, WORKSPACE };
+module.exports = { Sessions, directive, databaseFor, resolveDatabase, attachSql, ATTACH_TIMEOUT_MS, CONNECT_TIMEOUT_S, DEFAULT, MEMORY, WORKSPACE };

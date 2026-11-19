@@ -63,29 +63,24 @@ exports.activate = function activate(context) {
       liveSession: runner.liveSession,
       liveSessions: runner.liveSessions,
       sessionName: runner.currentSessionName,
-      remember: async (name) => {
-        await runner.rememberAttachments(name);
-        if (catalogFeed) catalogFeed.touched(name || runner.currentSessionName());
-      },
+      // The Catalog attached or detached something itself: the index
+      // reads the session again.
+      touched: (name) => catalogFeed && catalogFeed.touched(name || runner.currentSessionName()),
       // The catalog index: what it holds of a database, and reading one
       // again when asked.
       indexStatus: (name, db) => (catalogFeed ? catalogFeed.status(name, db) : null),
       indexView: (name, sess) => (catalogFeed ? catalogFeed.view(name, sess) : null),
       isRunning: runner.isRunning,
       reindex: (name, db) => catalogFeed && catalogFeed.reindex(name, db),
-      remembered: runner.rememberedAttachments,
-      forget: (alias) => {
-        runner.forgetAttachment(alias);
-        // Its kept index goes with it.
-        if (catalogFeed) catalogFeed.touched(runner.currentSessionName());
-      },
-      attachAgain: async (alias) => {
-        const error = await runner.attachAgain(alias);
-        // The index is told, as for any other attach: the tree is drawn
-        // from it.
-        if (catalogFeed) catalogFeed.touched(runner.currentSessionName());
-        return error;
-      },
+      // The connections of grebe.duckdb.connections, and what is kept of
+      // a server one that is not connected.
+      connections: runner.connectionsOf,
+      offline: (name, alias) => (catalogFeed ? catalogFeed.offline(name, alias) : null),
+      attachAgain: runner.attachAgain,
+      detach: runner.detachConnection,
+      forget: runner.forgetConnection,
+      save: runner.saveConnection,
+      prepare: runner.prepareFor,
       state: context.workspaceState,
       onDidRun: runner.onDidRun,
       settings: runner.settings,
@@ -100,6 +95,8 @@ exports.activate = function activate(context) {
       onDidRun: runner.onDidRun,
       isRunning: runner.isRunning,
       connections: runner.allConnections,
+      offline: runner.offlineConnections,
+      offlineSessions: runner.offlineSessions,
       onDidIndex: () => catalogView && catalogView.redraw(),
     }),
   );

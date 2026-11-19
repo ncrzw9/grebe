@@ -10,6 +10,8 @@ const fs = require("fs");
 const { checkCli, parseVersion, queryBody } = require("./duckdb-session");
 const { Sessions, directive, databaseFor, resolveDatabase, DEFAULT, MEMORY, WORKSPACE } = require("./sessions");
 const conninfo = require("./conninfo");
+const connections = require("./connections");
+const connectionSettings = require("./connectionSettings");
 const { columnar } = require("./lenient-json");
 const results = require("./results");
 const log = require("./log");
@@ -240,21 +242,6 @@ function setCurrent(name) {
   for (const l of runListeners) l();
 }
 
-/** An attachment that did not come back with its session. */
-function reattachFailed(name, rec, error) {
-  const where = conninfo.where(rec.path);
-  Promise.resolve(
-    vscode.window.showWarningMessage(
-      `grebe: could not re-attach ${rec.alias} (${where}) to the session: ${conninfo.redact(error)}`,
-      "Forget It",
-      "Show Output",
-    ),
-  ).then((pick) => {
-    if (pick === "Forget It") manager.forget(name, rec.alias);
-    else if (pick === "Show Output") output.show(true);
-  });
-}
-
 /**
  * Check the CLI (`duckdb --version`, which also reads ~/.duckdbrc) and show
  * the result in the status bar. A problem is also shown as a notification
@@ -414,6 +401,16 @@ async function run(client, { doc, range }) {
       statements.length === 1 ? "Running" : `Running statement ${i + 1} of ${statements.length}`,
     );
     let r;
+    // A connection this statement refers to that is not attached yet (a
+    // server is attached when first needed). One that cannot be is left
+    // out, and the statement fails with DuckDB's own error.
+    for (const { alias, error } of await manager.prepare(sess.name, st.text)) {
+      log.info("duckdb", `${alias} is not attached: ${error}`);
+    }
+    if (active.cancelled) {
+      stopped = "cancel";
+      break;
+    }
     const t0 = Date.now();
     try {
       r = await (st.kind === "select" ? runCapped(sess, st.text, s) : sess.run(st.text, { timeoutMs: s.timeoutMs }));
@@ -479,7 +476,6 @@ async function run(client, { doc, range }) {
   );
   // A run may have created, dropped or attached something. The listeners
   // are told what ran, so they can tell whether it can have.
-  await manager.remember(sess.name);
   for (const l of runListeners) l({ session: sess.name, statements: done });
 }
 
@@ -626,44 +622,92 @@ const liveSession = () => (manager ? manager.live(currentName) : null);
 /** The name of the session the Catalog shows. */
 const currentSessionName = () => currentName;
 
-/** Note what the current session has attached, to attach it again when the
- *  session next starts. */
-const rememberAttachments = (name = currentName) => manager.remember(name);
+// --- connections ---------------------------------------------------------------
 
-/** What the current session attaches when it starts. */
-const rememberedAttachments = () => (manager ? manager.remembered(currentName) : []);
-const forgetAttachment = (alias) => manager.forget(currentName, alias);
-/** Attach a listed connection of the current session again. The error as
- *  text, or null. */
-const attachAgain = (alias) => manager.attach(currentName, alias);
-
-/**
- * The connections the settings declare (`grebe.duckdb.connections`), as the
- * session keeps them. A password in a connection string is dropped, not
- * used: the server asks when it wants one. A relative file is in the
- * workspace folder.
- */
-function declaredConnections() {
-  const list = vscode.workspace.getConfiguration("grebe.duckdb").get("connections", []);
-  if (!Array.isArray(list)) return [];
-  const folder = (vscode.workspace.workspaceFolders || [])[0];
-  const out = [];
-  for (const c of list) {
-    if (!c || typeof c.alias !== "string" || typeof c.path !== "string" || !c.alias || !c.path) continue;
-    if (out.some((o) => o.alias === c.alias)) continue;
-    let target = conninfo.withoutPassword(c.path);
-    if (!conninfo.isConnection(target) && !path.isAbsolute(target) && folder) target = path.join(folder.uri.fsPath, target);
-    out.push({ alias: c.alias, path: target, type: typeof c.type === "string" && c.type ? c.type : "duckdb", readOnly: c.readOnly === true });
-  }
-  return out;
+/** The connections of session `name` (the current one by default), with
+ *  what is known of each now: `[{ alias, path, type, readOnly, detached?,
+ *  session?, scope, attaching, error }]`. */
+function connectionsOf(name = currentName) {
+  if (!manager) return [];
+  return manager.entries(name).map((e) => ({ ...e, ...manager.state(name, e.alias) }));
 }
 
-/** Every connection still remembered, of every session: `[{ type, path }]`
- *  (the path without a password, as it is kept). */
+/** Attach a connection of session `name` now, starting the session if need
+ *  be: Attach Again, Connect, or opening its node in the Catalog. A server
+ *  may ask for a password: the user asked. Clears its detached mark. The
+ *  error as text, or null. */
+async function attachAgain(alias, name = currentName) {
+  const e = manager.entry(name, alias);
+  if (!e) return `no connection called ${alias}`;
+  if (!manager.live(name)) {
+    if (name !== currentName) return "the session is not running";
+    await currentSession();
+  }
+  const error = await manager.ensure(name, alias, { prompt: true });
+  if (!error && e.detached) await connectionSettings.setDetached(name, e.alias, false);
+  return error;
+}
+
+/** Detach a database from session `name`. One in the setting is marked
+ *  detached there, so it stays listed and is left alone until asked for.
+ *  The error as text, or null. */
+async function detachConnection(alias, name = currentName) {
+  const e = manager.entry(name, alias);
+  const error = await manager.detach(name, alias);
+  if (!error && e && !e.detached) await connectionSettings.setDetached(name, e.alias, true);
+  return error;
+}
+
+/** Take a connection out of the setting, every scope of it, detaching it
+ *  first if it is attached. */
+async function forgetConnection(alias, name = currentName) {
+  const error = await manager.detach(name, alias);
+  if (error) log.info("duckdb", `could not detach ${alias}: ${error}`);
+  await connectionSettings.remove(name, alias);
+}
+
+/** Add a connection of session `name` to the setting: one the Catalog has
+ *  just attached, or one attached in SQL that is to be kept. Resolves to
+ *  the scope it was written to. */
+function saveConnection(entry, name = currentName) {
+  return connectionSettings.add([{ ...entry, session: name === DEFAULT ? undefined : name }]);
+}
+
+/** Every connection of the setting, of every session: `[{ type, path }]`.
+ *  A connection's kept index is kept as long as it is here. */
 function allConnections() {
+  return manager ? manager.all().map((e) => ({ type: e.type || "duckdb", path: e.path })) : [];
+}
+
+/** The server connections of session `name` that are attached when
+ *  needed: while one is not attached, its kept index stands in for it. */
+function offlineConnections(name) {
+  return manager ? manager.entries(name).filter((e) => !e.detached && connections.isServer(e)) : [];
+}
+
+/** The sessions that have such connections. */
+function offlineSessions() {
   if (!manager) return [];
-  const names = new Set([DEFAULT, ...manager.names(), ...(manager.deps.storedNames ? manager.deps.storedNames() : [])]);
-  return [...names].flatMap((name) => manager.remembered(name)).map((r) => ({ type: r.type || "duckdb", path: r.path }));
+  return [...new Set(manager.all().filter((e) => !e.detached && connections.isServer(e)).map(connections.sessionOf))];
+}
+
+/** Before a statement of the Catalog's (a preview) runs in session `name`:
+ *  attach what it refers to. */
+const prepareFor = (name, sql) => (manager ? manager.prepare(name, sql) : Promise.resolve([]));
+
+/** The store of attachments this extension kept per workspace before the
+ *  setting was the place for them: moved to the setting once, then
+ *  cleared. */
+const OLD_KEY = "grebe.duckdb.attachments";
+async function migrateStore(state) {
+  if (!state) return;
+  const old = state.get(OLD_KEY, undefined);
+  if (old === undefined) return;
+  const moved = connections.migrate(old, connectionSettings.read());
+  const scope = moved.length ? await connectionSettings.add(moved) : null;
+  await state.update(OLD_KEY, undefined);
+  const where = { global: "user", workspace: "workspace", workspaceFolder: "workspace folder" }[scope];
+  output.appendLine(`moved ${moved.length} saved connection${moved.length === 1 ? "" : "s"} to grebe.duckdb.connections${where ? ` (${where} settings)` : ""}`);
 }
 
 /** Every running session: `[{ name, session }]`. */
@@ -715,7 +759,7 @@ async function restartSession() {
     const detail =
       db === MEMORY
         ? "The in-memory database and every table in it are discarded."
-        : `Temporary tables, settings and secrets are discarded. ${kept} is kept, and attached databases are attached again.`;
+        : `Temporary tables, settings and secrets are discarded. ${kept} is kept, and the connections in grebe.duckdb.connections come back with it.`;
     const which = currentName === DEFAULT ? "the DuckDB session" : `the DuckDB session "${currentName}"`;
     const pick = await vscode.window.showWarningMessage(`Restart ${which}?`, { modal: true, detail }, "Restart");
     if (pick !== "Restart") return;
@@ -776,30 +820,16 @@ function activate(context, clientReady) {
   output = log.tagged("duckdb");
   storageDir = context.storageUri ? context.storageUri.fsPath : null;
   currentName = DEFAULT;
-  // Attachments are remembered per workspace, by session name. Passwords
-  // are never part of what is kept (sessions.js strips them).
-  const state = context.workspaceState;
-  const KEY = "grebe.duckdb.attachments";
-  const memory = {};
-  const all = () => (state ? state.get(KEY, {}) : memory);
+  // Connections are the entries of grebe.duckdb.connections. Passwords are
+  // never part of one: a server that wants one asks when it is attached.
   manager = new Sessions({
     storageDir,
-    store: {
-      get: (name) => all()[name] || [],
-      set: (name, recs) => {
-        const next = { ...all(), [name]: recs };
-        if (recs.length === 0) delete next[name];
-        if (state) state.update(KEY, next);
-        else Object.assign(memory, { [name]: recs });
-      },
-    },
-    storedNames: () => Object.keys(all()),
     reattach: () => settings().reattach,
-    declared: declaredConnections,
-    askPassword: (rec) =>
+    connections: connectionSettings.read,
+    askPassword: (e) =>
       vscode.window.showInputBox({
-        title: `Password for ${conninfo.where(rec.path)}`,
-        prompt: `To attach ${rec.alias} again. It is used for this attach only and is not stored.`,
+        title: `Password for ${conninfo.where(e.path)}`,
+        prompt: `To attach ${e.alias}. It is used for this attach only and is not stored.`,
         password: true,
         ignoreFocusOut: true,
       }),
@@ -807,7 +837,11 @@ function activate(context, clientReady) {
     // the log as it arrives.
     onStderr: (text) => output.append(text),
     onExit: (name, reason) => sessionEnded(name, reason),
-    onReattach: (name, rec, error) => error && reattachFailed(name, rec, error),
+    // A connection was attached or detached, or could not be: the Catalog
+    // and the index are told which session.
+    onChange: (name) => {
+      for (const l of runListeners) l({ session: name });
+    },
     log: (line) => output.appendLine(line),
   });
   runtimeErrors = vscode.languages.createDiagnosticCollection("duckdb");
@@ -874,12 +908,18 @@ function activate(context, clientReady) {
       if (e.affectsConfiguration("grebe.duckdb.path") || e.affectsConfiguration("grebe.duckdb.database")) {
         applySettings();
       }
+      // An edit of the setting by hand, or by the Catalog: the running
+      // sessions follow it.
+      if (e.affectsConfiguration("grebe.duckdb.connections")) {
+        manager.reconcile().catch((err) => log.error("duckdb", `could not apply grebe.duckdb.connections: ${err.message ?? err}`, err));
+      }
       // grebe.duckdb.maxRows is read at each run: changing it keeps the
       // session, and what it holds in memory.
     }),
     { dispose: () => manager.end() },
   );
   refreshStatus();
+  migrateStore(context.workspaceState).catch((err) => log.error("duckdb", `could not move the saved attachments to grebe.duckdb.connections: ${err.message ?? err}`, err));
 }
 
 /** The language server changed (started, restarted): ask for lenses again. */
@@ -903,10 +943,14 @@ module.exports = {
   liveSessions,
   allConnections,
   sessionNameOf,
-  rememberAttachments,
-  rememberedAttachments,
-  forgetAttachment,
+  connectionsOf,
   attachAgain,
+  detachConnection,
+  forgetConnection,
+  saveConnection,
+  offlineConnections,
+  offlineSessions,
+  prepareFor,
   onDidRun,
   settings,
   cwdFor,

@@ -175,6 +175,12 @@ fn run(ex: &Example, dir: &Path) -> String {
         printed.push_str(&stdout);
         printed.push_str(&String::from_utf8_lossy(&o.stderr));
     }
+    // The version grebe prints changes with every release; the docs show it
+    // as 1.0.0, so a version bump alone does not fail the docs.
+    let printed = printed.replace(
+        &format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION")),
+        "\"version\":\"1.0.0\"",
+    );
     if ex.output.lang == "sql" {
         if stdin {
             return stdout;

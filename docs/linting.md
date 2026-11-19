@@ -34,7 +34,7 @@ select status, count(*) from orders where total = null group by status;
 ```
 
 ```json
-{"version":"1.0.0-rc.3","files":1,"findings":[{"path":"query.sql","line":1,"column":22,"code":"MOD001","name":"count-star","severity":"info","start":21,"end":22},{"path":"query.sql","line":1,"column":49,"code":"MOD002","name":"null-comparison","severity":"warning","start":48,"end":54},{"path":"query.sql","line":1,"column":56,"code":"MOD003","name":"group-by-all","severity":"info","start":55,"end":70}],"unparsed":0,"fixed":0}
+{"version":"1.0.0","files":1,"findings":[{"path":"query.sql","line":1,"column":22,"code":"MOD001","name":"count-star","severity":"info","start":21,"end":22},{"path":"query.sql","line":1,"column":49,"code":"MOD002","name":"null-comparison","severity":"warning","start":48,"end":54},{"path":"query.sql","line":1,"column":56,"code":"MOD003","name":"group-by-all","severity":"info","start":55,"end":70}],"unparsed":0,"fixed":0}
 
 3 finding(s) in 1 file(s)
 ```
@@ -49,7 +49,7 @@ select id from ordrs;
 ```
 
 ```json
-{"version":"1.0.0-rc.3","files":1,"findings":[{"path":"query.sql","line":1,"column":16,"code":"CAT001","name":"unknown-table","severity":"warning","start":15,"end":20,"suggestion":"orders"}],"unparsed":0,"fixed":0}
+{"version":"1.0.0","files":1,"findings":[{"path":"query.sql","line":1,"column":16,"code":"CAT001","name":"unknown-table","severity":"warning","start":15,"end":20,"suggestion":"orders"}],"unparsed":0,"fixed":0}
 
 1 finding(s) in 1 file(s)
 ```

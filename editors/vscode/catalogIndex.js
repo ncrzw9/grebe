@@ -25,6 +25,11 @@
 //     CAT rules do not check names in those schemas.
 //   - The index of a foreign database is kept on disk, one file per
 //     connection, so the next window has its names at once.
+//   - A server connection in the setting that is not attached (it is
+//     attached when first needed) is given its kept index all the same, as
+//     a database of its own name: the editor knows its names without
+//     connecting. It is never read while it is not attached, and its file
+//     is kept for as long as the setting names the connection.
 //
 // Nothing here starts while the session is busy with a run, a foreign
 // database is read one at a time, and every question the index asks is a
@@ -213,7 +218,7 @@ const digest = (value) => crypto.createHash("sha1").update(JSON.stringify(value)
 /** The file name a connection's index is kept under: a hash of what it is
  *  and where, with the password taken out first. Never the string itself. */
 function cacheKey(type, target) {
-  return crypto.createHash("sha256").update(`${type || "duckdb"}\n${conninfo.withoutPassword(String(target))}`).digest("hex").slice(0, 32);
+  return crypto.createHash("sha256").update(`${type || "duckdb"}\n${conninfo.plain(String(target))}`).digest("hex").slice(0, 32);
 }
 
 /** `rows` (objects with schema, table and the rest) as a part's tables,
@@ -256,6 +261,7 @@ class CatalogIndex {
    *   isForeign?: (db: { db: string, type: string, path: string|null }) => boolean,
    *   isBusy?: () => boolean,
    *   connections?: () => { type: string, path: string }[],
+   *   offline?: (name: string) => { alias: string, type: string, path: string }[],
    *   onChange?: (name: string) => void,
    *   onRead?: (name: string) => void,
    *   log?: (line: string) => void,
@@ -264,7 +270,10 @@ class CatalogIndex {
    * `isForeign` decides which databases are indexed once rather than after
    * every run (any type but duckdb, unless told otherwise). `isBusy` is
    * true while a run is in progress. `connections` lists the connections
-   * still remembered: the cache of any other is deleted. `onChange` is
+   * the setting names: the cache of any other is deleted. `offline` lists
+   * the server connections of session `name` that are attached when
+   * needed: while one is not attached its kept index stands in for it.
+   * `onChange` is
    * told when a foreign database starts or stops being indexed; `onRead`
    * when a reading of the session (refresh()) found something different.
    */
@@ -340,7 +349,7 @@ class CatalogIndex {
     const changing = (statements || []).filter((s) => s.kind !== "select");
     if (changing.length) st.dirty = true;
     for (const e of st.dbs.values()) {
-      if (!e.foreign) continue;
+      if (!e.foreign || e.offline) continue;
       const hits = changing.filter((s) => changesStructure(s.text) && (e.current || mentions(s.text, e.db)));
       if (!hits.length) continue;
       e.stale = "a statement changed it";
@@ -364,7 +373,7 @@ class CatalogIndex {
     if (!st) return;
     st.dirty = true;
     for (const e of st.dbs.values()) {
-      if (e.foreign && (db === null || e.db === db)) {
+      if (e.foreign && !e.offline && (db === null || e.db === db)) {
         e.stale = "asked";
         e.fresh = true; // ask the server, not DuckDB's copy of its schema
       }
@@ -379,11 +388,22 @@ class CatalogIndex {
    * asked now (busy, ended, interrupted): what was known stays.
    */
   async refresh(name, sess) {
-    if (!sess || !sess.alive) return false;
+    // No session: only what is kept of its server connections.
+    if (!sess) {
+      const st = this.state(name, null);
+      const was = this.shape(st);
+      this.offline(name, st);
+      st.read = true;
+      this.prune();
+      if (this.shape(st) !== was && this.deps.onRead) this.deps.onRead(name);
+      return true;
+    }
+    if (!sess.alive) return false;
     const st = this.state(name, sess);
     const was = this.shape(st);
+    this.offline(name, st);
     this.expire(st);
-    const hasForeign = [...st.dbs.values()].some((e) => e.foreign);
+    const hasForeign = [...st.dbs.values()].some((e) => e.foreign && !e.offline);
     // Nothing but queries ran since the last reading. With a foreign
     // database attached the reading is not cheap, so it is skipped.
     if (st.read && !st.dirty && hasForeign) return true;
@@ -398,6 +418,9 @@ class CatalogIndex {
       let e = st.dbs.get(d.db);
       // The same name for something else: start over.
       if (e && (e.foreign !== foreign || e.key !== key || e.type !== d.type)) e = null;
+      // A server connection that was not attached is now: what was kept
+      // of it is its index.
+      if (e) e.offline = false;
       if (!e) {
         e = { db: d.db, type: d.type || "duckdb", path: d.path, key, foreign, part: null, digest: null, extras: [], views: [], columns: 0, indexedAt: null, stale: null, over: null, error: null, indexing: false };
         st.dbs.set(d.db, e);
@@ -406,7 +429,8 @@ class CatalogIndex {
       e.current = d.current;
       e.readonly = d.readonly;
     }
-    for (const db of [...st.dbs.keys()]) if (!seen.some((d) => d.db === db)) st.dbs.delete(db);
+    for (const [db, e] of [...st.dbs]) if (!e.offline && !seen.some((d) => d.db === db)) st.dbs.delete(db);
+    this.offline(name, st);
     this.expire(st);
 
     const local = [...st.dbs.values()].filter((e) => !e.foreign).map((e) => e.db);
@@ -434,12 +458,41 @@ class CatalogIndex {
     return true;
   }
 
+  /** Give the server connections of `name` that are not attached their
+   *  kept index (deps.offline), and drop the ones that are no longer
+   *  listed. Nothing is asked of a session. */
+  offline(name, st) {
+    const want = this.deps.offline ? this.deps.offline(name) || [] : [];
+    const listed = new Set();
+    for (const c of want) {
+      const had = st.dbs.get(c.alias);
+      if (had && !had.offline) continue; // attached
+      const type = c.type || "duckdb";
+      const key = cacheKey(type, c.path);
+      listed.add(c.alias);
+      if (had && had.key === key && had.type === type) continue;
+      const e = { db: c.alias, type, path: c.path, key, foreign: true, offline: true, current: false, readonly: false, part: null, digest: null, extras: [], views: [], columns: 0, indexedAt: null, stale: null, over: null, error: null, indexing: false };
+      st.dbs.set(c.alias, e);
+      this.restore(e);
+    }
+    let dropped = false;
+    for (const [db, e] of [...st.dbs]) {
+      if (e.offline && !listed.has(db)) {
+        st.dbs.delete(db);
+        dropped = true;
+      }
+    }
+    // Taken out of the setting: its kept index goes now, whether or not
+    // the session can be read.
+    if (dropped) this.prune();
+  }
+
   /** What the Catalog draws of a session, as one string: a reading that
    *  leaves it the same has nothing new to show. */
   shape(st) {
     return JSON.stringify([
       st.read,
-      [...st.dbs.values()].map((e) => [e.db, e.type, e.path, e.foreign, e.current, e.readonly, e.digest, e.extras, e.views, e.over, e.error, e.indexedAt]),
+      [...st.dbs.values()].map((e) => [e.db, e.type, e.path, e.foreign, Boolean(e.offline), e.current, e.readonly, e.digest, e.extras, e.views, e.over, e.error, e.indexedAt]),
     ]);
   }
 
@@ -448,7 +501,7 @@ class CatalogIndex {
     const maxAge = this.deps.maxAgeMs ? this.deps.maxAgeMs() : 0;
     if (!(maxAge > 0)) return;
     for (const e of st.dbs.values()) {
-      if (e.foreign && !e.stale && e.indexedAt !== null && this.now() - e.indexedAt > maxAge) {
+      if (e.foreign && !e.offline && !e.stale && e.indexedAt !== null && this.now() - e.indexedAt > maxAge) {
         e.stale = "older than the age limit";
         e.fresh = true;
       }
@@ -501,7 +554,7 @@ class CatalogIndex {
     for (;;) {
       const st = this.sessions.get(name);
       if (!st || st.session !== sess || !sess.alive) return true;
-      const e = [...st.dbs.values()].find((x) => x.foreign && (x.stale || (x.indexedAt === null && !x.over && !x.error)));
+      const e = [...st.dbs.values()].find((x) => x.foreign && !x.offline && (x.stale || (x.indexedAt === null && !x.over && !x.error)));
       if (!e) return true;
       if (this.taken(sess)) return false;
       e.indexing = true;
@@ -675,6 +728,7 @@ class CatalogIndex {
         readonly: e.readonly,
         current: e.current,
         foreign: e.foreign,
+        offline: Boolean(e.offline),
         tables: e.over ? null : !e.part ? (e.views.length ? e.views : null) : e.views.length ? e.part.tables.concat(e.views) : e.part.tables,
         extras: e.extras,
         status: this.status(name, e.db),
@@ -729,7 +783,7 @@ class CatalogIndex {
   }
 
   /** Delete the kept indexes of connections that are no longer attached
-   *  or remembered, then the oldest ones past the cache's limits. */
+   *  or in the setting, then the oldest ones past the cache's limits. */
   prune() {
     if (!this.dir) return;
     let names;
@@ -740,12 +794,12 @@ class CatalogIndex {
     }
     const known = new Set();
     for (const st of this.sessions.values()) for (const e of st.dbs.values()) if (e.key) known.add(e.key);
-    const remembered = this.deps.connections ? this.deps.connections() : null;
-    for (const c of remembered || []) known.add(cacheKey(c.type, c.path));
+    const named = this.deps.connections ? this.deps.connections() : null;
+    for (const c of named || []) known.add(cacheKey(c.type, c.path));
     const files = [];
     for (const f of names) {
       const full = path.join(this.dir, f);
-      if (remembered && !known.has(f.slice(0, 32))) {
+      if (named && !known.has(f.slice(0, 32))) {
         fs.rmSync(full, { force: true });
         continue;
       }

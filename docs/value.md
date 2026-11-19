@@ -322,7 +322,7 @@ window functions, CASE sums) formats in 3.9 s with a peak of 209 MB:
 grebe format --no-config - < 12mb.sql > /dev/null
 ```
 
-Measured on a 4-core Linux machine with the release build of 1.0.0-rc.3,
+Measured on a 4-core Linux machine with the release build of 1.0.0-rc.3 (the formatter is unchanged since),
 median of 3 runs, wall time and peak resident memory read from the process
 on exit. Before the 1.0 parser work the same file took 37 s and 6 GB
 (measured then, not re-run here).

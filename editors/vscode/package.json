@@ -204,6 +204,18 @@
         "icon": "$(close)"
       },
       {
+        "command": "grebe.catalog.keep",
+        "title": "Keep in Settings",
+        "category": "grebe: Catalog",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "grebe.catalog.connect",
+        "title": "Connect",
+        "category": "grebe: Catalog",
+        "icon": "$(plug)"
+      },
+      {
         "command": "grebe.catalog.browseFile",
         "title": "Browse DuckDB File…",
         "category": "grebe: Catalog",
@@ -251,10 +263,8 @@
           "items": {
             "type": "string"
           },
-          "default": [
-            "ALL"
-          ],
-          "description": "The MOD rules to lint for, same as the grebe CLI's --select flag. Only the MOD rules listed here run, and any of them that are off by default are turned on. The default, [\"ALL\"], is every MOD rule there is -- including ones added after this setting, so the editor stays loud rather than needing an update to see a new rule; list codes explicitly to pick a subset instead. Parse errors (PRS) and other-dialect notices (SRC) are always shown unless set to off in grebe.toml's [severity]."
+          "default": [],
+          "description": "The MOD rules to lint for, same as the grebe CLI's --select flag. Empty, the default, is the rules that are on by default, as grebe check runs them. List codes to pick your own set (any that are off by default are turned on), [\"FRIENDLY\"] for the friendly-SQL rewrites, or [\"ALL\"] for every MOD rule. Parse errors (PRS), other-dialect notices (SRC) and the catalog checks (CAT) are always shown unless set to off in grebe.toml's [severity]."
         },
         "grebe.duckdb.path": {
           "type": "string",
@@ -269,12 +279,13 @@
         "grebe.duckdb.reattach": {
           "type": "boolean",
           "default": true,
-          "description": "When a session starts, attach again the databases it had attached when it was last used (from the Catalog or by an ATTACH in your SQL). Passwords are never kept: a server that needs one asks again. A connection you detached is not attached again until you ask; it stays in the Catalog, marked detached. Off: every connection stays listed and is attached only when you ask."
+          "description": "When a session starts, attach the database files in grebe.duckdb.connections that are not marked detached, in the background. Servers are attached when first needed either way. Off: nothing is attached when a session starts; every connection stays listed and is attached when a statement refers to it or when you ask."
         },
         "grebe.duckdb.connections": {
           "type": "array",
           "default": [],
-          "markdownDescription": "Connections the shared session always lists in the Catalog: database files and servers, by the name SQL uses for them. Each is attached when the session starts unless you detached it, and stays listed, detached, until you attach it again. Do not put a password here: one in a connection string is ignored, and the server asks when it needs one.\n\n```json\n[\n  { \"alias\": \"sales\", \"path\": \"data/sales.duckdb\" },\n  { \"alias\": \"warehouse\", \"path\": \"postgresql://me@db.example.com/warehouse\", \"type\": \"postgres\", \"readOnly\": true }\n]\n```",
+          "scope": "resource",
+          "markdownDescription": "The databases your sessions attach, by the name SQL uses for them. The Catalog writes here: attaching adds an entry, Detach sets `detached`, Attach Again clears it, the X removes the entry. Edits here apply at once. A file is attached when the session starts; a server when a statement first refers to it, or when you open it in the Catalog. Entries from user, workspace and folder settings are combined. Never put a password here: one in a connection string is dropped, and the server asks when it needs one.\n\n```json\n[\n  { \"alias\": \"sales\", \"path\": \"data/sales.duckdb\" },\n  { \"alias\": \"warehouse\", \"path\": \"postgresql://me@db.example.com/warehouse\", \"readOnly\": true },\n  { \"alias\": \"archive\", \"path\": \"/data/archive.duckdb\", \"detached\": true },\n  { \"alias\": \"stage\", \"path\": \"stage.duckdb\", \"session\": \"etl\" }\n]\n```",
           "items": {
             "type": "object",
             "required": ["alias", "path"],
@@ -282,8 +293,10 @@
             "properties": {
               "alias": { "type": "string", "description": "The name SQL uses for it: alias.table." },
               "path": { "type": "string", "description": "A database file (relative to the workspace folder, or absolute) or a connection string." },
-              "type": { "type": "string", "description": "What it is when it is not a DuckDB file: postgres, sqlite, mysql, ..." },
-              "readOnly": { "type": "boolean", "default": false, "description": "Attach it read-only." }
+              "type": { "type": "string", "description": "What it is when it is not a DuckDB file and the path does not say: postgres, sqlite, mysql, ..." },
+              "readOnly": { "type": "boolean", "default": false, "description": "Attach it read-only." },
+              "detached": { "type": "boolean", "default": false, "description": "Listed in the Catalog but not attached until you choose Attach Again." },
+              "session": { "type": "string", "description": "The `-- grebe: session NAME` session it belongs to. Without it, the shared session." }
             }
           }
         },
@@ -434,6 +447,14 @@
         {
           "command": "grebe.catalog.forget",
           "when": "false"
+        },
+        {
+          "command": "grebe.catalog.keep",
+          "when": "false"
+        },
+        {
+          "command": "grebe.catalog.connect",
+          "when": "false"
         }
       ],
       "explorer/context": [
@@ -552,38 +573,68 @@
           "group": "inline"
         },
         {
-          "command": "grebe.catalog.detach",
-          "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
-          "group": "inline"
-        },
-        {
-          "command": "grebe.catalog.detach",
-          "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
-          "group": "1_view@1"
-        },
-        {
-          "command": "grebe.catalog.reindex",
-          "when": "view == grebe.catalog && viewItem == grebe.attachedDb",
-          "group": "1_view@2"
-        },
-        {
-          "command": "grebe.catalog.reattach",
-          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "command": "grebe.catalog.keep",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.unsavedDb$/",
           "group": "inline@1"
         },
         {
-          "command": "grebe.catalog.reattach",
-          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
-          "group": "1_view@1"
-        },
-        {
-          "command": "grebe.catalog.forget",
-          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "command": "grebe.catalog.detach",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(attachedDb|unsavedDb|memoryDb)$/",
           "group": "inline@2"
         },
         {
           "command": "grebe.catalog.forget",
-          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb)$/",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.attachedDb$/",
+          "group": "inline@3"
+        },
+        {
+          "command": "grebe.catalog.detach",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(attachedDb|unsavedDb|memoryDb)$/",
+          "group": "1_view@1"
+        },
+        {
+          "command": "grebe.catalog.keep",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.unsavedDb$/",
+          "group": "1_view@2"
+        },
+        {
+          "command": "grebe.catalog.reindex",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(attachedDb|unsavedDb)$/",
+          "group": "1_view@3"
+        },
+        {
+          "command": "grebe.catalog.forget",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.attachedDb$/",
+          "group": "1_view@4"
+        },
+        {
+          "command": "grebe.catalog.reattach",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb|idleDb)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "grebe.catalog.connect",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.offlineDb$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "grebe.catalog.connect",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.offlineDb$/",
+          "group": "1_view@1"
+        },
+        {
+          "command": "grebe.catalog.reattach",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb|idleDb)$/",
+          "group": "1_view@1"
+        },
+        {
+          "command": "grebe.catalog.forget",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb|idleDb|offlineDb|pendingDb)$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "grebe.catalog.forget",
+          "when": "view == grebe.catalog && viewItem =~ /^grebe\\.(lostDb|detachedDb|idleDb|offlineDb|pendingDb)$/",
           "group": "1_view@2"
         }
       ]

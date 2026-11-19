@@ -4,7 +4,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { redact, isConnection, parse, where, aliasFor, withPassword } = require("../conninfo");
+const { redact, isConnection, parse, where, aliasFor, withPassword, withConnectTimeout, plain } = require("../conninfo");
 
 test("redact: a password never survives, in any spelling of a connection string", () => {
   const cases = [
@@ -72,4 +72,16 @@ test("an alias from the database name, and a password added in the same style", 
   assert.deepEqual(parse(withPassword("dbname=ub user=postgres", "it's a\\pw")).password, "it's a\\pw");
   assert.equal(withPassword("postgresql://postgres@localhost/ub", "p@ss"), "postgresql://postgres@localhost/ub?password=p%40ss");
   assert.equal(withPassword("postgresql://h/ub?sslmode=disable", "x"), "postgresql://h/ub?sslmode=disable&password=x");
+});
+
+test("a connect timeout added unless one is given, and left out of what is kept", () => {
+  assert.equal(withConnectTimeout("dbname=ub host=h", 8), "dbname=ub host=h connect_timeout=8");
+  assert.equal(withConnectTimeout("postgresql://h/ub", 8), "postgresql://h/ub?connect_timeout=8");
+  assert.equal(withConnectTimeout("postgresql://h/ub?sslmode=require", 8), "postgresql://h/ub?sslmode=require&connect_timeout=8");
+  assert.equal(withConnectTimeout("dbname=ub connect_timeout=3", 8), "dbname=ub connect_timeout=3");
+  // As DuckDB reports it attached: with the timeout and a password.
+  assert.equal(plain(withPassword(withConnectTimeout("dbname=ub host=h", 8), "pw")), "dbname=ub host=h");
+  assert.equal(plain(withPassword(withConnectTimeout("postgresql://u@h/ub", 8), "pw")), "postgresql://u@h/ub");
+  assert.equal(plain("postgresql://u@h/ub?connect_timeout=8&sslmode=require"), "postgresql://u@h/ub?sslmode=require");
+  assert.equal(plain("/data/connect_timeout=1.duckdb"), "/data/connect_timeout=1.duckdb");
 });

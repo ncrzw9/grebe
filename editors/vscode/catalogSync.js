@@ -117,7 +117,7 @@ class CatalogSync {
     const indexed = this.setting("catalogIndex", true) !== false;
     // No language server (it could not be started): the index is still
     // read, for the Catalog.
-    if (!client) return indexed ? this.readIndex(this.enabled() ? this.deps.liveSessions() : []) : undefined;
+    if (!client) return indexed ? this.readIndex(this.enabled() ? this.sessions() : []) : undefined;
     if (this.indexed !== null && this.indexed !== indexed) this.forgetAll(client);
     this.indexed = indexed;
     return indexed ? this.syncParts(client) : this.syncWhole(client);
@@ -140,6 +140,15 @@ class CatalogSync {
 
   // --- database by database -------------------------------------------------
 
+  /** The sessions the index keeps: every running one, and, with no
+   *  session behind them, those that are not running and have server
+   *  connections in the setting, whose kept indexes stand in for them. */
+  sessions() {
+    const live = this.deps.liveSessions();
+    const idle = (this.deps.offlineSessions ? this.deps.offlineSessions() : []).filter((name) => !live.some((x) => x.name === name));
+    return [...live, ...idle.map((name) => ({ name, session: null }))];
+  }
+
   /** Bring the index up to date with the sessions `live`, sending nothing. */
   async readIndex(live) {
     this.index.keep(live);
@@ -153,6 +162,7 @@ class CatalogSync {
    *  run tries again as it ends. */
   read(name, session, done) {
     if (done) this.retries = 0;
+    if (!session) return;
     if (done || !session.alive || (this.deps.isRunning && this.deps.isRunning()) || this.retries >= MAX_RETRIES) return;
     this.retries++;
     clearTimeout(this.retry);
@@ -164,6 +174,7 @@ class CatalogSync {
    *  the background, one at a time; each one that finishes syncs again. */
   indexPending(live) {
     for (const { name, session } of live) {
+      if (!session) continue;
       this.index
         .indexPending(name, session)
         .then((done) => this.read(name, session, done))
@@ -173,7 +184,7 @@ class CatalogSync {
 
   async syncParts(client) {
     const on = this.enabled();
-    const live = on ? this.deps.liveSessions() : [];
+    const live = on ? this.sessions() : [];
     this.index.keep(live);
     const partKey = (catalog, database) => `part\u0000${catalog}\u0000${database}`;
     const have = new Set(); // the part keys that should be there
@@ -302,6 +313,16 @@ class CatalogSync {
     return { read: false };
   }
 
+  /** What is kept of the server connection `alias` of session `name` while
+   *  it is not attached (as view() gives a database), or null. */
+  offline(name, alias) {
+    if (this.setting("catalogIndex", true) === false) return null;
+    const v = this.index.view(name);
+    const d = v && v.dbs.find((x) => x.db === alias && x.offline);
+    if (!d) this.schedule();
+    return d || null;
+  }
+
   dispose() {
     clearTimeout(this.timer);
     clearTimeout(this.retry);
@@ -316,6 +337,7 @@ function activate(context, deps) {
     maxAgeMs,
     isBusy: deps.isRunning,
     connections: deps.connections,
+    offline: deps.offline,
     onChange: (name) => {
       if (sync) sync.schedule();
       if (deps.onDidIndex) deps.onDidIndex(name);
@@ -327,11 +349,15 @@ function activate(context, deps) {
   sync = new CatalogSync({ ...deps, index });
   context.subscriptions.push(
     sync,
-    deps.onDidRun((run) => (run && run.statements ? sync.ran(run.session, run.statements) : sync.schedule())),
+    // A run ended (what it ran), a connection was attached or detached
+    // (which session), or something else changed.
+    deps.onDidRun((run) => (run && run.statements ? sync.ran(run.session, run.statements) : run && run.session ? sync.touched(run.session) : sync.schedule())),
     vscode.workspace.onDidOpenTextDocument((doc) => doc.languageId === "sql" && sync.schedule()),
     vscode.workspace.onDidSaveTextDocument((doc) => doc.languageId === "sql" && sync.schedule()),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("grebe.duckdb.catalogInEditor") || e.affectsConfiguration("grebe.duckdb.catalogIndex")) sync.schedule();
+      if (e.affectsConfiguration("grebe.duckdb.catalogInEditor") || e.affectsConfiguration("grebe.duckdb.catalogIndex") || e.affectsConfiguration("grebe.duckdb.connections")) {
+        sync.schedule();
+      }
     }),
   );
   return sync;

@@ -99,38 +99,65 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { Sessions } = require("../sessions");
+const { normalize, toSetting } = require("../connections");
 const { Session } = require("../duckdb-session");
 const CLI = process.env.DUCKDB_CLI;
 
-(CLI && fs.existsSync(CLI) ? test : test.skip)("Detach keeps the connection in the Catalog, and Attach Again brings it back", async (t) => {
+(CLI && fs.existsSync(CLI) ? test : test.skip)("Keep, Detach, Attach Again and Forget write the setting, and the tree follows it", async (t) => {
   t.after(() => Session.disposeAll());
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-catalog-detach-"));
-  const m = new Sessions({});
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grebe-catalog-detach-")));
+  // The setting, as the extension keeps it (connectionSettings.js): every
+  // write is followed by the change event, which reconciles.
+  const list = [];
+  const m = new Sessions({ connections: () => normalize(list) });
+  const write = async (fn) => {
+    fn();
+    await m.reconcile();
+  };
+  const find = (alias) => list.findIndex((x) => x.alias === alias);
   const sess = await m.open({ cli: CLI, database: ":memory:", cwd: dir });
   assert.equal((await sess.run(`ATTACH '${path.join(dir, "side.duckdb")}' AS side`)).kind, "ok");
   assert.equal((await sess.run("CREATE TABLE side.t AS SELECT 1 AS i")).kind, "ok");
-  await m.remember();
   const ex = new Explorer({
     liveSession: () => m.live(),
     liveSessions: () => [],
     settings: () => ({ database: ":memory:" }),
     currentSession: async () => sess,
     cli: () => CLI,
-    remember: (name) => m.remember(name),
-    remembered: () => m.remembered(),
-    forget: (alias) => m.forget("default", alias),
-    attachAgain: (alias) => m.attach("default", alias),
+    connections: (name) => m.entries(name).map((e) => ({ ...e, ...m.state(name, e.alias) })),
+    attachAgain: async (alias, name) => {
+      const error = await m.ensure(name, alias);
+      if (!error) await write(() => delete list[find(alias)].detached);
+      return error;
+    },
+    detach: async (alias, name) => {
+      const error = await m.detach(name, alias);
+      if (!error) await write(() => (list[find(alias)].detached = true));
+      return error;
+    },
+    forget: async (alias, name) => {
+      await m.detach(name, alias);
+      await write(() => list.splice(find(alias), 1));
+    },
+    save: (e) => write(() => list.push(toSetting(e))),
   });
   const under = async () => {
     const roots = await ex.getChildren();
     return ex.getChildren(roots.find((r) => r.source === "session"));
   };
-  const side = (await under()).find((n) => n.item.label === "side");
-  assert.equal(side.contextValue, "grebe.attachedDb");
+  const at = async (label) => (await under()).find((n) => n.item.label === label);
 
-  await ex.detach(side);
-  const waiting = (await under()).find((n) => n.item.label === "side");
-  assert.equal(waiting.contextValue, "grebe.detachedDb");
+  // Attached in SQL: not saved, and offered to be kept.
+  assert.equal((await at("side")).item.contextValue, "grebe.unsavedDb");
+  assert.deepEqual(list, []);
+  await ex.keep(await at("side"));
+  assert.deepEqual(list, [{ alias: "side", path: path.join(dir, "side.duckdb") }]);
+  assert.equal((await at("side")).item.contextValue, "grebe.attachedDb");
+
+  await ex.detach(await at("side"));
+  assert.deepEqual(list, [{ alias: "side", path: path.join(dir, "side.duckdb"), detached: true }]);
+  const waiting = await at("side");
+  assert.equal(waiting.item.contextValue, "grebe.detachedDb");
   assert.match(waiting.item.description, /^detached · side\.duckdb$/);
   // Nothing holds the file now: another process can write it.
   const other = new Session({ cli: CLI, database: path.join(dir, "side.duckdb"), cwd: dir });
@@ -140,26 +167,33 @@ const CLI = process.env.DUCKDB_CLI;
   await new Promise((r) => setTimeout(r, 300));
 
   await ex.reattach(waiting);
-  assert.equal((await under()).find((n) => n.item.label === "side").contextValue, "grebe.attachedDb");
+  assert.deepEqual(list, [{ alias: "side", path: path.join(dir, "side.duckdb") }]);
+  assert.equal((await at("side")).item.contextValue, "grebe.attachedDb");
   assert.equal(Number((await sess.run("SELECT count(*) FROM side.t")).rows[0][0]), 2);
 
-  // Before the session starts, its connections are listed all the same.
-  const second = path.join(dir, "second.duckdb");
-  assert.equal((await sess.run(`ATTACH '${second}' AS second`)).kind, "ok");
-  await ex.detach((await under()).find((n) => n.item.label === "side"));
-  await m.remember();
+  // Before the session starts, its connections are listed all the same: a
+  // file to be attached with it, a detached one, a server not connected.
+  await write(() => list.push({ alias: "second", path: path.join(dir, "second.duckdb") }, { alias: "pg", path: "dbname=x host=127.0.0.1 port=1" }));
+  assert.equal((await at("second")).item.contextValue, "grebe.attachedDb", "a file added is attached at once");
+  await ex.detach(await at("side"));
   let running = false;
   ex.deps.liveSession = () => (running ? m.live() : null);
   assert.deepEqual(
-    (await under()).slice(1).map((n) => [n.item.label, n.item.contextValue]),
-    [["second", "grebe.pendingDb"], ["side", "grebe.detachedDb"]],
+    (await under()).slice(1).map((n) => [n.item.label, n.item.contextValue, n.item.description, n.item.collapsibleState]),
+    [
+      ["side", "grebe.detachedDb", "detached · side.duckdb", 0],
+      ["second", "grebe.pendingDb", "attached when the session starts · second.duckdb", 0],
+      ["pg", "grebe.offlineDb", "not connected · x@127.0.0.1:1", 1],
+    ],
   );
   running = true;
-  await sess.run("DETACH second");
-  await m.remember();
-  m.forget("default", "second");
-  await ex.forget((await under()).find((n) => n.item.label === "side"));
-  assert.equal((await under()).some((n) => n.item.label === "side"), false);
+  // The X: out of the setting, and detached if it is attached.
+  await ex.forget(await at("side"));
+  await ex.forget(await at("second"));
+  assert.deepEqual(list.map((x) => x.alias), ["pg"]);
+  assert.equal(await at("side"), undefined);
+  assert.equal(await at("second"), undefined);
+  assert.equal(Number((await sess.run("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'second'")).rows[0][0]), 0);
 });
 
 // ------------------------------------------- the tree from the catalog index --
@@ -237,7 +271,8 @@ const notMemory = (sess) => sess.asked.filter((q) => !q.sql.includes("pragma_dat
 
 test("with the index, the tree asks the session nothing about its databases", async () => {
   const sess = notingSession();
-  const ex = indexedExplorer(sess);
+  // The three attached ones are in the setting.
+  const ex = indexedExplorer(sess, { connections: () => ["big", "lake", "pg"].map((alias) => ({ alias, path: `${alias}.db`, type: "duckdb" })) });
   const [root] = await ex.getChildren();
   const top = await ex.getChildren(root);
   assert.deepEqual(shown(top), [
@@ -260,6 +295,10 @@ test("with the index, the tree asks the session nothing about its databases", as
   const inMemory = await ex.getChildren(memory);
   assert.deepEqual(shown(inMemory), ["orders (~100 rows · 2 cols)", "recent (2 cols)", "Macros (1)"]);
   assert.deepEqual(inMemory.slice(0, 2).map((n) => n.item.contextValue), ["grebe.table", "grebe.view"]);
+  assert.deepEqual(inMemory.slice(0, 2).map((n) => n.item.tooltip), [
+    `"memory"."main"."orders"\ntable\n~100 rows (estimated)\n2 columns`,
+    `"memory"."main"."recent"\nview\n2 columns`,
+  ]);
   assert.deepEqual(shown(await ex.getChildren(inMemory[0])), ["id (BIGINT NOT NULL)", "note (VARCHAR)"]);
   assert.deepEqual(shown(await ex.getChildren(inMemory[2])), ["add1(x) (macro)"]);
 
@@ -279,7 +318,7 @@ test("with the index, the tree asks the session nothing about its databases", as
   assert.deepEqual(one.object, { db: "pg", schema: "public", name: "t1007", kind: "table", est: null, cols: 2, tmp: false });
   assert.equal(one.item.command.command, "grebe.catalog.preview");
   assert.equal(one.item.command.arguments[0], one);
-  assert.equal(one.item.tooltip, 'table "pg"."public"."t1007"');
+  assert.equal(one.item.tooltip, '"pg"."public"."t1007"\ntable\n2 columns', "no row estimate when there is none");
   const columns = await ex.getChildren(one);
   assert.deepEqual(shown(columns), ["id (BIGINT NOT NULL)", "note (VARCHAR)"]);
   assert.deepEqual([columns[0].item.contextValue, columns[0].object], ["grebe.column", one.object]);
