@@ -227,6 +227,34 @@ impl Table {
             .map(|at| &self.columns[self.by_name[at] as usize])
     }
 
+    /// The columns whose name starts with `prefix` (any case), in the order
+    /// of their lowercase names. Found by the name index, so it costs what
+    /// matches, not what the table holds.
+    pub fn columns_with_prefix<'a: 'p, 'p>(
+        &'a self,
+        prefix: &'p str,
+    ) -> Box<dyn Iterator<Item = &'a Column> + 'p> {
+        let starts = move |c: &Column| {
+            let n = c.name.as_bytes();
+            n.len() >= prefix.len() && n[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        };
+        if self.by_name.len() != self.columns.len() {
+            // Still being read: not indexed yet.
+            let mut found: Vec<&Column> = self.columns.iter().filter(|c| starts(c)).collect();
+            found.sort_by(|a, b| cmp_lower(&a.name, &b.name));
+            return Box::new(found.into_iter());
+        }
+        let from = self
+            .by_name
+            .partition_point(|&i| cmp_lower(&self.columns[i as usize].name, prefix).is_lt());
+        Box::new(
+            self.by_name[from..]
+                .iter()
+                .map(move |&i| &self.columns[i as usize])
+                .take_while(move |c| starts(c)),
+        )
+    }
+
     #[must_use]
     pub fn has_column(&self, name: &str) -> bool {
         self.column(name).is_some()
@@ -2388,6 +2416,29 @@ mod tests {
         );
         // "tables" without "columns" is not a snapshot.
         assert!(Catalog::from_json_text(r#"{"tables": []}"#).is_err());
+    }
+
+    #[test]
+    fn columns_are_found_by_prefix_in_name_order() {
+        let cat = Catalog::from_json_text(
+            r#"[
+            {"database":"d","schema":"main","table":"t","column":"Total","type":"INT"},
+            {"database":"d","schema":"main","table":"t","column":"id","type":"INT"},
+            {"database":"d","schema":"main","table":"t","column":"tax","type":"INT"},
+            {"database":"d","schema":"main","table":"t","column":"to","type":"INT"}
+            ]"#,
+        )
+        .unwrap();
+        let t = cat.tables().next().unwrap();
+        let names = |prefix: &str| -> Vec<&str> {
+            t.columns_with_prefix(prefix)
+                .map(|c| c.name.as_str())
+                .collect()
+        };
+        assert_eq!(names("t"), ["tax", "to", "Total"]);
+        assert_eq!(names("TO"), ["to", "Total"]);
+        assert_eq!(names(""), ["id", "tax", "to", "Total"]);
+        assert!(names("x").is_empty());
     }
 
     #[test]

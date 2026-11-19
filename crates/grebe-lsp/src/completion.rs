@@ -27,15 +27,20 @@
 //! Tables and columns come from the catalog when the server has one (see
 //! [`grebe_rules::catalog`]); without one, the statement's own CTEs and the
 //! tables the file creates still complete, with keywords and functions.
-//! What the catalog knows of a column or a table beyond its name -- NOT
-//! NULL, keys, indexes, a row estimate -- is shown in the item's detail.
+//!
+//! Items are kept short: a column's detail is its type (and the relation,
+//! when two have the name); a table has no detail unless its name is in
+//! more than one schema or database, when each place is its own item,
+//! with `database.schema` as the detail. Keys, sizes and the rest are the
+//! hover's (see [`crate::hover`]). An answer carries at most 200 items,
+//! the best first, and is marked incomplete when there were more.
 //!
 //! [`crate::hover`] and [`crate::expand`] read a statement the same way,
 //! with the pieces here.
 
 use std::collections::{HashMap, HashSet};
 
-use grebe_rules::catalog::{Catalog, Column, FileContext, Resolved, Table, quote_ident};
+use grebe_rules::catalog::{Catalog, FileContext, Resolved, Table, quote_ident};
 use grebe_syntax::token::{Token, TokenKind};
 
 use crate::json::Json;
@@ -95,7 +100,7 @@ pub struct Completions {
 }
 
 /// The most items one answer carries.
-const LIMIT: usize = 1000;
+const LIMIT: usize = 200;
 
 /// Words that end a table reference, so cannot be its alias.
 const NOT_AN_ALIAS: &[&str] = &[
@@ -408,6 +413,8 @@ pub(crate) struct Binding {
 pub(crate) struct Scope {
     pub(crate) bindings: Vec<Binding>,
     pub(crate) ctes: Vec<(String, Option<Vec<String>>)>,
+    /// Beside `ctes`: the token each CTE's body opens with, its `(`.
+    pub(crate) cte_bodies: Vec<usize>,
 }
 
 /// The parentheses of one statement, and the queries they hold. A query is
@@ -623,17 +630,48 @@ pub(crate) fn named_table<'c>(
     file: &FileContext,
     catalog: &'c Catalog,
 ) -> Option<&'c Table> {
+    match named_tables(parts, scope, file, catalog).as_slice() {
+        [one] => Some(one),
+        _ => None,
+    }
+}
+
+/// Every catalog table `b` could stand for: one, or each place of a name
+/// the catalog has in more than one schema or database. Empty for a CTE,
+/// a table the file creates, a subquery, or a name the catalog does not
+/// have.
+pub(crate) fn tables_of<'c>(
+    b: &Binding,
+    scope: &Scope,
+    file: &FileContext,
+    catalog: &'c Catalog,
+) -> Vec<&'c Table> {
+    match &b.target {
+        Target::Named(parts) => named_tables(parts, scope, file, catalog),
+        _ => Vec::new(),
+    }
+}
+
+/// Every catalog table called `parts` here: see [`tables_of`].
+pub(crate) fn named_tables<'c>(
+    parts: &[String],
+    scope: &Scope,
+    file: &FileContext,
+    catalog: &'c Catalog,
+) -> Vec<&'c Table> {
     let lower: Vec<String> = parts.iter().map(|p| p.to_ascii_lowercase()).collect();
-    let last = lower.last()?;
-    if lower.len() == 1 && scope.ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(last)) {
-        return None;
+    let Some(last) = lower.last() else {
+        return Vec::new();
+    };
+    if lower.len() == 1 && scope.cte(last).is_some() {
+        return Vec::new();
     }
     if file.local.contains_key(last) {
-        return None;
+        return Vec::new();
     }
     match catalog.resolve(&lower) {
-        Resolved::Found(tables) if tables.len() == 1 => Some(tables[0]),
-        _ => None,
+        Resolved::Found(tables) => tables,
+        _ => Vec::new(),
     }
 }
 
@@ -648,75 +686,6 @@ pub(crate) fn statement_at(src: &str, code: &[Token], at: usize) -> (Vec<Token>,
         .position(is_semi)
         .map_or(code.len(), |i| at + i);
     (code[start..end].to_vec(), at - start)
-}
-
-/// What the catalog knows of a column's place in its table's keys, in a
-/// few words each: `primary key`, `part of unique key`, `indexed`.
-pub(crate) fn key_marks(t: &Table, column: &str) -> Vec<&'static str> {
-    let holds = |key: &[String]| key.iter().any(|k| k.eq_ignore_ascii_case(column));
-    let mut out = Vec::new();
-    if holds(&t.primary_key) {
-        out.push(if t.primary_key.len() == 1 {
-            "primary key"
-        } else {
-            "part of primary key"
-        });
-    }
-    if let Some(key) = t.unique.iter().find(|k| holds(k)) {
-        out.push(if key.len() == 1 {
-            "unique"
-        } else {
-            "part of unique key"
-        });
-    }
-    if t.indexes.iter().any(|k| holds(k)) {
-        out.push("indexed");
-    }
-    out
-}
-
-/// `1240000` as `1.24 million`: three digits are all an estimate is good
-/// for.
-pub(crate) fn humanize(n: u64) -> String {
-    if n < 1000 {
-        return n.to_string();
-    }
-    const UNITS: [(&str, f64); 4] = [
-        ("thousand", 1e3),
-        ("million", 1e6),
-        ("billion", 1e9),
-        ("trillion", 1e12),
-    ];
-    for (i, (unit, scale)) in UNITS.iter().enumerate() {
-        let v = n as f64 / scale;
-        let digits = if v >= 99.95 {
-            0
-        } else if v >= 9.995 {
-            1
-        } else {
-            2
-        };
-        let shown = format!("{v:.digits$}");
-        if shown.parse::<f64>().is_ok_and(|r| r < 1000.0) || i + 1 == UNITS.len() {
-            let shown = if shown.contains('.') {
-                shown.trim_end_matches('0').trim_end_matches('.')
-            } else {
-                shown.as_str()
-            };
-            return format!("{shown} {unit}");
-        }
-    }
-    n.to_string()
-}
-
-/// `about 1.24 million rows`, for a table whose size the catalog knows.
-pub(crate) fn rows_text(t: &Table) -> Option<String> {
-    let n = t.row_estimate()?;
-    Some(format!(
-        "about {} row{}",
-        humanize(n),
-        if n == 1 { "" } else { "s" }
-    ))
 }
 
 /// An alias at `t[i]`: `[AS] name [(cols)]`. `(alias, columns, its token)`.
@@ -810,8 +779,9 @@ fn relation_at(src: &str, t: &[Token], i: usize, is_target: bool, scope: &mut Sc
     });
 }
 
-/// `name [(cols)] AS [[NOT] MATERIALIZED] (` at `t[i]`: a CTE head.
-fn cte_at(src: &str, t: &[Token], i: usize) -> Option<(String, Option<Vec<String>>)> {
+/// `name [(cols)] AS [[NOT] MATERIALIZED] (` at `t[i]`: a CTE head, and
+/// the token its body opens with.
+fn cte_at(src: &str, t: &[Token], i: usize) -> Option<(String, Option<Vec<String>>, usize)> {
     let name = name_of(src, t.get(i)?)?;
     let mut j = i + 1;
     let mut columns = None;
@@ -830,7 +800,24 @@ fn cte_at(src: &str, t: &[Token], i: usize) -> Option<(String, Option<Vec<String
     if upper(src, t.get(j)) == "MATERIALIZED" {
         j += 1;
     }
-    is_punct(src, t.get(j), "(").then_some((name, columns))
+    is_punct(src, t.get(j), "(").then_some((name, columns, j))
+}
+
+impl Scope {
+    fn add_cte(&mut self, (name, columns, body): (String, Option<Vec<String>>, usize)) {
+        self.ctes.push((name, columns));
+        self.cte_bodies.push(body);
+    }
+
+    /// The CTE called `name` (any case): its columns when spelled out, and
+    /// the token its body opens with.
+    pub(crate) fn cte(&self, name: &str) -> Option<(Option<&[String]>, usize)> {
+        let i = self
+            .ctes
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(name))?;
+        Some((self.ctes[i].1.as_deref(), self.cte_bodies[i]))
+    }
 }
 
 /// Every relation and CTE one statement's tokens name.
@@ -854,7 +841,7 @@ pub(crate) fn scope_of(src: &str, t: &[Token], blocks: &Blocks) -> Scope {
                         relation_at(src, t, i + 1, false, &mut scope);
                     }
                     if let Some(cte) = cte_at(src, t, i + 1) {
-                        scope.ctes.push(cte);
+                        scope.add_cte(cte);
                     }
                 }
                 _ => {}
@@ -873,7 +860,7 @@ pub(crate) fn scope_of(src: &str, t: &[Token], blocks: &Blocks) -> Scope {
                     i + 1
                 };
                 if let Some(cte) = cte_at(src, t, at) {
-                    scope.ctes.push(cte);
+                    scope.add_cte(cte);
                 }
             }
             "FROM" => {
@@ -1075,121 +1062,172 @@ impl Collector {
         self.push(item, key);
     }
 
-    fn table(&mut self, t: &Table, rank: u8) {
-        if !self.matches(&t.name) {
-            return;
-        }
-        let kind = if t.is_view {
-            Kind::Interface
-        } else {
-            Kind::Class
-        };
-        let what = if t.is_view { "view" } else { "table" };
-        let mut detail = format!("{what} · {}.{}", t.database, t.schema);
-        if let Some(rows) = rows_text(t) {
-            detail.push_str(" · ");
-            detail.push_str(&rows);
-        }
-        self.add(&t.name, kind, detail, rank);
-    }
-
     /// The catalog's tables that match what is typed, within `within` (see
     /// [`Catalog::tables_with_prefix`]). The catalog finds them by its
     /// index and hands over no more than an answer can carry, so a catalog
     /// of a hundred thousand tables costs what a small one does.
+    ///
+    /// A name in one place is one item with no detail. A name in several
+    /// is an item for each place, with `database.schema` as the detail,
+    /// inserted with as much of that as tells the places apart (none of
+    /// it when a qualifier is typed already, unless it is the database).
     fn tables(&mut self, catalog: &Catalog, within: &[String], rank: u8) {
         let (found, cut) = catalog.tables_with_prefix(&self.prefix, within, LIMIT + 1);
-        for t in found {
-            self.table(t, rank);
-        }
         self.incomplete |= cut;
+        let mut places: HashMap<String, usize> = HashMap::new();
+        let mut schemas: HashMap<(String, String), usize> = HashMap::new();
+        for t in &found {
+            *places.entry(t.name.to_ascii_lowercase()).or_default() += 1;
+            *schemas
+                .entry((t.schema.to_ascii_lowercase(), t.name.to_ascii_lowercase()))
+                .or_default() += 1;
+        }
+        let typed_database =
+            matches!(within, [q] if catalog.has_database(q) && !catalog.has_schema(q));
+        for t in found {
+            let kind = if t.is_view {
+                Kind::Interface
+            } else {
+                Kind::Class
+            };
+            let lname = t.name.to_ascii_lowercase();
+            if places.get(&lname).is_none_or(|n| *n < 2) {
+                self.add(&t.name, kind, "", rank);
+                continue;
+            }
+            if !self.wants(&t.name, rank) {
+                continue;
+            }
+            let name = quote_ident(&t.name);
+            let insert = if within.is_empty() || typed_database {
+                let schema = format!("{}.{name}", quote_ident(&t.schema));
+                let shared = schemas
+                    .get(&(t.schema.to_ascii_lowercase(), lname))
+                    .is_some_and(|n| *n > 1);
+                if shared && !typed_database {
+                    format!("{}.{schema}", quote_ident(&t.database))
+                } else {
+                    schema
+                }
+            } else {
+                name
+            };
+            let key = format!("{}.{}.{}", t.database, t.schema, t.name).to_ascii_lowercase();
+            if !self.seen.insert((key.clone(), kind)) {
+                continue;
+            }
+            let item = Item {
+                label: t.name.clone(),
+                kind,
+                detail: format!("{}.{}", t.database, t.schema),
+                insert: (insert != t.name).then_some(insert),
+                rank,
+            };
+            self.push(item, key);
+        }
     }
 }
 
-/// A column's detail: its type, `NOT NULL`, its place in the table's keys,
-/// and the table.
-fn column_detail(t: &Table, c: &Column) -> String {
-    let mut detail = c.data_type.clone();
-    if c.nullable == Some(false) {
-        detail.push_str(" NOT NULL");
-    }
-    for mark in key_marks(t, &c.name) {
-        detail.push_str(" · ");
-        detail.push_str(mark);
-    }
-    detail.push_str(" · ");
-    detail.push_str(&t.name);
-    detail
-}
-
-/// A column of a relation: its name, and where it is from -- the catalog's
-/// table and column, or just what to call the source.
-enum Source<'a> {
-    Catalog(&'a Table, &'a Column),
-    Named(&'a str),
-}
-
-/// Every column of whatever `parts` names: a CTE, a table the file
-/// creates, or a catalog table.
+/// Every column whose name starts with `prefix` of whatever `parts` names
+/// (a CTE, a table the file creates, or a catalog table), with its type
+/// when known. A catalog table's
+/// are taken from its name index, in name order, and no more than an answer
+/// carries; true when some were left out for that.
 fn each_column_named<'a>(
     parts: &[String],
+    prefix: &'a str,
     scope: &'a Scope,
     file: &'a FileContext,
     catalog: Option<&'a Catalog>,
-    f: &mut dyn FnMut(&'a str, Source<'a>),
-) {
+    f: &mut dyn FnMut(&'a str, &'a str),
+) -> bool {
     let lower: Vec<String> = parts.iter().map(|p| p.to_ascii_lowercase()).collect();
-    let Some(last) = lower.last() else { return };
+    let Some(last) = lower.last() else {
+        return false;
+    };
     if lower.len() == 1 {
-        if let Some((name, cols)) = scope
-            .ctes
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(last))
-        {
-            for c in cols.iter().flatten() {
-                f(c, Source::Named(name));
+        if let Some((cols, _)) = scope.cte(last) {
+            for c in cols.into_iter().flatten() {
+                f(c, "");
             }
-            return;
+            return false;
         }
     }
     if let Some(local) = file.local.get(last) {
         for c in local.columns.iter().flatten() {
-            f(c, Source::Named(&local.name));
+            f(c, "");
         }
-        return;
+        return false;
     }
+    let mut cut = false;
     if let Some(Resolved::Found(tables)) = catalog.map(|c| c.resolve(&lower)) {
         for t in tables {
-            for c in &t.columns {
-                f(&c.name, Source::Catalog(t, c));
+            for (n, c) in t.columns_with_prefix(prefix).enumerate() {
+                if n == LIMIT {
+                    cut = true;
+                    break;
+                }
+                f(&c.name, &c.data_type);
             }
         }
     }
+    cut
 }
 
-/// Every column of the relation `b`.
+/// Every column of the relation `b` whose name starts with `prefix`: see
+/// [`each_column_named`].
 fn each_column<'a>(
     b: &'a Binding,
+    prefix: &'a str,
     scope: &'a Scope,
     file: &'a FileContext,
     catalog: Option<&'a Catalog>,
-    f: &mut dyn FnMut(&'a str, Source<'a>),
-) {
+    f: &mut dyn FnMut(&'a str, &'a str),
+) -> bool {
     match &b.target {
-        Target::Named(parts) => each_column_named(parts, scope, file, catalog, f),
+        Target::Named(parts) => each_column_named(parts, prefix, scope, file, catalog, f),
         Target::Columns(cols) => {
             for c in cols {
-                f(c, Source::Named(&b.name));
+                f(c, "");
             }
+            false
         }
-        Target::Unknown => {}
+        Target::Unknown => false,
     }
 }
 
-fn source_detail(source: &Source) -> String {
-    match source {
-        Source::Catalog(t, c) => column_detail(t, c),
-        Source::Named(n) => (*n).to_string(),
+/// Does the relation `b` have a column `name`? `None` when its columns are
+/// not known. Looked up, not listed: a wide table costs what a narrow one
+/// does.
+fn relation_has(
+    b: &Binding,
+    name: &str,
+    scope: &Scope,
+    file: &FileContext,
+    catalog: Option<&Catalog>,
+) -> Option<bool> {
+    let has = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(name));
+    match &b.target {
+        Target::Columns(cols) => Some(has(cols)),
+        Target::Unknown => None,
+        Target::Named(parts) => {
+            let lower: Vec<String> = parts.iter().map(|p| p.to_ascii_lowercase()).collect();
+            let last = lower.last()?;
+            if lower.len() == 1 {
+                if let Some((cols, _)) = scope.cte(last) {
+                    return cols.map(has);
+                }
+            }
+            if let Some(local) = file.local.get(last) {
+                return local.columns.as_deref().map(has);
+            }
+            match catalog?.resolve(&lower) {
+                Resolved::Found(tables) if tables.iter().any(|t| !t.columns.is_empty()) => {
+                    Some(tables.iter().any(|t| t.has_column(name)))
+                }
+                _ => None,
+            }
+        }
     }
 }
 
@@ -1202,11 +1240,13 @@ fn columns_named(
     catalog: Option<&Catalog>,
     rank: u8,
 ) {
-    each_column_named(parts, scope, file, catalog, &mut |name, source| {
+    let prefix = out.prefix.clone();
+    let cut = each_column_named(parts, &prefix, scope, file, catalog, &mut |name, ty| {
         if out.wants(name, rank) {
-            out.add(name, Kind::Field, source_detail(&source), rank);
+            out.add(name, Kind::Field, ty.to_string(), rank);
         }
     });
+    out.incomplete |= cut;
 }
 
 /// The columns of the relation `b`, as items.
@@ -1218,11 +1258,13 @@ fn columns_of(
     catalog: Option<&Catalog>,
     rank: u8,
 ) {
-    each_column(b, scope, file, catalog, &mut |name, source| {
+    let prefix = out.prefix.clone();
+    let cut = each_column(b, &prefix, scope, file, catalog, &mut |name, ty| {
         if out.wants(name, rank) {
-            out.add(name, Kind::Field, source_detail(&source), rank);
+            out.add(name, Kind::Field, ty.to_string(), rank);
         }
     });
+    out.incomplete |= cut;
 }
 
 /// What a table's name could be in the name of a column that points at it:
@@ -1242,26 +1284,20 @@ fn stems(table: &str) -> Vec<String> {
     out
 }
 
-/// The join conditions the keys of two tables imply, each with what it
-/// rests on. A key of one column `k` of a table `things` pairs with a
+/// The join conditions the keys of two tables imply. A key of one column `k` of a table `things` pairs with a
 /// column `things_k` or `thing_k` of the other table, or with one called
 /// `k` too unless that is a bare `id`, which every table has for itself.
 /// A key of several columns pairs with the columns of the same names.
 /// `left` is the relation written first; it is written first in the
 /// condition too.
-fn join_conditions(left: (&str, &Table), right: (&str, &Table)) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+fn join_conditions(left: (&str, &Table), right: (&str, &Table)) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     let side =
         |alias: &str, column: &str| format!("{}.{}", quote_ident(alias), quote_ident(column));
     for (keyed, other, keyed_is_left) in [(left, right, true), (right, left, false)] {
         let (ka, kt) = keyed;
         let (oa, ot) = other;
-        for (n, key) in kt.unique_keys().enumerate() {
-            let what = if n == 0 && !kt.primary_key.is_empty() {
-                "primary key"
-            } else {
-                "unique key"
-            };
+        for key in kt.unique_keys() {
             let pairs: Option<Vec<(&str, &str)>> = if let [k] = key {
                 let named_for = stems(&kt.name)
                     .iter()
@@ -1287,8 +1323,8 @@ fn join_conditions(left: (&str, &Table), right: (&str, &Table)) -> Vec<(String, 
                 })
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            if !out.iter().any(|(c, _)| *c == condition) {
-                out.push((condition, format!("join · {what} of {}", kt.name)));
+            if !out.contains(&condition) {
+                out.push(condition);
             }
         }
     }
@@ -1361,7 +1397,7 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
                 // A database's schemas and tables; a schema's tables.
                 for (schema, database) in cat.schemas() {
                     if database.eq_ignore_ascii_case(q) {
-                        out.add(schema, Kind::Module, format!("schema · {database}"), 1);
+                        out.add(schema, Kind::Module, "", 1);
                     }
                 }
                 out.tables(cat, &lower, 2);
@@ -1394,13 +1430,15 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
     if let Some(open) = blocks.parent(at) {
         let before = upper(src, open.checked_sub(1).and_then(|i| t.get(i)));
         let already = listed(src, t, open, &blocks);
+        let prefix = out.prefix.clone();
         let offer = |out: &mut Collector, from: &[&Binding]| {
             for b in from {
-                each_column(b, &scope, &file, catalog, &mut |name, source| {
+                let cut = each_column(b, &prefix, &scope, &file, catalog, &mut |name, ty| {
                     if out.wants(name, 0) && !already.contains(&name.to_ascii_lowercase()) {
-                        out.add(name, Kind::Field, source_detail(&source), 0);
+                        out.add(name, Kind::Field, ty.to_string(), 0);
                     }
                 });
+                out.incomplete |= cut;
             }
         };
         let star = open >= 2 && text(src, &t[open - 2]) == "*";
@@ -1434,27 +1472,26 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
             // it; all of its own when theirs are not known.
             let earlier: Vec<&Binding> = here.iter().copied().filter(|b| b.at < open).collect();
             if let Some((joined, rest)) = earlier.split_last() {
-                let mut theirs: HashSet<String> = HashSet::new();
-                let mut known = !rest.is_empty();
-                for b in rest {
-                    let before = theirs.len();
-                    each_column(b, &scope, &file, catalog, &mut |name, _| {
-                        theirs.insert(name.to_ascii_lowercase());
-                    });
-                    known &= theirs.len() > before;
-                }
-                let mut own = false;
-                each_column(joined, &scope, &file, catalog, &mut |name, source| {
-                    own = true;
-                    let lname = name.to_ascii_lowercase();
+                // Whether the relations before it have a name, when every
+                // one of them has known columns.
+                let known = !rest.is_empty()
+                    && rest
+                        .iter()
+                        .all(|b| relation_has(b, "", &scope, &file, catalog).is_some());
+                let theirs = |name: &str| {
+                    rest.iter()
+                        .any(|b| relation_has(b, name, &scope, &file, catalog) == Some(true))
+                };
+                let cut = each_column(joined, &prefix, &scope, &file, catalog, &mut |name, ty| {
                     if out.wants(name, 0)
-                        && !already.contains(&lname)
-                        && (!known || theirs.contains(&lname))
+                        && !already.contains(&name.to_ascii_lowercase())
+                        && (!known || theirs(name))
                     {
-                        out.add(name, Kind::Field, source_detail(&source), 0);
+                        out.add(name, Kind::Field, ty.to_string(), 0);
                     }
                 });
-                if !own {
+                out.incomplete |= cut;
+                if relation_has(joined, "", &scope, &file, catalog).is_none() {
                     offer(&mut out, rest);
                 }
             }
@@ -1520,10 +1557,8 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
                     let Some(left) = table_of(b, &scope, &file, cat) else {
                         continue;
                     };
-                    for (condition, detail) in
-                        join_conditions((&b.name, left), (&joined.name, right))
-                    {
-                        out.add(&condition, Kind::Snippet, detail, 0);
+                    for condition in join_conditions((&b.name, left), (&joined.name, right)) {
+                        out.add(&condition, Kind::Snippet, "join", 0);
                     }
                 }
             }
@@ -1544,79 +1579,67 @@ pub fn complete(src: &str, offset: u32, catalog: Option<&Catalog>) -> Completion
                     .map(move |b| (b, if n == 0 { 1 } else { 2 }))
             })
             .collect();
-        let mut holders: HashMap<String, usize> = HashMap::new();
-        if reach.len() > 1 {
-            for (b, _) in &reach {
-                let mut own: HashSet<String> = HashSet::new();
-                each_column(b, &scope, &file, catalog, &mut |name, _| {
-                    if out.matches(name) {
-                        own.insert(name.to_ascii_lowercase());
-                    }
-                });
-                for name in own {
-                    *holders.entry(name).or_default() += 1;
-                }
-            }
-        }
+        // A name another relation in reach has too is offered once for
+        // each, inserted with the relation's name. Looked up, not listed.
+        let prefix = out.prefix.clone();
         for (b, rank) in &reach {
-            each_column(b, &scope, &file, catalog, &mut |name, source| {
+            let cut = each_column(b, &prefix, &scope, &file, catalog, &mut |name, ty| {
                 if !out.wants(name, *rank) {
                     return;
                 }
-                let shared = holders
-                    .get(&name.to_ascii_lowercase())
-                    .is_some_and(|n| *n > 1);
-                if shared && !b.name.is_empty() {
-                    out.qualified(&b.name, name, source_detail(&source), *rank);
+                let shared = !b.name.is_empty()
+                    && reach.iter().any(|(other, _)| {
+                        !std::ptr::eq(*other, *b)
+                            && relation_has(other, name, &scope, &file, catalog) == Some(true)
+                    });
+                let detail = ty.to_string();
+                if shared {
+                    let detail = if detail.is_empty() {
+                        b.name.clone()
+                    } else {
+                        format!("{detail} · {}", b.name)
+                    };
+                    out.qualified(&b.name, name, detail, *rank);
                 } else {
-                    out.add(name, Kind::Field, source_detail(&source), *rank);
+                    out.add(name, Kind::Field, detail, *rank);
                 }
             });
+            out.incomplete |= cut;
         }
         for b in &scope.bindings {
-            let detail = match &b.target {
-                Target::Named(parts)
-                    if !parts
-                        .last()
-                        .is_some_and(|l| l.eq_ignore_ascii_case(&b.name)) =>
-                {
-                    parts.join(".")
-                }
-                _ => String::new(),
-            };
-            out.add(&b.name, Kind::Variable, detail, 2);
+            out.add(&b.name, Kind::Variable, "", 2);
         }
         for a in grebe_rules::detect::aggregate_names() {
-            out.add(a, Kind::Function, "aggregate", 4);
+            out.add(a, Kind::Function, "", 4);
         }
         for f in FUNCTIONS {
             out.add(f, Kind::Function, "", 4);
         }
         if let Some(cat) = catalog {
             for f in cat.functions() {
-                out.add(&f.name, Kind::Function, f.kind.as_str(), 4);
+                out.add(&f.name, Kind::Function, "", 4);
             }
         }
     }
     for (name, _) in &scope.ctes {
-        out.add(name, Kind::Class, "CTE", tables_rank);
+        out.add(name, Kind::Class, "", tables_rank);
     }
     let mut local: Vec<_> = file.local.values().collect();
     local.sort_by(|a, b| a.name.cmp(&b.name));
     for l in local {
-        out.add(&l.name, Kind::Class, "created in this file", tables_rank);
+        out.add(&l.name, Kind::Class, "", tables_rank);
     }
     if let Some(cat) = catalog {
         out.tables(cat, &[], tables_rank);
         for (schema, _) in cat.schemas() {
-            out.add(schema, Kind::Module, "schema", tables_rank + 1);
+            out.add(schema, Kind::Module, "", tables_rank + 1);
         }
         for database in cat.databases() {
-            out.add(database, Kind::Module, "database", tables_rank + 1);
+            out.add(database, Kind::Module, "", tables_rank + 1);
         }
         if table_context {
             for f in cat.functions().filter(|f| f.kind.contains("table")) {
-                out.add(&f.name, Kind::Function, f.kind.as_str(), 2);
+                out.add(&f.name, Kind::Function, "", 2);
             }
         }
     }
@@ -1697,7 +1720,7 @@ mod tests {
             .find(|i| i.label == "Order Date")
             .unwrap();
         assert_eq!(date.insert.as_deref(), Some("\"Order Date\""));
-        assert_eq!(date.detail, "DATE · orders");
+        assert_eq!(date.detail, "DATE");
     }
 
     #[test]
@@ -1728,8 +1751,9 @@ mod tests {
         let cat = catalog();
         let got = at("SELECT | FROM customers", Some(&cat));
         assert_eq!(&got[..3], ["id", "name", "customers"]);
-        assert!(got.contains(&"sum".to_string()), "aggregates: {got:?}");
-        assert!(got.contains(&"SELECT".to_string()), "keywords: {got:?}");
+        // Aggregates and keywords come after, as what is typed narrows it.
+        assert!(at("SELECT su| FROM customers", Some(&cat)).contains(&"sum".to_string()));
+        assert!(at("SELECT se| FROM customers", Some(&cat)).contains(&"SELECT".to_string()));
         // Only what the prefix matches.
         assert_eq!(
             at("SELECT na| FROM customers", Some(&cat)),
@@ -1835,35 +1859,84 @@ mod tests {
     }
 
     #[test]
-    fn items_say_what_the_catalog_knows() {
+    fn items_are_a_name_and_a_type() {
         let cat = shop();
+        // A table: its name, nothing else, when the name is in one place.
         assert_eq!(
             shown("SELECT * FROM ord|", Some(&cat), 2),
-            [
-                "order_items [table · shop.main · about 3 rows]",
-                "orders [table · shop.main · about 1.24 million rows]",
-            ]
+            ["order_items []", "orders []"]
         );
-        assert_eq!(
-            shown("FROM big|", Some(&cat), 1),
-            ["big_orders [view · shop.main]"]
-        );
+        assert_eq!(shown("FROM big|", Some(&cat), 1), ["big_orders []"]);
+        // A column: its type.
         assert_eq!(
             shown("SELECT | FROM order_items", Some(&cat), 4),
             [
-                "line_no [INTEGER NOT NULL · part of primary key · order_items]",
-                "order_id [BIGINT NOT NULL · part of primary key · order_items]",
-                "qty [INTEGER · order_items]",
-                "sku [VARCHAR NOT NULL · order_items]",
+                "line_no [INTEGER]",
+                "order_id [BIGINT]",
+                "qty [INTEGER]",
+                "sku [VARCHAR]",
             ]
         );
         assert_eq!(
             shown("SELECT em| FROM customers", Some(&cat), 1),
-            ["email [VARCHAR NOT NULL · unique · customers]"]
+            ["email [VARCHAR]"]
         );
         assert_eq!(
             shown("SELECT pl| FROM orders", Some(&cat), 1),
-            ["placed [TIMESTAMP NOT NULL · indexed · orders]"]
+            ["placed [TIMESTAMP]"]
+        );
+        // Nothing else carries a detail: not an alias, a function, a
+        // keyword, a schema or a CTE.
+        for sql in [
+            "SELECT | FROM orders o",
+            "SELECT * FROM |",
+            "WITH w AS (SELECT 1) SELECT | FROM w, orders",
+            "SELECT * FROM shop.|",
+        ] {
+            let offset = sql.find('|').unwrap();
+            let src = sql.replacen('|', "", 1);
+            for i in complete(&src, offset as u32, Some(&cat)).items {
+                let typed = i.kind == Kind::Field && !i.detail.is_empty();
+                assert!(i.detail.is_empty() || typed, "{sql}: {i:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_in_two_schemas_is_offered_for_each_with_where_it_is() {
+        let cat = Catalog::from_json_text(
+            r#"[
+            {"database":"pg","schema":"public","table":"orders","column":"id","type":"INT"},
+            {"database":"pg","schema":"staging","table":"orders","column":"id","type":"INT"},
+            {"database":"pg","schema":"public","table":"customers","column":"id","type":"INT"},
+            {"database":"wh","schema":"public","table":"orders","column":"id","type":"INT"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            shown("SELECT * FROM ord|", Some(&cat), 3),
+            [
+                "orders [pg.public] pg.public.orders",
+                "orders [pg.staging] staging.orders",
+                "orders [wh.public] wh.public.orders",
+            ]
+        );
+        assert_eq!(shown("SELECT * FROM cu|", Some(&cat), 5), ["customers []"]);
+        // After the database, the schema tells them apart; after the
+        // schema, the database is typed already or cannot be.
+        assert_eq!(
+            shown("SELECT * FROM pg.|", Some(&cat), 5),
+            [
+                "public []",
+                "staging []",
+                "customers []",
+                "orders [pg.public] public.orders",
+                "orders [pg.staging] staging.orders",
+            ]
+        );
+        assert_eq!(
+            shown("SELECT * FROM pg.staging.|", Some(&cat), 5),
+            ["orders []"]
         );
     }
 
@@ -1892,10 +1965,7 @@ mod tests {
                 Some(&cat),
                 2
             ),
-            [
-                "id [BIGINT NOT NULL · primary key · orders] o.id",
-                "id [BIGINT NOT NULL · primary key · customers] c.id",
-            ]
+            ["id [BIGINT · o] o.id", "id [BIGINT · c] c.id",]
         );
     }
 
@@ -1908,23 +1978,23 @@ mod tests {
                 Some(&cat),
                 1
             ),
-            ["o.customer_id = c.id [join · primary key of customers]"]
+            ["o.customer_id = c.id [join]"]
         );
         // The relation written first is written first.
         assert_eq!(
             shown("FROM customers JOIN orders ON |", Some(&cat), 1),
-            ["customers.id = orders.customer_id [join · primary key of customers]"]
+            ["customers.id = orders.customer_id [join]"]
         );
         // A key of two columns.
         assert_eq!(
             shown("FROM order_items i JOIN stock s ON |", Some(&cat), 1),
             ["i.order_id = s.order_id AND i.line_no = s.line_no \
-                 [join · primary key of order_items]"]
+                 [join]"]
         );
         // `orders.id` and `stock.order_id`.
         assert_eq!(
             shown("FROM stock s LEFT JOIN orders o ON |", Some(&cat), 1),
-            ["s.order_id = o.id [join · primary key of orders]"]
+            ["s.order_id = o.id [join]"]
         );
         // Nothing to rest on: no key (`stock`, a view), no column named for
         // it, a bare `id` on both sides, a table not in the catalog, no
@@ -2014,7 +2084,7 @@ mod tests {
         assert_eq!(found.items.len(), LIMIT);
         let found = complete("SELECT  FROM t7", 7, Some(&cat));
         assert_eq!(found.items[0].label, "c0");
-        assert_eq!(found.items[0].detail, "INT · t7");
+        assert_eq!(found.items[0].detail, "INT");
     }
 
     #[test]
@@ -2029,8 +2099,13 @@ mod tests {
         assert!(found.incomplete);
         let mut names: Vec<String> = (0..5_000).map(|c| format!("c{c}")).collect();
         names.sort();
-        names.truncate(LIMIT);
+        names.truncate(200);
         let got: Vec<String> = found.items.into_iter().map(|i| i.label).collect();
         assert_eq!(got, names);
+        // What is typed narrows it, by the table's index of names.
+        let found = complete("SELECT c49 FROM wide", 10, Some(&cat));
+        assert!(!found.incomplete);
+        assert_eq!(found.items.len(), 111);
+        assert_eq!(found.items[0].label, "c49");
     }
 }

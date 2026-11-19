@@ -317,21 +317,24 @@ stop that. The files you browse are kept with the workspace too.
 After every run the language server is told which tables, views, columns
 and macros the session holds, so in a `.sql` file:
 
-- **Completion** offers them: tables and views after `FROM` and `JOIN`
-  (with their kind and row estimate), the columns of the tables in the
-  statement wherever a column goes, SELECT-first or FROM-first, and
-  `alias.` or `table.` their columns. A column shows its type, `NOT NULL`
-  and whether it is in a key or an index. Right after a join's `ON` the
-  condition the keys imply comes first (`o.customer_id = c.id`, when one
-  table's key matches a column of the other named for it). In `* EXCLUDE (`,
-  `USING (` and `INSERT INTO t (` only the columns that can go there are
-  offered.
-- **Hover** on a table or view shows its full name, kind, row estimate,
-  keys, indexes and columns with their types; on an alias, the table it
-  stands for; on a column, its type, whether it may be NULL and its place
-  in the keys. Only for a name that is exactly one thing: a column that two
-  of the query's tables have, or a name next to a subquery or a file, has
-  no hover.
+- **Completion** offers them: tables and views after `FROM` and `JOIN`,
+  the columns of the tables in the statement wherever a column goes,
+  SELECT-first or FROM-first, and after `alias.` or `table.` their columns.
+  An item is the name and, for a column, its type. A column two tables
+  have is offered for each, inserted as `alias.column`; a table in more
+  than one schema is offered for each, with `database.schema` beside it.
+  Right after a join's `ON` the condition the keys imply comes first
+  (`o.customer_id = c.id`). In `* EXCLUDE (`, `USING (` and
+  `INSERT INTO t (` only the columns that can go there are offered. At
+  most 200 items come back, the best first; typing narrows the rest.
+- **Hover** on a table, a view or an alias gives one line -- full name,
+  kind, row estimate, primary key -- and its first 20 columns with their
+  types. On a column, one line: `table.column`, its type, `NOT NULL`, and
+  `key`, `unique` or `indexed`. A column is found among the query's
+  catalog tables even beside a CTE, a subquery or a file, unless one of
+  those names a column of the same name too; one that two tables have
+  shows both. A name in more than one schema lists each place. A macro
+  shows its kind; built-in functions have no hover.
 - **Expand \* to columns** (a refactoring in the lightbulb menu, kind
   `refactor.rewrite`) writes a `SELECT *` or `alias.*` out as its columns,
   in table order, qualified when the query reads more than one table, and
@@ -376,7 +379,7 @@ costs its price once and cannot take the rest down with it:
 - The index also records what DuckDB (or, for PostgreSQL, the server's
   own catalog) knows of each table: whether a column may be NULL, the
   estimated row count, the primary key, unique constraints and indexes.
-  Hover and completion show them, and the join condition comes from them.
+  Hover shows them, and the join condition comes from them.
 
 Reading a database for the editor happens after a run's results are
 shown, never during a run, and one database at a time. A run that starts
