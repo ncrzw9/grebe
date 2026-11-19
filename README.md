@@ -6,6 +6,8 @@ dependencies: no database engine, no catalog, no network. Give it a
 checks queries against what the catalog says of each table, and completes
 names in your editor.
 
+Documentation, with an exact example for every option and rule: [docs/](docs/README.md).
+
 The parser is generated from DuckDB's own PEG grammar, vendored verbatim, so
 grebe parses the dialect DuckDB parses instead of approximating it. The
 grammar is DuckDB 2.0.0's. Measured on 62,253 distinct statements (every
@@ -352,11 +354,14 @@ FROM duckdb_columns() WHERE NOT internal;
 The language server completes from the same catalog: columns after
 `alias.`, tables after `FROM`, what is inside a schema or database after
 `name.`, the columns of the statement's tables wherever a column goes, on
-statements that do not parse yet. With the metadata `grebe catalog
+statements that do not parse yet. An item is a name and, for a column, its
+type; at most 200 come back, the best first. Hover gives a table's kind,
+row estimate, key and first columns, or a column's type and keys, in a line
+or two; it answers beside CTEs, subqueries and files, and lists every place
+of a name that is in more than one schema. With the metadata `grebe catalog
 --with-metadata` writes (types, NOT NULL, keys, indexes, row estimates) it
-also shows them in completion and on hover over a table, an alias or a
-column, offers the join condition the keys imply right after `ON`, and has
-a code action, **Expand \* to columns** (`refactor.rewrite`), that writes a
+also offers the join condition the keys imply right after `ON`, and has a
+code action, **Expand \* to columns** (`refactor.rewrite`), that writes a
 `SELECT *` out as its columns when every table is in the catalog. An editor
 with a database open can send its catalog directly (the VS Code extension
 sends the session's); any other LSP client gets the `grebe.toml` one.

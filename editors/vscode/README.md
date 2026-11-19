@@ -127,116 +127,71 @@ The last two lines get squiggles (`LIMIT` without `ORDER BY`, `count(*)`,
   `TEMP` tables and `SET` options still end with the session. **grebe:
   Delete Workspace Database** starts over. A file written by DuckDB 2.0
   cannot be opened by 1.5: after switching back to an older CLI, delete it.
-- **Attachments come back.** Whatever a session has attached -- from the
-  Catalog or by an `ATTACH` in your SQL -- is noted when a run ends, and
-  attached again when the session next starts, in the same mode
-  (read-only or not), after a restart or in a new window. Passwords are
-  never kept: a server that needs one asks again. One that cannot be
-  brought back (a file that moved, a server that is down) stays in the
-  Catalog as *not attached*, with the reason.
-- **Detaching does not lose a connection.** A database you detach -- with
-  **Detach** in the Catalog or a `DETACH` in your SQL -- lets go of the
-  file or the server, so another program can have it, and stays in the
-  Catalog as *detached*. It is left alone when the session starts, and
-  **Attach Again** brings it back, in the same mode. **Forget** takes a
-  connection off the list. The list is shown before the session starts
-  too, so you can see what it will attach. With `grebe.duckdb.reattach: false` nothing is
-  attached when a session starts: every connection is listed, and attached
-  when you ask.
-- **Connections in settings.** `grebe.duckdb.connections` declares
-  connections for the shared session, in your user or workspace settings:
 
-  ```json
-  "grebe.duckdb.connections": [
-    { "alias": "sales", "path": "data/sales.duckdb" },
-    { "alias": "warehouse", "path": "postgresql://me@db.example.com/warehouse", "type": "postgres", "readOnly": true }
-  ]
-  ```
+### Connections
 
-  They behave like any other connection (attached at start, detached and
-  attached again from the Catalog), and stay listed for as long as the
-  setting names them. Do not put a password there: one in a connection
-  string is ignored, and the server asks when it needs one.
+The databases your sessions attach are kept in one place, the
+`grebe.duckdb.connections` setting:
 
-## Stopping a long query
+```json
+"grebe.duckdb.connections": [
+  { "alias": "sales", "path": "data/sales.duckdb" },
+  { "alias": "warehouse", "path": "postgresql://me@db.example.com/warehouse", "readOnly": true },
+  { "alias": "archive", "path": "/data/archive.duckdb", "detached": true },
+  { "alias": "stage", "path": "stage.duckdb", "session": "etl" }
+]
+```
 
-While a run is going, the status bar shows a clock (**DuckDB · 12 s**),
-the editor's ▶ becomes ■, and the results show **Running statement 2 of 5**
-with a **Cancel** button. Any of those, or **grebe: Cancel Running
-Query**, stops it:
+An entry is `{ alias, path, type?, readOnly?, detached?, session? }`:
+`alias` is the name SQL uses (`sales.orders`), `path` a database file
+(relative to the workspace folder) or a connection string, `type` what it
+is when the path does not say (`sqlite`, `mysql`; a `postgresql://` URI is
+`postgres`), `session` the `-- grebe: session NAME` session it belongs to
+(without it, the shared session).
 
-- **The query stops within milliseconds and the session carries on**:
-  `TEMP` tables, `SET` options and in-memory data are all still there. The
-  rest of the run does not run.
-- **A cancelled export leaves nothing behind**: no partial file, and a file
-  you were about to overwrite is left as it was.
-- **`grebe.duckdb.queryTimeout`** cancels any statement that runs longer
-  than that many seconds, if you want a safety net (off by default).
-- Starting a run while another is going offers to cancel the first, rather
-  than quietly queueing behind it.
-- In the rare case DuckDB does not stop within 3 seconds, the session is
-  ended instead and the next run starts a fresh one; the results say so.
-  On **Windows**, where one process cannot interrupt another, cancelling
-  always ends the session this way.
-
-**No stray `duckdb` processes.** Every DuckDB process the extension starts
-ends with it: on a normal shutdown, and also if the editor crashes or is
-force-quit in the middle of a query, when a small watchdog process ends
-them.
-
-## The results grid
-
-Results appear in the **DuckDB Results** view, which starts in the bottom
-panel. One run fills it:
-
-- a **header** line: the file, the statement count, and while it runs, a
-  clock and **Cancel**;
-- a **tab for each result set** (`L2 · 37 rows`), and a **Messages** tab:
-  every statement echoed with its outcome and time, and an error in full,
-  with the line and a caret under the spot DuckDB reported. A run that
-  fails opens on Messages; otherwise on its newest result. When the tabs
-  do not fit, a list beside them names every result with its line, row
-  count and statement, one pick away;
-- the **grid**, filling the rest, with a **filter** above it: type to keep
-  the rows that match, *contains* by default (or *equals*, *starts with*,
-  *regex*), in all columns or one, not case-sensitive. `Cmd/Ctrl+F` jumps
-  to it and `Esc` clears it. It filters the rows loaded; export and Count
-  always work on the whole result;
-- a **status line**: `37 rows × 2 · 3.7 ms`, or `5 of 37 rows match`, and
-  **Count**, **CSV**, **TSV**, **Parquet**, **JSON**.
-
-It is built to be fast. A query shows at most `grebe.duckdb.maxRows` rows
-(10,000 by default) and DuckDB stops producing rows there, so a query that
-returns 5 million rows comes back as fast as one that returns 10,000.
-**Count** asks DuckDB for the full total; **export** writes every row. The
-grid draws only the cells in view, so scrolling stays at the display's
-frame rate at any size.
-
-Put the view wherever suits you:
-
-- **Drag its tab** to the side bar, the secondary side bar, or back to the
-  panel, like any view. It keeps showing the current results when moved.
-- **Open Results in Editor** (the icon in the view's title bar) puts the
-  same results in an editor tab, which can sit in any editor group, split
-  beside your SQL, or be moved into a window of its own (right-click the
-  tab, **Move into New Window**). Both stay in step while open.
-
-In the grid:
-
-- **Select**: click or drag cells; click a **header** for the column
-  (Shift+click or drag across headers for several), a **row number** for
-  the row. Arrows, `Shift`+arrows, `Home`/`End`, `PgUp`/`PgDn` move and
-  extend; `Cmd/Ctrl`+arrows jump to the edge; `Ctrl+Space`/`Shift+Space`
-  select the column/row; `Cmd/Ctrl+A` everything.
-- **Copy**: `Cmd/Ctrl+C` copies tab-separated text that pastes into a
-  spreadsheet, with the column names when whole columns are selected. NULL
-  pastes as an empty cell.
-- **Sort and size**: the **↕** at a header's right edge, or `S` for the
-  active cell's column, sorts ascending, descending, off (NULLs last). Drag a header's edge to resize it,
-  double-click it to fit.
-- **Types** of each column show in its header.
-- **Screen readers** hear the cell you move to with its column and row,
-  how much a Shift+move selects, and each sort and filter.
+- **The Catalog writes it.** Attaching a file or a PostgreSQL database
+  from the Catalog adds an entry. **Detach** sets `"detached": true` and
+  lets go of the database; **Attach Again** clears it. The **X**
+  (Forget) removes the entry, and detaches it if it is attached.
+- **Where.** A new entry goes to the settings that already have
+  `grebe.duckdb.connections` -- workspace folder, workspace or user -- when
+  exactly one of them does; otherwise to your user settings. Entries from
+  all three are read together; for the same alias the more specific one
+  wins. The X removes an entry from every one that has it.
+- **Edit it by hand, and the session follows.** A new entry is attached, a
+  removed or newly detached one is detached, and one whose path, type or
+  `readOnly` changed is detached and attached again. The Catalog is drawn
+  again.
+- **An `ATTACH` in your SQL is not saved.** It lasts as long as the
+  session. In the Catalog such a database has a **Keep** pin, which adds
+  it to the setting as it is attached.
+- **Starting a session never waits for a connection.** The session is
+  ready as soon as DuckDB is. Database files are attached right after,
+  in the background, without asking anything; one that cannot be (a file
+  that moved) says why in the Catalog, with **Attach Again**.
+- **A server is attached when it is first needed**: when a statement you
+  run refers to it (`warehouse.public.orders`, `USE warehouse`), when you
+  open it in the Catalog, or with **Connect**. Only then does a
+  server that wants a password ask for it. Each attach has 20 seconds: a
+  server that does not answer is given up on (PostgreSQL connections are
+  given libpq's `connect_timeout` for that), and the run that needed it
+  goes on and fails with DuckDB's own error. A session runs one statement
+  at a time, so a statement behind an attach waits at most for what is
+  left of those 20 seconds; while a password prompt is open the session
+  is free.
+- **Until then the editor still knows its tables**, from what the
+  [catalog index](#the-catalog-in-the-editor) kept of it last time:
+  completion, the `CAT` checks and the Catalog work without connecting.
+  It shows as *not connected*, and opening it (or **Connect**) connects.
+- **Passwords are never written.** One in a connection string is dropped;
+  the server asks when it needs one, and the answer is used for that
+  attach only.
+- With `grebe.duckdb.reattach: false` nothing is attached when a session
+  starts, files included: each is attached when a statement refers to it
+  or when you ask.
+- An earlier version kept attachments per workspace, out of sight. They
+  are moved to the setting once (to your user settings, unless the rule
+  above says otherwise), and the log says how many.
 
 ## Catalog
 
@@ -306,32 +261,48 @@ into Editor**.
 right-click a `.duckdb` or `.sqlite` file in the Explorer) attaches a file
 to the session, read-only or read-write, under a name taken from the file:
 `warehouse.duckdb` becomes `warehouse`, so `FROM warehouse.orders` works in
-your SQL. **Detach** (on an attached database) lets go of it and leaves it
-in the Catalog as *detached*; **Attach Again** brings it back and **Forget**
-removes it from the list. An attachment is [attached again](#sessions) when
-the session restarts, the same as an `ATTACH` in your own SQL; detach it to
-stop that. The files you browse are kept with the workspace too.
+your SQL, and adds it to [`grebe.duckdb.connections`](#connections).
+
+Every connection in the setting is listed, attached or not:
+
+- *attached*: **Detach** lets go of it and marks it detached; the **X**
+  takes it out of the setting.
+- *detached*, or *not attached* with the reason it could not be: **Attach
+  Again**, or the **X**.
+- *not connected*: a server, attached when first needed. Its tables are
+  listed from the index while it is not connected; opening it, or **Connect**,
+  connects it.
+- *attached when the session starts*: before the session runs.
+
+A database attached by an `ATTACH` in your SQL has a **Keep** pin instead
+of the X: it is not in the setting until you keep it. Table and view
+tooltips give the qualified name, the kind, the row estimate when there is
+one and the number of columns. The files you browse are kept with the
+workspace too.
 
 ### The catalog in the editor
 
 After every run the language server is told which tables, views, columns
 and macros the session holds, so in a `.sql` file:
 
-- **Completion** offers them: tables and views after `FROM` and `JOIN`
-  (with their kind and row estimate), the columns of the tables in the
-  statement wherever a column goes, SELECT-first or FROM-first, and
-  `alias.` or `table.` their columns. A column shows its type, `NOT NULL`
-  and whether it is in a key or an index. Right after a join's `ON` the
-  condition the keys imply comes first (`o.customer_id = c.id`, when one
-  table's key matches a column of the other named for it). In `* EXCLUDE (`,
-  `USING (` and `INSERT INTO t (` only the columns that can go there are
-  offered.
-- **Hover** on a table or view shows its full name, kind, row estimate,
-  keys, indexes and columns with their types; on an alias, the table it
-  stands for; on a column, its type, whether it may be NULL and its place
-  in the keys. Only for a name that is exactly one thing: a column that two
-  of the query's tables have, or a name next to a subquery or a file, has
-  no hover.
+- **Completion** offers them: tables and views after `FROM` and `JOIN`,
+  the columns of the tables in the statement wherever a column goes,
+  SELECT-first or FROM-first, and after `alias.` or `table.` their columns.
+  An item is the name and, for a column, its type. A column two tables
+  have is offered for each, inserted as `alias.column`; a table in more
+  than one schema is offered for each, with `database.schema` beside it.
+  Right after a join's `ON` the condition the keys imply comes first
+  (`o.customer_id = c.id`). In `* EXCLUDE (`, `USING (` and
+  `INSERT INTO t (` only the columns that can go there are offered. At
+  most 200 items come back, the best first; typing narrows the rest.
+- **Hover** on a table, a view or an alias gives one line -- full name,
+  kind, row estimate, primary key -- and its first 20 columns with their
+  types. On a column, one line: `table.column`, its type, `NOT NULL`, and
+  `key`, `unique` or `indexed`. A column is found among the query's
+  catalog tables even beside a CTE, a subquery or a file, unless one of
+  those names a column of the same name too; one that two tables have
+  shows both. A name in more than one schema lists each place. A macro
+  shows its kind; built-in functions have no hover.
 - **Expand \* to columns** (a refactoring in the lightbulb menu, kind
   `refactor.rewrite`) writes a `SELECT *` or `alias.*` out as its columns,
   in table order, qualified when the query reads more than one table, and
@@ -365,18 +336,19 @@ costs its price once and cannot take the rest down with it:
   system schemas (`pg_catalog`, `information_schema`) are not indexed;
   names in them are neither completed nor marked.
 - **Between windows** the index of a foreign database is kept in the
-  editor's storage for the workspace, so its names are there as soon as
-  the connection is attached again. The file is named by a hash of the
-  connection and holds table and column names; the connection string and
-  its password are never written. It is deleted when you **Forget** the
-  connection.
+  editor's storage for the workspace, so its names are there at once,
+  and for a server in `grebe.duckdb.connections` before it is connected
+  at all. The file is named by a hash of the connection and holds table
+  and column names; the connection string and its password are never
+  written. It is kept as long as the setting names the connection, and
+  deleted when it no longer does.
 - **A database of more than 500,000 columns** is left out, alone: the
   Catalog marks it *not in the editor: too large*, the output channel
   says so once, and every other database still completes and is checked.
 - The index also records what DuckDB (or, for PostgreSQL, the server's
   own catalog) knows of each table: whether a column may be NULL, the
   estimated row count, the primary key, unique constraints and indexes.
-  Hover and completion show them, and the join condition comes from them.
+  Hover shows them, and the join condition comes from them.
 
 Reading a database for the editor happens after a run's results are
 shown, never during a run, and one database at a time. A run that starts
@@ -412,6 +384,8 @@ schemas and tables appear in the Catalog as
 
 - **Passwords**: leave it out of the string and grebe asks for it, masked,
   if the server wants one; it is used for that attach and not stored.
+  The connection is added to `grebe.duckdb.connections` without it; in a
+  later session it is attached when first needed, and asks again then.
   `PGPASSWORD` and `~/.pgpass` work too, as for `psql`. A password you do
   give is never shown: the Catalog, the output channel and error messages
   print `password=***`.
@@ -424,6 +398,7 @@ schemas and tables appear in the Catalog as
 
   DuckDB loads the extension for it on its own, unless your `~/.duckdbrc`
   turns off `autoinstall_known_extensions` or `autoload_known_extensions`.
+  It lasts for the session; **Keep** in the Catalog saves it.
 - Row estimates are not shown for PostgreSQL tables: DuckDB has none for
   them. **Count Rows** gives the real number.
 
@@ -496,10 +471,13 @@ timing, and on a failure the whole statement and where DuckDB stopped),
 - `grebe.duckdb.database`: `:memory:` (the default), `:workspace:` (a
   database kept with the workspace, see [Sessions](#sessions)) or a
   database file; relative paths resolve against the workspace folder.
-- `grebe.duckdb.reattach`: attach again what a session had attached when
-  it starts (default on). Off: connections stay listed, detached.
-- `grebe.duckdb.connections`: connections the shared session always lists,
-  as `{ alias, path, type?, readOnly? }` (see [Sessions](#sessions)).
+- `grebe.duckdb.reattach`: attach the database files of
+  `grebe.duckdb.connections` when a session starts (default on). Off:
+  nothing is attached at start; each connection is attached when a
+  statement refers to it or when you ask.
+- `grebe.duckdb.connections`: the connections your sessions attach, as
+  `{ alias, path, type?, readOnly?, detached?, session? }` (see
+  [Connections](#connections)).
 - `grebe.duckdb.catalogInEditor`: give the language server the session's
   tables and columns for completion and the `CAT` checks (default on).
 - `grebe.duckdb.catalogIndex`: keep that database by database, reading a
@@ -520,11 +498,11 @@ timing, and on a failure the whole statement and where DuckDB stopped),
   pointing it at the wrong program gives an error rather than a server that
   never answers. Changing it restarts the server.
 - `grebe.select`: the MOD rules to lint for, same meaning as the CLI's
-  `grebe check --select` flag: only the listed rules run, and any of them
-  that are off by default get turned on. Defaults to `["ALL"]`, every MOD
-  rule there is, so the editor is loud out of the box even though bare
-  `grebe check` on the command line stays quiet, and stays loud as new
-  rules ship. Parse errors (`PRS`) and other-dialect notices (`SRC`) are
+  `grebe check --select` flag. Empty, the default, is the rules that are on
+  by default, as bare `grebe check` runs them. List codes to pick your own
+  set (any that are off by default are turned on), `["FRIENDLY"]` for the
+  friendly-SQL rewrites, or `["ALL"]` for every MOD rule. Parse errors
+  (`PRS`), other-dialect notices (`SRC`) and catalog checks (`CAT`) are
   always shown unless `grebe.toml` sets them to `off` under `[severity]`.
   List codes explicitly to pick a subset instead; the change takes effect
   immediately. A code that doesn't name a real rule is dropped and reported

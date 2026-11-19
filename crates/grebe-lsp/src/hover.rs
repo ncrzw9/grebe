@@ -1,47 +1,53 @@
 //! `textDocument/hover`: what the catalog knows of the name under the
-//! cursor.
+//! cursor, in a line or two.
 //!
 //! - On a table or a view in a FROM (or after `JOIN`, `INTO`, `UPDATE`,
-//!   `DESCRIBE`, ...): its full name, what kind it is, about how many rows
-//!   it holds, its keys and indexes, and its columns with their types.
-//! - On an alias, where it is given or where it is used: the same, for the
-//!   table it stands for.
-//! - On a column: its type, whether it can be NULL, and its place in the
-//!   table's keys and indexes.
+//!   `DESCRIBE`, ...), or on an alias of one: its full name, what kind it
+//!   is, about how many rows it holds and its primary key on one line,
+//!   then its first 20 columns with their types.
+//! - On a name the catalog has in more than one schema or database: each
+//!   place, with its kind and size (the first five, and how many more).
+//! - On a column: one line, `table.column`, its type, NOT NULL, and
+//!   whether it is a key, unique or indexed.
+//! - On a macro the catalog lists: its name and kind.
 //!
 //! The statement is read off its tokens, as completion reads it (see
 //! [`crate::completion`]), so a statement that does not parse still
-//! answers. What is said has to be true, so a name is only described when
-//! it can be one thing:
+//! answers. What is said has to be true:
 //!
-//! - a table name has to be exactly one table of the catalog, and not a
-//!   CTE or a table the file itself creates, alters or drops;
+//! - a table name is not a CTE's or a table the file itself creates,
+//!   alters or drops;
 //! - `alias.column` has to name a relation of the query around it (or of a
-//!   query around that one) which is such a table, and the table has to
-//!   have the column;
-//! - a column with nothing before it has to be a column of exactly one of
-//!   the query's relations, and every one of them has to be a table whose
-//!   columns are known: next to a subquery, a table function or a file, the
-//!   column could be theirs. When no relation of the query has it, the
-//!   query around it is tried the same way. A name the select list also
-//!   gives as an alias, or a lambda's parameter, is left alone.
+//!   query around that one) whose table has the column;
+//! - a column with nothing before it is looked for in the catalog tables
+//!   of the query around it, and when none of them has it, in the query
+//!   around that. Relations whose columns are not known (a subquery, a
+//!   table function, a file) do not stop it: in a query that runs, a name
+//!   one of the tables has is that table's. One that visibly has a column
+//!   of the name does -- a CTE or a subquery whose select list names it,
+//!   columns spelled out in an alias -- and then nothing is said. When two
+//!   tables have it, both are listed. A name the select list also gives
+//!   as an alias, or a lambda's parameter, is left alone.
 //!
-//! Anything else -- no catalog, a keyword, a function, a string, a name
-//! that is not there or is there twice -- has no hover.
+//! Anything else -- no catalog, a keyword, a built-in function, a string,
+//! a name that is not there -- has no hover.
 
-use grebe_rules::catalog::{Catalog, Column, FileContext, Table, quote_ident};
+use grebe_rules::catalog::{Catalog, Column, FileContext, Function, Table, quote_ident};
 use grebe_syntax::Span;
+use grebe_syntax::keyword::Keyword;
 use grebe_syntax::token::{Token, TokenKind};
 
 use crate::completion::{
-    Binding, Blocks, Scope, Target, is_punct, name_of, named_table, rows_text, scope_of,
-    statement_at, table_of, text, upper,
+    Binding, Blocks, Scope, Target, is_punct, matching_paren, name_of, named_tables, scope_of,
+    statement_at, tables_of, text, upper,
 };
 
 /// The most columns a table's hover lists.
-const COLUMN_LIMIT: usize = 40;
+const COLUMN_LIMIT: usize = 20;
 /// The widest a column's name is padded to.
 const NAME_WIDTH: usize = 32;
+/// The most places, or tables with a column, one hover lists.
+const PLACE_LIMIT: usize = 5;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Hover {
@@ -65,56 +71,53 @@ fn qualified(t: &Table) -> String {
         .join(".")
 }
 
-/// A key's columns: `` `id` ``, or ``(`a`, `b`)``.
-fn key_text(key: &[String]) -> String {
-    match key {
-        [one] => code(one),
-        _ => format!(
-            "({})",
-            key.iter().map(|k| code(k)).collect::<Vec<_>>().join(", ")
-        ),
+/// `1240000` as `1.2M`: two digits are all an estimate is good for.
+pub(crate) fn humanize(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
     }
+    const UNITS: [(&str, f64); 4] = [("K", 1e3), ("M", 1e6), ("B", 1e9), ("T", 1e12)];
+    let mut out = n.to_string();
+    for (unit, scale) in UNITS {
+        let v = n as f64 / scale;
+        let shown = if v < 9.95 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.0}")
+        };
+        out = format!("{}{unit}", shown.strip_suffix(".0").unwrap_or(&shown));
+        if shown.parse::<f64>().is_ok_and(|r| r < 1000.0) {
+            break;
+        }
+    }
+    out
 }
 
 fn what(t: &Table) -> &'static str {
     if t.is_view { "view" } else { "table" }
 }
 
-/// The hover of a table, or of `alias` that stands for it.
-fn table_markdown(t: &Table, alias: Option<&str>) -> String {
-    let mut out = String::new();
-    if let Some(a) = alias {
-        out.push_str(&code(&quote_ident(a)));
-        out.push_str(" is ");
+/// `table · ~1.2M rows`, and ` · key: (id)` when `key` is asked for and
+/// known.
+fn summary(t: &Table, key: bool) -> String {
+    let mut out = what(t).to_string();
+    if let Some(n) = t.row_estimate() {
+        out.push_str(&format!(
+            " · ~{} row{}",
+            humanize(n),
+            if n == 1 { "" } else { "s" }
+        ));
     }
-    out.push_str(&code(&qualified(t)));
-    out.push_str(" — ");
-    out.push_str(what(t));
-    if let Some(rows) = rows_text(t) {
-        out.push_str(", ");
-        out.push_str(&rows);
+    if key && !t.primary_key.is_empty() {
+        let cols: Vec<String> = t.primary_key.iter().map(|k| quote_ident(k)).collect();
+        out.push_str(&format!(" · key: ({})", cols.join(", ")));
     }
-    let mut keys: Vec<String> = Vec::new();
-    if !t.primary_key.is_empty() {
-        keys.push(format!("Primary key: {}", key_text(&t.primary_key)));
-    }
-    let list = |keys: &[Vec<String>]| {
-        keys.iter()
-            .map(|k| key_text(k))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if !t.unique.is_empty() {
-        keys.push(format!("Unique: {}", list(&t.unique)));
-    }
-    if !t.indexes.is_empty() {
-        keys.push(format!("Indexes: {}", list(&t.indexes)));
-    }
-    if !keys.is_empty() {
-        out.push_str("\n\n");
-        // Two spaces end a line without ending the paragraph.
-        out.push_str(&keys.join("  \n"));
-    }
+    out
+}
+
+/// The hover of a table.
+fn table_markdown(t: &Table) -> String {
+    let mut out = format!("{} — {}", code(&qualified(t)), summary(t, true));
     if t.columns.is_empty() {
         return out;
     }
@@ -134,63 +137,131 @@ fn table_markdown(t: &Table, alias: Option<&str>) -> String {
         out.push_str(line.trim_end());
         out.push('\n');
     }
-    out.push_str("```");
     let more = t.columns.len() - shown.len();
     if more > 0 {
-        out.push_str(&format!(
-            "\n\n… {more} more column{} ({} in all)",
-            if more == 1 { "" } else { "s" },
-            t.columns.len()
-        ));
+        out.push_str(&format!("… {more} more\n"));
+    }
+    out.push_str("```");
+    out
+}
+
+/// A list, one per line, of at most [`PLACE_LIMIT`] things, and how many
+/// more there are.
+fn lines(all: Vec<String>) -> String {
+    let more = all.len().saturating_sub(PLACE_LIMIT);
+    let mut shown: Vec<String> = all.into_iter().take(PLACE_LIMIT).collect();
+    if more > 0 {
+        shown.push(format!("… and {more} more"));
+    }
+    // Two spaces end a line without ending the paragraph.
+    shown.join("  \n")
+}
+
+/// The hover of a name that is `tables`: one table, or each place of a
+/// name the catalog has more than once.
+fn describe(tables: &[&Table]) -> Option<String> {
+    match tables {
+        [] => None,
+        [one] => Some(table_markdown(one)),
+        _ => Some(lines(
+            tables
+                .iter()
+                .map(|t| format!("{} — {}", code(&qualified(t)), summary(t, false)))
+                .collect(),
+        )),
+    }
+}
+
+/// `BIGINT NOT NULL · key`: a column's type, whether it can be NULL, and
+/// its place in the table's keys.
+fn facts(t: &Table, c: &Column) -> String {
+    let mut out = c.data_type.clone();
+    if c.nullable == Some(false) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("NOT NULL");
+    }
+    let holds = |key: &[String]| key.iter().any(|k| k.eq_ignore_ascii_case(&c.name));
+    let mark = if holds(&t.primary_key) {
+        Some("key")
+    } else if t.unique.iter().any(|k| holds(k)) {
+        Some("unique")
+    } else if t.indexes.iter().any(|k| holds(k)) {
+        Some("indexed")
+    } else {
+        None
+    };
+    if let Some(mark) = mark {
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+        out.push_str(mark);
     }
     out
 }
 
-/// The hover of a column of `t`.
-fn column_markdown(t: &Table, c: &Column) -> String {
-    let mut out = code(&format!(
-        "{}.{}",
-        quote_ident(&t.name),
-        quote_ident(&c.name)
-    ));
-    let mut facts: Vec<String> = Vec::new();
-    if !c.data_type.is_empty() {
-        facts.push(code(&c.data_type));
+/// A table that has the column a name could be.
+struct Hit<'a> {
+    /// The relation of the query it is read through.
+    binding: &'a Binding,
+    table: &'a Table,
+    column: &'a Column,
+    /// How many places of the catalog the relation's name could be.
+    places: usize,
+}
+
+/// The hover of a column `name` that is one of `hits`.
+fn hits_markdown(name: &str, hits: &[Hit]) -> String {
+    if let [hit] = hits {
+        // Of a name in two schemas, which one has it.
+        let table = if hit.places > 1 {
+            qualified(hit.table)
+        } else {
+            quote_ident(&hit.table.name)
+        };
+        let head = code(&format!("{table}.{}", quote_ident(&hit.column.name)));
+        let facts = facts(hit.table, hit.column);
+        return if facts.is_empty() {
+            head
+        } else {
+            format!("{head} {facts}")
+        };
     }
-    match c.nullable {
-        Some(false) => facts.push("NOT NULL".into()),
-        Some(true) => facts.push("nullable".into()),
-        None => {}
-    }
-    if !facts.is_empty() {
-        out.push_str(" — ");
-        out.push_str(&facts.join(", "));
-    }
-    out.push_str(&format!(
-        "\n\nColumn of {} {}.",
-        what(t),
-        code(&qualified(t))
-    ));
-    let holds = |key: &[String]| key.iter().any(|k| k.eq_ignore_ascii_case(&c.name));
-    if holds(&t.primary_key) {
-        out.push_str(&match t.primary_key.len() {
-            1 => " Primary key.".to_string(),
-            _ => format!(" Part of the primary key {}.", key_text(&t.primary_key)),
-        });
-    }
-    for key in t.unique.iter().filter(|k| holds(k)) {
-        out.push_str(&match key.len() {
-            1 => " Unique.".to_string(),
-            _ => format!(" Part of the unique key {}.", key_text(key)),
-        });
-    }
-    for key in t.indexes.iter().filter(|k| holds(k)).take(3) {
-        out.push_str(&match key.len() {
-            1 => " Indexed.".to_string(),
-            _ => format!(" In the index {}.", key_text(key)),
-        });
-    }
-    out
+    let all: Vec<String> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let relation = code(&quote_ident(&h.binding.name));
+            let mut line = if i == 0 {
+                format!("{} — in {relation}", code(&quote_ident(name)))
+            } else {
+                format!("in {relation}")
+            };
+            if h.places > 1 {
+                line.push_str(&format!(" ({})", qualified(h.table)));
+            } else if !h.table.name.eq_ignore_ascii_case(&h.binding.name) {
+                line.push_str(&format!(" ({})", quote_ident(&h.table.name)));
+            }
+            let facts = facts(h.table, h.column);
+            if !facts.is_empty() {
+                line.push(' ');
+                line.push_str(&facts);
+            }
+            line
+        })
+        .collect();
+    lines(all)
+}
+
+/// The hover of a macro the catalog lists.
+fn function_markdown(f: &Function) -> String {
+    let kind = if f.kind.is_empty() {
+        "function".to_string()
+    } else {
+        f.kind.replace('_', " ")
+    };
+    format!("{} — {kind}", code(&f.name))
 }
 
 /// A statement, read for names.
@@ -239,35 +310,157 @@ impl<'a> Reading<'a> {
         None
     }
 
-    /// The one table in reach of token `at` that has a column `name`.
-    fn column(&self, name: &str, at: usize) -> Option<(&'a Table, &'a Column)> {
+    /// The catalog tables in reach of token `at` that have a column
+    /// `name`: those of the innermost query that has one. Empty when none
+    /// has, or when a relation that is not the catalog's visibly has a
+    /// column of that name too.
+    fn column(&self, name: &str, at: usize) -> Vec<Hit<'a>> {
+        let named = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(name));
+        let insert = upper(self.src, self.t.first()) == "INSERT";
         for block in self.blocks.blocks_at(self.src, self.t, at) {
-            let relations = self
-                .blocks
-                .relations(self.src, self.t, &block, self.scope)?;
-            let written = self
+            let mut hits = Vec::new();
+            for b in self
                 .scope
                 .bindings
                 .iter()
-                .filter(|b| b.written && self.blocks.member(b.at, &block));
-            let mut found: Option<(&Table, &Column)> = None;
-            for b in relations.into_iter().chain(written) {
-                let table = table_of(b, self.scope, self.file, self.catalog)?;
-                if table.columns.is_empty() {
-                    return None;
+                .filter(|b| self.blocks.member(b.at, &block))
+            {
+                // What `INSERT INTO t` writes is only named in its list of
+                // columns; the rest of the statement reads other tables.
+                if b.written && insert && self.blocks.parent(at) != Some(b.name_tokens.1) {
+                    continue;
                 }
-                if let Some(c) = table.column(name) {
-                    if found.is_some() {
-                        return None;
+                match &b.target {
+                    Target::Columns(cols) => {
+                        if named(cols) {
+                            return Vec::new();
+                        }
                     }
-                    found = Some((table, c));
+                    Target::Unknown => {
+                        if self.subquery_names(b.at, name) {
+                            return Vec::new();
+                        }
+                    }
+                    Target::Named(parts) => {
+                        let last = parts.last().map(|p| p.to_ascii_lowercase());
+                        if let (1, Some((cols, body))) = (parts.len(), self.scope.cte(&parts[0])) {
+                            let has = match cols {
+                                Some(cols) => named(cols),
+                                None => self.select_names(body, name),
+                            };
+                            if has {
+                                return Vec::new();
+                            }
+                            continue;
+                        }
+                        if let Some(local) = last.and_then(|l| self.file.local.get(&l)) {
+                            if local.columns.as_deref().is_some_and(named) {
+                                return Vec::new();
+                            }
+                            continue;
+                        }
+                        let tables = named_tables(parts, self.scope, self.file, self.catalog);
+                        for table in &tables {
+                            if let Some(column) = table.column(name) {
+                                hits.push(Hit {
+                                    binding: b,
+                                    table,
+                                    column,
+                                    places: tables.len(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
-            if found.is_some() {
-                return found;
+            if !hits.is_empty() {
+                return hits;
             }
         }
-        None
+        Vec::new()
+    }
+
+    /// Does the subquery the relation at token `at` is (`(SELECT ...)`,
+    /// `LATERAL (SELECT ...)`) name a column `name` in its select list?
+    fn subquery_names(&self, at: usize, name: &str) -> bool {
+        let open = if upper(self.src, self.t.get(at)) == "LATERAL" {
+            at + 1
+        } else {
+            at
+        };
+        is_punct(self.src, self.t.get(open), "(") && self.select_names(open, name)
+    }
+
+    /// Does the query in the parentheses at token `open` name a column
+    /// `name` in its (first) select list: as a column, `x.name`, or as an
+    /// alias? A `*` names nothing here.
+    fn select_names(&self, open: usize, name: &str) -> bool {
+        let Some(close) = matching_paren(self.src, self.t, open) else {
+            return false;
+        };
+        let direct: Vec<usize> = (open + 1..close)
+            .filter(|&i| self.blocks.parent(i) == Some(open))
+            .collect();
+        let Some(select) = direct
+            .iter()
+            .position(|&i| upper(self.src, self.t.get(i)) == "SELECT")
+        else {
+            return false;
+        };
+        let mut item: Vec<usize> = Vec::new();
+        let mut items: Vec<Vec<usize>> = Vec::new();
+        for &i in &direct[select + 1..] {
+            let tok = &self.t[i];
+            if is_punct(self.src, Some(tok), ",") {
+                items.push(std::mem::take(&mut item));
+                continue;
+            }
+            let word = upper(self.src, Some(tok));
+            if matches!(
+                word.as_str(),
+                "FROM"
+                    | "WHERE"
+                    | "GROUP"
+                    | "HAVING"
+                    | "ORDER"
+                    | "LIMIT"
+                    | "OFFSET"
+                    | "QUALIFY"
+                    | "WINDOW"
+                    | "UNION"
+                    | "EXCEPT"
+                    | "INTERSECT"
+                    | "INTO"
+            ) {
+                break;
+            }
+            if item.is_empty() && matches!(word.as_str(), "DISTINCT" | "ALL") {
+                continue;
+            }
+            item.push(i);
+        }
+        items.push(item);
+        items.iter().any(|item| {
+            let Some(&last) = item.last() else {
+                return false;
+            };
+            let tok = &self.t[last];
+            let reserved = tok.kind == TokenKind::Word
+                && grebe_syntax::grammar::classify_keyword(text(self.src, tok))
+                    .has(Keyword::RESERVED);
+            if reserved || !name_of(self.src, tok).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+                return false;
+            }
+            // The name alone, `x.name`, `... AS name`, `expr name`; not the
+            // last operand of `a + name` or `x::name`.
+            match item.len().checked_sub(2).map(|p| &self.t[item[p]]) {
+                None => true,
+                Some(prev) if prev.kind == TokenKind::Punct => {
+                    matches!(text(self.src, prev), "." | ")" | "]")
+                }
+                Some(_) => true,
+            }
+        })
     }
 
     /// Is `name` something other than a column where it stands alone: an
@@ -304,7 +497,7 @@ impl<'a> Reading<'a> {
                     // A plain name: `total t`.
                     return true;
                 }
-                if class.has(grebe_syntax::keyword::Keyword::RESERVED) {
+                if class.has(Keyword::RESERVED) {
                     return false;
                 }
                 // A word that is a keyword and can be a name (`name`,
@@ -345,8 +538,7 @@ pub fn hover(src: &str, offset: u32, catalog: &Catalog) -> Option<Hover> {
     let token = t[k];
     let reserved = |tok: &Token| {
         tok.kind == TokenKind::Word
-            && grebe_syntax::grammar::classify_keyword(text(src, tok))
-                .has(grebe_syntax::keyword::Keyword::RESERVED)
+            && grebe_syntax::grammar::classify_keyword(text(src, tok)).has(Keyword::RESERVED)
     };
     if reserved(&token) {
         return None;
@@ -389,22 +581,25 @@ pub fn hover(src: &str, offset: u32, catalog: &Catalog) -> Option<Hover> {
     // A table where a FROM names it, or its alias there.
     for b in &scope.bindings {
         if b.alias == Some(k) {
-            let table = table_of(b, &scope, &file, catalog)?;
-            return answer(table_markdown(table, Some(&b.name)));
+            return describe(&tables_of(b, &scope, &file, catalog)).and_then(answer);
         }
         if b.name_tokens.0 <= k && k < b.name_tokens.1 {
             if k + 1 != b.name_tokens.1 {
                 return None;
             }
-            let table = table_of(b, &scope, &file, catalog)?;
-            return answer(table_markdown(table, None));
+            return describe(&tables_of(b, &scope, &file, catalog)).and_then(answer);
         }
     }
-    // A function, or a name before a string (`DATE '2026-01-01'`).
-    if part == last
-        && (is_punct(src, t.get(hi + 1), "(")
-            || t.get(hi + 1).is_some_and(|n| n.kind == TokenKind::String))
-    {
+    // A function: a macro the catalog lists, and nothing for a built-in.
+    // Nor for a name before a string (`DATE '2026-01-01'`).
+    if part == last && is_punct(src, t.get(hi + 1), "(") {
+        let name = &chain[last];
+        let f = catalog
+            .functions()
+            .find(|f| f.name.eq_ignore_ascii_case(name))?;
+        return answer(function_markdown(f));
+    }
+    if part == last && t.get(hi + 1).is_some_and(|n| n.kind == TokenKind::String) {
         return None;
     }
     // A table a statement names without a FROM.
@@ -415,21 +610,32 @@ pub fn hover(src: &str, offset: u32, catalog: &Catalog) -> Option<Hover> {
             "TABLE" | "DESCRIBE" | "SUMMARIZE" | "TRUNCATE"
         )
     {
-        let table = named_table(&chain, &scope, &file, catalog)?;
-        return answer(table_markdown(table, None));
+        return describe(&named_tables(&chain, &scope, &file, catalog)).and_then(answer);
     }
 
     if part > 0 {
         // `relation.column`; or the table in `schema.table.column`.
         if let Some(b) = reading.relation(&chain[..part], k) {
-            let table = table_of(b, &scope, &file, catalog)?;
-            let column = table.column(&chain[part])?;
-            return answer(column_markdown(table, column));
+            let tables = tables_of(b, &scope, &file, catalog);
+            let hits: Vec<Hit> = tables
+                .iter()
+                .filter_map(|table| {
+                    table.column(&chain[part]).map(|column| Hit {
+                        binding: b,
+                        table,
+                        column,
+                        places: tables.len(),
+                    })
+                })
+                .collect();
+            if hits.is_empty() {
+                return None;
+            }
+            return answer(hits_markdown(&chain[part], &hits));
         }
         if part < last {
             let b = reading.relation(&chain[..=part], k)?;
-            let table = table_of(b, &scope, &file, catalog)?;
-            return answer(table_markdown(table, None));
+            return describe(&tables_of(b, &scope, &file, catalog)).and_then(answer);
         }
         return None;
     }
@@ -456,18 +662,16 @@ pub fn hover(src: &str, offset: u32, catalog: &Catalog) -> Option<Hover> {
     }
     let relation = reading.relation(std::slice::from_ref(name), k);
     let shadowed = reading.shadowed(name);
-    let column = if shadowed {
-        None
+    let hits = if shadowed {
+        Vec::new()
     } else {
         reading.column(name, k)
     };
-    match (relation, column) {
-        (Some(b), None) if last > 0 || !shadowed => {
-            let table = table_of(b, &scope, &file, catalog)?;
-            let alias = (!table.name.eq_ignore_ascii_case(&b.name)).then_some(b.name.as_str());
-            answer(table_markdown(table, alias))
+    match (relation, hits.is_empty()) {
+        (Some(b), true) if last > 0 || !shadowed => {
+            describe(&tables_of(b, &scope, &file, catalog)).and_then(answer)
         }
-        (None, Some((table, c))) => answer(column_markdown(table, c)),
+        (None, false) => answer(hits_markdown(name, &hits)),
         _ => None,
     }
 }
@@ -519,9 +723,7 @@ pub(crate) mod tests {
     fn a_table_says_what_the_catalog_knows_of_it() {
         assert_eq!(
             at("SELECT * FROM ord|ers").unwrap(),
-            "`shop.main.orders` — table, about 1.24 million rows\n\n\
-             Primary key: `id`  \n\
-             Indexes: (`customer_id`, `placed`)\n\n\
+            "`shop.main.orders` — table · ~1.2M rows · key: (id)\n\n\
              ```text\n\
              id           BIGINT NOT NULL\n\
              customer_id  BIGINT NOT NULL\n\
@@ -532,10 +734,8 @@ pub(crate) mod tests {
         );
         let customers = at("FROM orders o JOIN main.custo|mers c ON true").unwrap();
         assert!(
-            customers.starts_with(
-                "`shop.main.customers` — table, about 2.5 thousand rows\n\n\
-                 Primary key: `id`  \nUnique: `email`\n\n"
-            ),
+            customers
+                .starts_with("`shop.main.customers` — table · ~2.5K rows · key: (id)\n\n```text\n"),
             "{customers}"
         );
         // A view has no size and no keys.
@@ -548,59 +748,70 @@ pub(crate) mod tests {
         let items = at("TRUNCATE order_items|").unwrap();
         assert!(
             items.starts_with(
-                "`shop.main.order_items` — table, about 3 rows\n\n\
-                 Primary key: (`order_id`, `line_no`)\n\n"
+                "`shop.main.order_items` — table · ~3 rows · key: (order_id, line_no)\n\n"
             ),
             "{items}"
         );
         assert!(
             at("FROM sto|ck")
                 .unwrap()
-                .starts_with("`shop.main.stock` — table, about 0 rows\n\n```")
+                .starts_with("`shop.main.stock` — table · ~0 rows\n\n```")
         );
+    }
+
+    #[test]
+    fn sizes_are_short() {
+        for (n, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1K"),
+            (2500, "2.5K"),
+            (9_960, "10K"),
+            (999_999, "1M"),
+            (1_240_000, "1.2M"),
+            (3_400_000, "3.4M"),
+            (12_000_000_000, "12B"),
+            (5_000_000_000_000_000, "5000T"),
+        ] {
+            assert_eq!(humanize(n), text, "{n}");
+        }
     }
 
     #[test]
     fn an_alias_is_the_table_it_stands_for() {
         let given = at("SELECT o.id FROM orders AS o|").unwrap();
         assert!(
-            given.starts_with("`o` is `shop.main.orders` — table, about 1.24 million rows"),
+            given.starts_with("`shop.main.orders` — table · ~1.2M rows · key: (id)\n"),
             "{given}"
         );
         let used = at("SELECT o|.id FROM orders o").unwrap();
         assert_eq!(used, given);
         // The table's own name, used as one, is just the table.
         let own = at("SELECT orde|rs.id FROM orders").unwrap();
-        assert!(own.starts_with("`shop.main.orders` — table"), "{own}");
+        assert_eq!(own, given);
     }
 
     #[test]
-    fn a_column_says_its_type_and_its_keys() {
+    fn a_column_is_one_line_of_its_type_and_its_keys() {
         assert_eq!(
             at("SELECT o.customer_|id FROM orders o").unwrap(),
-            "`orders.customer_id` — `BIGINT`, NOT NULL\n\n\
-             Column of table `shop.main.orders`. In the index (`customer_id`, `placed`)."
+            "`orders.customer_id` BIGINT NOT NULL · indexed"
         );
         assert_eq!(
             at("SELECT ema|il FROM customers").unwrap(),
-            "`customers.email` — `VARCHAR`, NOT NULL\n\n\
-             Column of table `shop.main.customers`. Unique."
+            "`customers.email` VARCHAR NOT NULL · unique"
         );
         assert_eq!(
             at("SELECT 1 FROM order_items i WHERE i.line_no| = 1").unwrap(),
-            "`order_items.line_no` — `INTEGER`, NOT NULL\n\n\
-             Column of table `shop.main.order_items`. \
-             Part of the primary key (`order_id`, `line_no`)."
+            "`order_items.line_no` INTEGER NOT NULL · key"
         );
         assert_eq!(
             at("SELECT \"Order No|te\" FROM orders").unwrap(),
-            "`orders.\"Order Note\"` — `VARCHAR`, nullable\n\n\
-             Column of table `shop.main.orders`."
+            "`orders.\"Order Note\"` VARCHAR"
         );
         assert_eq!(
             at("SELECT tot|al FROM big_orders").unwrap(),
-            "`big_orders.total` — `DECIMAL(10,2)`, nullable\n\n\
-             Column of view `shop.main.big_orders`."
+            "`big_orders.total` DECIMAL(10,2)"
         );
         // Through the table's name, with its schema, and FROM-first.
         assert!(at("SELECT main.orders.pla|ced FROM main.orders").is_some());
@@ -630,23 +841,74 @@ pub(crate) mod tests {
         // Each side of a UNION is its own query.
         let second = at("SELECT id FROM orders UNION ALL SELECT i|d FROM customers").unwrap();
         assert!(second.starts_with("`customers.id`"), "{second}");
+        // What `INSERT INTO` writes is in its column list only.
+        assert_eq!(
+            at("INSERT INTO stock (ware|house) SELECT sku FROM order_items").unwrap(),
+            "`stock.warehouse` VARCHAR"
+        );
+        assert_eq!(
+            at("INSERT INTO stock SELECT order_i|d, line_no, sku FROM order_items").unwrap(),
+            "`order_items.order_id` BIGINT NOT NULL · key"
+        );
+        assert_eq!(
+            at("UPDATE stock SET warehouse = 'x' WHERE order_i|d = 1").unwrap(),
+            "`stock.order_id` BIGINT"
+        );
+    }
+
+    #[test]
+    fn a_column_two_tables_have_is_listed_for_each() {
+        assert_eq!(
+            at("SELECT i|d FROM orders o JOIN customers c ON true").unwrap(),
+            "`id` — in `o` (orders) BIGINT NOT NULL · key  \n\
+             in `c` (customers) BIGINT NOT NULL · key"
+        );
+        // A table joined to itself, under its own name and another.
+        assert_eq!(
+            at("SELECT plac|ed FROM orders JOIN orders b ON true").unwrap(),
+            "`placed` — in `orders` TIMESTAMP NOT NULL · indexed  \n\
+             in `b` (orders) TIMESTAMP NOT NULL · indexed"
+        );
+    }
+
+    #[test]
+    fn a_relation_whose_columns_are_not_known_does_not_stop_a_column() {
+        let total = Some("`orders.total` DECIMAL(10,2)".to_string());
+        for sql in [
+            "SELECT tot|al FROM orders, read_csv('x.csv')",
+            "SELECT tot|al FROM orders, 'totals.csv'",
+            "SELECT tot|al FROM orders JOIN LATERAL (SELECT 1) l ON true",
+            "SELECT tot|al FROM orders, (SELECT 1 AS other) s",
+            "SELECT tot|al FROM orders, (SELECT total + 1 FROM stock) s",
+            "WITH w AS (SELECT 1 AS other) SELECT tot|al FROM orders, w",
+            "SELECT tot|al FROM orders, range(3) r(i)",
+            "SELECT tot|al FROM orders, unknown_table",
+            "CREATE TABLE made AS SELECT 1;\nSELECT tot|al FROM orders, made",
+        ] {
+            assert_eq!(at(sql), total, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_relation_that_visibly_has_the_column_too_stops_it() {
+        for sql in [
+            "WITH w AS (SELECT 1 AS total) SELECT tot|al FROM orders, w",
+            "WITH w AS (SELECT o.total FROM orders o) SELECT tot|al FROM orders, w",
+            "WITH w AS (SELECT DISTINCT total FROM orders) SELECT tot|al FROM orders, w",
+            "WITH w AS (SELECT count(*) total FROM orders) SELECT tot|al FROM orders, w",
+            "WITH w(total) AS (SELECT 1) SELECT tot|al FROM orders, w",
+            "SELECT tot|al FROM orders, (SELECT 1 AS total) s",
+            "SELECT tot|al FROM orders, (SELECT 1 AS x, \"total\" FROM stock) s",
+            "SELECT tot|al FROM orders JOIN LATERAL (SELECT 1 AS total) l ON true",
+            "SELECT tot|al FROM orders, range(3) r(total)",
+            "CREATE TABLE made (total INT);\nSELECT tot|al FROM orders, made",
+        ] {
+            assert_eq!(at(sql), None, "{sql}");
+        }
     }
 
     #[test]
     fn nothing_is_said_of_what_could_be_two_things() {
-        // In both tables.
-        assert_eq!(
-            at("SELECT i|d FROM orders o JOIN customers c ON true"),
-            None
-        );
-        // Next to something whose columns are not known.
-        assert_eq!(at("SELECT tot|al FROM orders, (SELECT 1 AS total) s"), None);
-        assert_eq!(at("SELECT tot|al FROM orders, read_csv('x.csv')"), None);
-        assert_eq!(
-            at("SELECT tot|al FROM orders JOIN LATERAL (SELECT 1) l ON true"),
-            None
-        );
-        assert_eq!(at("SELECT tot|al FROM orders, 'totals.csv'"), None);
         // An alias of the select list, or a lambda's parameter.
         assert_eq!(
             at("SELECT placed AS total FROM orders ORDER BY tot|al"),
@@ -692,6 +954,7 @@ pub(crate) mod tests {
     fn nothing_is_said_of_keywords_functions_strings_and_names_being_given() {
         assert_eq!(at("SEL|ECT id FROM orders"), None);
         assert_eq!(at("SELECT total|(1) FROM orders"), None);
+        assert_eq!(at("SELECT upp|er(email) FROM customers"), None);
         assert_eq!(at("SELECT 'tot|al' FROM orders"), None);
         // A file name is the editor's own hover, not this one.
         assert_eq!(at("SELECT * FROM 'ord|ers.csv'"), None);
@@ -708,20 +971,81 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_name_in_two_databases_is_not_guessed() {
-        let two = Catalog::from_json_text(
-            r#"[
-            {"database":"a","schema":"main","table":"t","column":"x","type":"INT"},
-            {"database":"b","schema":"main","table":"t","column":"x","type":"INT"}
-            ]"#,
+    fn a_macro_of_the_catalog_says_what_kind_it_is() {
+        let cat = Catalog::from_json_text(
+            r#"{"columns": [
+            {"database":"d","schema":"main","table":"t","column":"x","type":"INT"}],
+            "functions": [{"name":"add1","kind":"macro"},{"name":"series","kind":"table_macro"}]}"#,
         )
         .unwrap();
-        assert_eq!(hover("SELECT x FROM t", 14, &two), None);
-        assert_eq!(hover("SELECT x FROM t", 7, &two), None);
+        let at = |sql: &str| {
+            let offset = sql.find('|').unwrap();
+            hover(&sql.replacen('|', "", 1), offset as u32, &cat).map(|h| h.contents)
+        };
+        assert_eq!(at("SELECT add|1(x) FROM t").unwrap(), "`add1` — macro");
+        assert_eq!(at("SELECT ADD1|(x) FROM t").unwrap(), "`add1` — macro");
+        assert_eq!(at("FROM ser|ies(3)").unwrap(), "`series` — table macro");
+        // A built-in, or a macro's name used as something else.
+        assert_eq!(at("SELECT upp|er(x) FROM t"), None);
+        assert_eq!(at("SELECT add|1 FROM t"), None);
+    }
+
+    #[test]
+    fn a_name_in_two_schemas_lists_each_place() {
+        let mut rows = vec![
+            r#"{"database":"pg","schema":"public","table":"orders","column":"id","type":"INTEGER","nullable":false}"#.to_string(),
+            r#"{"database":"pg","schema":"staging","table":"orders","column":"id","type":"INTEGER","kind":"view"}"#.to_string(),
+            r#"{"database":"pg","schema":"staging","table":"orders","column":"note","type":"VARCHAR","kind":"view"}"#.to_string(),
+        ];
+        for s in 0..7 {
+            rows.push(format!(
+                r#"{{"database":"pg","schema":"s{s}","table":"events","column":"x","type":"INT"}}"#
+            ));
+        }
+        let cat = Catalog::from_json_text(&format!(
+            r#"{{"columns": [{}], "tables": [
+            {{"database":"pg","schema":"public","table":"orders","kind":"table","rows":1240000,"primary_key":["id"]}}]}}"#,
+            rows.join(",")
+        ))
+        .unwrap();
+        let at = |sql: &str| {
+            let offset = sql.find('|').unwrap();
+            hover(&sql.replacen('|', "", 1), offset as u32, &cat).map(|h| h.contents)
+        };
+        assert_eq!(
+            at("SELECT id FROM ord|ers o").unwrap(),
+            "`pg.public.orders` — table · ~1.2M rows  \n`pg.staging.orders` — view"
+        );
+        assert_eq!(
+            at("SELECT o|.id FROM orders o").unwrap(),
+            at("SELECT id FROM ord|ers o").unwrap()
+        );
+        assert_eq!(
+            at("DESCRIBE eve|nts").unwrap(),
+            "`pg.s0.events` — table  \n`pg.s1.events` — table  \n`pg.s2.events` — table  \n\
+             `pg.s3.events` — table  \n`pg.s4.events` — table  \n… and 2 more"
+        );
+        // A column of it: each place that has it.
+        assert_eq!(
+            at("SELECT i|d FROM orders o").unwrap(),
+            "`id` — in `o` (pg.public.orders) INTEGER NOT NULL · key  \n\
+             in `o` (pg.staging.orders) INTEGER"
+        );
+        assert_eq!(
+            at("SELECT o.i|d FROM orders o").unwrap(),
+            at("SELECT i|d FROM orders o").unwrap()
+        );
+        assert_eq!(
+            at("SELECT not|e FROM orders").unwrap(),
+            "`pg.staging.orders.note` VARCHAR"
+        );
         // Said which, it is one.
-        let one = hover("SELECT x FROM a.t", 16, &two).unwrap();
-        assert!(one.contents.starts_with("`a.main.t` — table"), "{one:?}");
-        assert_eq!(one.span, Span::new(16, 17));
+        assert_eq!(
+            at("SELECT i|d FROM public.orders").unwrap(),
+            "`orders.id` INTEGER NOT NULL · key"
+        );
+        let one = at("SELECT id FROM staging.ord|ers").unwrap();
+        assert!(one.starts_with("`pg.staging.orders` — view\n\n"), "{one}");
     }
 
     #[test]
@@ -739,8 +1063,7 @@ pub(crate) mod tests {
             h.starts_with("`d.main.wide` — table\n\n```text\nc0   INT\n"),
             "{h}"
         );
-        assert!(h.contains("\nc39  INT\n```"), "{h}");
-        assert!(!h.contains("c40"), "{h}");
-        assert!(h.ends_with("\n\n… 5 more columns (45 in all)"), "{h}");
+        assert!(h.ends_with("\nc19  INT\n… 25 more\n```"), "{h}");
+        assert!(!h.contains("c20"), "{h}");
     }
 }

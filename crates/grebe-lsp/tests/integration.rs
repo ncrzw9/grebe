@@ -1193,10 +1193,9 @@ fn completion_offers_the_catalogs_names() {
         .and_then(|m| m.get("result")?.get("items")?.as_array()?.first().cloned())
         .unwrap();
     assert_eq!(first.get("kind").and_then(Json::as_f64), Some(5.0));
-    assert_eq!(
-        first.get("detail").and_then(Json::as_str),
-        Some("BIGINT · orders")
-    );
+    // A column's detail is its type, and nothing else.
+    assert_eq!(first.get("detail").and_then(Json::as_str), Some("BIGINT"));
+    assert!(first.get("documentation").is_none());
 }
 
 /// The nearest name is a quick fix in the editor.
@@ -1569,7 +1568,7 @@ fn hover_describes_tables_aliases_and_columns_from_the_catalog() {
         hover_request(4, uri, 0, 16),
         // `c.email`.
         hover_request(5, uri, 0, 19),
-        // `customers` in two databases, and its column.
+        // `customers` in two databases, and its column: each place.
         hover_request(6, uri, 1, 17),
         hover_request(7, uri, 1, 7),
         // A column the table does not have; a keyword.
@@ -1580,9 +1579,7 @@ fn hover_describes_tables_aliases_and_columns_from_the_catalog() {
     ]);
     assert_eq!(
         hover_text(&messages, 2.0).unwrap(),
-        "`shop.main.orders` — table, about 1.24 million rows\n\n\
-         Primary key: `id`  \n\
-         Indexes: `customer_id`\n\n\
+        "`shop.main.orders` — table · ~1.2M rows · key: (id)\n\n\
          ```text\n\
          id           BIGINT NOT NULL\n\
          customer_id  BIGINT NOT NULL\n\
@@ -1591,25 +1588,146 @@ fn hover_describes_tables_aliases_and_columns_from_the_catalog() {
     );
     assert_eq!(
         hover_text(&messages, 3.0).unwrap(),
-        "`orders.total` — `DECIMAL(10,2)`, nullable\n\n\
-         Column of table `shop.main.orders`."
+        "`orders.total` DECIMAL(10,2)"
     );
     assert!(
         hover_text(&messages, 4.0)
             .unwrap()
-            .starts_with("`c` is `shop.main.customers` — table, about 2.5 thousand rows"),
+            .starts_with("`shop.main.customers` — table · ~2.5K rows · key: (id)\n"),
     );
     assert_eq!(
         hover_text(&messages, 5.0).unwrap(),
-        "`customers.email` — `VARCHAR`, NOT NULL\n\n\
-         Column of table `shop.main.customers`. Unique."
+        "`customers.email` VARCHAR NOT NULL · unique"
     );
-    for id in [6.0, 7.0, 8.0, 9.0, 10.0] {
+    assert_eq!(
+        hover_text(&messages, 6.0).unwrap(),
+        "`shop.main.customers` — table · ~2.5K rows  \n`other.main.customers` — table"
+    );
+    assert_eq!(
+        hover_text(&messages, 7.0).unwrap(),
+        "`id` — in `customers` (shop.main.customers) BIGINT NOT NULL · key  \n\
+         in `customers` (other.main.customers) INTEGER"
+    );
+    for id in [8.0, 9.0, 10.0] {
         assert_eq!(hover_text(&messages, id), None, "request {id}");
     }
     // The hover's range is the name.
     let range = result_of(&messages, 3.0).get("range").cloned().unwrap();
     assert_eq!(range, lsp_range((0, 9), (0, 14)));
+}
+
+/// Hover in queries as they are written: beside a CTE, a subquery or a
+/// file; over a table in two schemas; on a name two tables have; on a
+/// macro.
+#[test]
+fn hover_answers_in_real_queries() {
+    let uri = "file:///hover/real.sql";
+    let sql = "WITH recent AS (SELECT 1 AS n) SELECT total FROM orders, recent, 'x.csv';\n\
+               WITH recent AS (SELECT 1 AS total) SELECT total FROM orders, recent;\n\
+               SELECT id FROM orders o JOIN events e ON true;\n\
+               SELECT add1(total) FROM orders;\n\
+               SELECT upper(email) FROM customers c;";
+    let messages = run_session(&[
+        catalog_message(
+            r#"{"columns": [
+{"database":"pg","schema":"public","table":"orders","column":"id","type":"BIGINT","nullable":false},
+{"database":"pg","schema":"public","table":"orders","column":"total","type":"NUMERIC","nullable":true},
+{"database":"pg","schema":"public","table":"events","column":"id","type":"BIGINT","nullable":false},
+{"database":"pg","schema":"staging","table":"events","column":"id","type":"INTEGER","nullable":true},
+{"database":"pg","schema":"public","table":"customers","column":"email","type":"TEXT","nullable":true}],
+"tables": [
+{"database":"pg","schema":"public","table":"orders","kind":"table","rows":3400000,"primary_key":["id"]},
+{"database":"pg","schema":"public","table":"events","kind":"table","rows":12000000000},
+{"database":"pg","schema":"staging","table":"events","kind":"view"}],
+"functions": [{"name":"add1","kind":"macro"}]}"#,
+        ),
+        did_open(uri, sql),
+        // `total` beside a CTE that does not have it, and a file.
+        hover_request(2, uri, 0, 39),
+        // `total` beside a CTE that has it.
+        hover_request(3, uri, 1, 42),
+        // `events`, in two schemas.
+        hover_request(4, uri, 2, 34),
+        // `id`, in `orders` and in both `events`.
+        hover_request(5, uri, 2, 7),
+        // A macro, and a built-in function.
+        hover_request(6, uri, 3, 8),
+        hover_request(7, uri, 4, 8),
+    ]);
+    assert_eq!(
+        hover_text(&messages, 2.0).unwrap(),
+        "`orders.total` NUMERIC"
+    );
+    assert_eq!(hover_text(&messages, 3.0), None);
+    assert_eq!(
+        hover_text(&messages, 4.0).unwrap(),
+        "`pg.public.events` — table · ~12B rows  \n`pg.staging.events` — view"
+    );
+    assert_eq!(
+        hover_text(&messages, 5.0).unwrap(),
+        "`id` — in `o` (orders) BIGINT NOT NULL · key  \n\
+         in `e` (pg.public.events) BIGINT NOT NULL  \n\
+         in `e` (pg.staging.events) INTEGER"
+    );
+    assert_eq!(hover_text(&messages, 6.0).unwrap(), "`add1` — macro");
+    assert_eq!(hover_text(&messages, 7.0), None);
+}
+
+/// Completion is a name and a type, at most 200 items, the best first.
+#[test]
+fn completion_is_short_and_capped() {
+    let uri = "file:///catalog/cap.sql";
+    let columns: Vec<String> = (0..300)
+        .map(|c| {
+            format!(r#"{{"schema":"public","table":"wide","column":"c{c:03}","type":"INTEGER"}}"#)
+        })
+        .collect();
+    let messages = run_session(&[
+        catalog_message(&format!(
+            r#"{{"database":"pg","columns":[{},
+            {{"schema":"public","table":"other","column":"c000","type":"TEXT"}}]}}"#,
+            columns.join(",")
+        )),
+        did_open(
+            uri,
+            "SELECT  FROM wide;\nSELECT c00 FROM wide w JOIN other o ON true;",
+        ),
+        completion_request(2, uri, 0, 7),
+        completion_request(3, uri, 1, 10),
+    ]);
+    let result = result_of(&messages, 2.0);
+    assert_eq!(result.get("isIncomplete"), Some(&Json::Bool(true)));
+    let items = result.get("items").and_then(Json::as_array).unwrap();
+    assert_eq!(items.len(), 200);
+    assert_eq!(items[0].get("label").and_then(Json::as_str), Some("c000"));
+    assert_eq!(items[199].get("label").and_then(Json::as_str), Some("c199"));
+    for i in items {
+        let keys: Vec<&str> = match i {
+            Json::Object(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+            _ => panic!("an item is an object"),
+        };
+        assert_eq!(keys, ["label", "kind", "sortText", "detail"], "{i:?}");
+        assert_eq!(i.get("detail").and_then(Json::as_str), Some("INTEGER"));
+    }
+    // A name both tables have: one item each, inserted qualified.
+    let shared: Vec<(String, String, String)> = result_of(&messages, 3.0)
+        .get("items")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .filter(|i| i.get("label").and_then(Json::as_str) == Some("c000"))
+        .map(|i| {
+            let s = |k: &str| i.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+            (s("label"), s("detail"), s("insertText"))
+        })
+        .collect();
+    assert_eq!(
+        shared,
+        [
+            ("c000".into(), "INTEGER · w".into(), "w.c000".into()),
+            ("c000".into(), "TEXT · o".into(), "o.c000".into()),
+        ]
+    );
 }
 
 #[test]
@@ -1625,7 +1743,7 @@ fn hover_says_nothing_without_a_catalog() {
 }
 
 #[test]
-fn completion_shows_types_keys_and_sizes_and_offers_the_join() {
+fn completion_shows_types_and_offers_the_join() {
     let uri = "file:///catalog/meta.sql";
     let messages = run_session(&[
         catalog_message(SHOP_META),
@@ -1656,25 +1774,23 @@ fn completion_shows_types_keys_and_sizes_and_offers_the_join() {
     let join = items(2.0);
     assert_eq!(
         join[0],
-        (
-            "o.customer_id = c.id".to_string(),
-            "join · primary key of customers".to_string()
-        )
+        ("o.customer_id = c.id".to_string(), "join".to_string())
     );
     assert!(
-        join.contains(&(
-            "email".to_string(),
-            "VARCHAR NOT NULL · unique · customers".to_string()
-        )),
+        join.contains(&("email".to_string(), "VARCHAR".to_string())),
         "{join:?}"
     );
-    assert_eq!(
-        items(3.0),
-        [(
-            "orders".to_string(),
-            "table · shop.main · about 1.24 million rows".to_string()
-        )]
+    // `id` is in both tables: one item for each, with where it is from.
+    assert!(
+        join.contains(&("id".to_string(), "BIGINT · o".to_string())),
+        "{join:?}"
     );
+    assert!(
+        join.contains(&("id".to_string(), "BIGINT · c".to_string())),
+        "{join:?}"
+    );
+    // A table: its name alone.
+    assert_eq!(items(3.0), [("orders".to_string(), String::new())]);
 }
 
 #[test]

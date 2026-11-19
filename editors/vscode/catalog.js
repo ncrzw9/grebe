@@ -11,12 +11,17 @@
 // collapsed (one database shows its schemas; a lone `main` shows its
 // tables) to keep the tree short.
 //
-// The catalog is kept from one window to the next: what is attached to a
-// session is attached again when the session restarts (sessions.js), an
-// attachment that could not be brought back stays listed with the reason,
-// and the files being browsed are browsed again. When files run in sessions
-// of their own (`-- grebe: session NAME`), every running session has a root
-// here; the one the file in front uses is the open one.
+// The connections of a session are the entries of the
+// `grebe.duckdb.connections` setting (connectionSettings.js): attaching
+// from here adds one, Detach marks it detached, Attach Again clears that,
+// Forget (the X) takes it out, and a database attached by an ATTACH in SQL
+// can be kept with Keep. A connection that is not attached is listed all
+// the same: detached, not attached (with the reason), or, for a server that
+// is attached when first needed, not connected, with what the catalog index
+// kept of it; opening it connects. The files being browsed are browsed
+// again in the next window. When files run in sessions of their own
+// (`-- grebe: session NAME`), every running session has a root here; the
+// one the file in front uses is the open one.
 //
 // With the catalog index on (catalogIndex.js; `grebe.duckdb.catalogIndex`)
 // a session's databases are drawn from the index, and the session is asked
@@ -45,6 +50,7 @@ const log = require("./log");
 const trust = require("./trust");
 const conninfo = require("./conninfo");
 const { EXTRAS } = require("./catalogIndex");
+const { isServer } = require("./connections");
 
 // The most tables and views one list shows before it is split into folders.
 const PAGE = 500;
@@ -162,6 +168,7 @@ class Explorer {
       if (node.kind === "range") return node.objects.map((o) => this.objectNode(node.source, o));
       if (node.kind === "group") return node.children;
       if (node.kind === "object") return this.columnNodes(node);
+      if (node.kind === "lost") return this.notConnectedChildren(node);
     } catch (e) {
       log.error("catalog", `could not list ${node ? node.item.label : "the catalog"}: ${e.message ?? e}`, e);
       return [message(`Error: ${e.message ?? e}`, "grebe.showOutput", "error")];
@@ -280,35 +287,100 @@ class Explorer {
   }
 
   /**
-   * The session's connections that are not attached now: detached (and
-   * waiting to be attached again), or not brought back when the session
-   * started (a file that moved, a server that is down). Before the session
-   * starts (`idle`), also the ones it will attach when it does.
+   * The connections of session `name` (the setting's entries) that are not
+   * attached now; `attached(alias)` says which are. Before the session
+   * starts (`idle`), all of them. Each says why it is not attached:
+   * attaching, it could not be (with the reason), detached, a server not
+   * connected yet (with what the index kept of it; opening it connects),
+   * or a file waiting for the session to start.
    */
-  waiting(attached, idle = false) {
-    if (!this.deps.remembered) return [];
+  connectionNodes(name, attached, idle = false) {
+    if (!this.deps.connections) return [];
+    const reattach = this.deps.settings().reattach !== false;
     const out = [];
-    for (const rec of this.deps.remembered()) {
-      if (attached(rec.alias)) continue;
-      const where = conninfo.where(rec.path);
-      const from = rec.declared ? "\n\nDeclared in the grebe.duckdb.connections setting." : "";
-      const pending = idle && !rec.detached && !rec.error;
+    for (const c of this.deps.connections(name)) {
+      if (attached(c.alias)) continue;
+      const target = `${c.alias}: ${conninfo.redact(c.path)}`;
+      const from = c.scope ? `\n\nIn grebe.duckdb.connections (${SCOPE_NAMES[c.scope] || c.scope} settings).` : "";
+      const server = isServer(c);
+      let icon = "debug-disconnect";
+      let state = "not attached";
+      let tooltip = `${target}\n\nNot attached. Attach Again to attach it.`;
+      let contextValue = "grebe.idleDb";
+      let open = vscode.TreeItemCollapsibleState.None;
+      let note = null;
+      if (c.attaching) {
+        icon = "sync~spin";
+        state = "attaching…";
+        tooltip = target;
+        contextValue = "grebe.pendingDb";
+      } else if (c.error) {
+        icon = "warning";
+        tooltip = `${target}\n\nCould not be attached:\n${conninfo.redact(c.error)}\n\nAttach Again to retry, or Forget to take it out of the setting.`;
+        contextValue = "grebe.lostDb";
+      } else if (c.detached) {
+        state = "detached";
+        tooltip = `${target}\n\nDetached: nothing here holds it open. Attach Again when you want it back.`;
+        contextValue = "grebe.detachedDb";
+      } else if (server) {
+        // What the index kept of it: its tables, without connecting.
+        const kept = this.deps.offline ? this.deps.offline(name, c.alias) : null;
+        const index = kept ? describeIndex(kept.status) : null;
+        icon = "plug";
+        state = "not connected";
+        note = index && kept.tables ? index.short : null;
+        tooltip =
+          `${target}\n\nNot connected. It is connected when a statement refers to ${c.alias}, when you open it here, or with Connect.` +
+          (note ? ` Its tables are listed from the catalog index (${note}).` : "");
+        contextValue = "grebe.offlineDb";
+        open = vscode.TreeItemCollapsibleState.Collapsed;
+      } else if (idle && reattach) {
+        icon = "plug";
+        state = "attached when the session starts";
+        tooltip = target;
+        contextValue = "grebe.pendingDb";
+      }
       out.push(
-        node("lost", rec.alias, vscode.TreeItemCollapsibleState.None, {
-          icon: rec.error ? "warning" : pending ? "plug" : "debug-disconnect",
-          alias: rec.alias,
-          declared: !!rec.declared,
-          description: `${rec.error ? "not attached" : pending ? "attached when the session starts" : "detached"} · ${where}`,
-          tooltip: rec.error
-            ? `Could not be attached:\n${conninfo.redact(rec.error)}\n\nAttach it again to retry, or forget it.${from}`
-            : pending
-              ? `${rec.alias}: ${conninfo.redact(rec.path)}${from}`
-              : `${rec.alias}: ${conninfo.redact(rec.path)}\n\nDetached: nothing here holds it open. Attach it again when you want it back; it stays listed until you forget it.${from}`,
-          contextValue: rec.error ? "grebe.lostDb" : pending ? "grebe.pendingDb" : "grebe.detachedDb",
+        node("lost", c.alias, open, {
+          icon,
+          alias: c.alias,
+          session: name,
+          server,
+          description: [state, conninfo.where(c.path), note].filter(Boolean).join(" · "),
+          tooltip: tooltip + from,
+          contextValue,
         }),
       );
     }
     return out;
+  }
+
+  /** What a server connection that is not connected holds, as the index
+   *  kept it. */
+  async notConnectedChildren(n) {
+    const kept = this.deps.offline ? this.deps.offline(n.session, n.alias) : null;
+    const source = n.session === this.sessionNameOf("session") ? "session" : `session:${n.session}`;
+    if (kept && kept.tables) return this.indexedDbChildren({ source, indexed: kept });
+    const c = (this.deps.connections ? this.deps.connections(n.session) : []).find((x) => same(x.alias, n.alias));
+    if (c && c.attaching) return [message("Connecting…", undefined, "sync~spin")];
+    if (c && c.error) return [message(conninfo.redact(c.error), undefined, "warning")];
+    return [message("Not connected yet: nothing is known of its tables")];
+  }
+
+  /** The user opened `n` in the tree: a server connection that is not
+   *  connected is connected. */
+  expanded(n) {
+    if (n && n.kind === "lost" && n.server && n.item.contextValue === "grebe.offlineDb") return this.reattach(n);
+    return undefined;
+  }
+
+  /** How an attached database (not the session's own) is offered: one in
+   *  the setting, one attached in SQL that can be kept, or an in-memory
+   *  one, which has nothing to keep. */
+  dbContext(name, db, attachedPath) {
+    const saved = this.deps.connections && this.deps.connections(name).some((c) => same(c.alias, db));
+    if (saved) return "grebe.attachedDb";
+    return attachedPath ? "grebe.unsavedDb" : "grebe.memoryDb";
   }
 
   async sourceChildren(root) {
@@ -319,9 +391,8 @@ class Explorer {
       const start = message("Start DuckDB session", "grebe.catalog.start", "play");
       start.item.description = "or run a statement";
       start.item.tooltip = "Start the session your runs use, to see what is in it.";
-      // Its connections are listed before it starts: the ones that will be
-      // attached with it, and the detached ones.
-      return [start, ...this.waiting(() => false, true)];
+      // Its connections are listed before it starts.
+      return [start, ...this.connectionNodes(this.sessionNameOf(root.source), () => false, true)];
     }
     if (root.source === "file" && this.files.get(root.alias).error) {
       return [message(this.files.get(root.alias).error)];
@@ -342,8 +413,8 @@ class Explorer {
       const rank = (d) => (d.current ? 0 : d.db === "temp" ? 2 : 1);
       dbs.sort((a, b) => rank(a) - rank(b) || a.db.localeCompare(b.db));
     }
+    const name = isSession(root.source) ? this.sessionNameOf(root.source) : null;
     const nodes = dbs.map((d) => {
-      const attached = isSession(root.source) && !d.current && d.db !== "temp";
       // PostgreSQL, SQLite, ...: DuckDB estimates no rows for their tables
       // (it says 0), and lists each table's row type as a type of its own.
       const foreign = d.type && d.type !== "duckdb";
@@ -359,11 +430,12 @@ class Explorer {
         icon: d.db === "temp" ? "clock" : indexed && indexed.over ? "warning" : "database",
         description: [describeDb(d), index && index.short].filter(Boolean).join(" · "),
         tooltip: (d.path ? `${d.db}: ${conninfo.redact(d.path)}` : d.db) + (index ? `\n\n${index.long}` : ""),
-        contextValue: attached ? "grebe.attachedDb" : "grebe.db",
+        contextValue: name === null || d.current || d.db === "temp" ? "grebe.db" : this.dbContext(name, d.db, d.path),
+        attachedAs: { path: d.path, type: d.type, readOnly: d.readonly === true || d.readonly === "true" },
       });
     });
     const session = isSession(root.source) ? await this.sessionGroups(sess) : [];
-    if (root.source === "session") nodes.push(...this.waiting((alias) => dbs.some((d) => d.db === alias)));
+    if (name !== null) nodes.push(...this.connectionNodes(name, (alias) => dbs.some((d) => same(d.db, alias))));
     if (nodes.length === 0) return [message("No tables yet"), ...session];
     // One database: show its contents directly.
     return nodes.length === 1 && nodes[0].kind === "db" ? [...this.dbChildren(nodes[0]), ...session] : [...nodes, ...session];
@@ -405,7 +477,10 @@ class Explorer {
     // The index reads a session as soon as it is free; it says when.
     if (!view.read) return [message("Reading the catalog…", undefined, "sync")];
     const holds = (d) => Boolean(d.tables && d.tables.length) || d.extras.length > 0;
-    const dbs = view.dbs.filter((d) => d.db !== "temp" || holds(d));
+    // A server connection that is not attached is drawn with the
+    // connections below.
+    const dbs = view.dbs.filter((d) => !d.offline && (d.db !== "temp" || holds(d)));
+    const name = this.sessionNameOf(root.source);
     // The session's own database first, then attached ones by name, temp last.
     const rank = (d) => (d.current ? 0 : d.db === "temp" ? 2 : 1);
     dbs.sort((a, b) => rank(a) - rank(b) || a.db.localeCompare(b.db));
@@ -420,11 +495,12 @@ class Explorer {
         icon: d.db === "temp" ? "clock" : d.status && d.status.over ? "warning" : "database",
         description: [describeDb(d), index && index.short].filter(Boolean).join(" · "),
         tooltip: (d.path ? `${d.db}: ${conninfo.redact(d.path)}` : d.db) + (index ? `\n\n${index.long}` : ""),
-        contextValue: !d.current && d.db !== "temp" ? "grebe.attachedDb" : "grebe.db",
+        contextValue: !d.current && d.db !== "temp" ? this.dbContext(name, d.db, d.path) : "grebe.db",
+        attachedAs: { path: d.path, type: d.type, readOnly: Boolean(d.readonly) },
       });
     });
     const session = await this.heldBy(sess);
-    if (root.source === "session") nodes.push(...this.waiting((alias) => dbs.some((d) => d.db === alias)));
+    nodes.push(...this.connectionNodes(name, (alias) => dbs.some((d) => same(d.db, alias))));
     if (nodes.length === 0) return [message("No tables yet"), ...session];
     // One database: show its contents directly.
     return nodes.length === 1 && nodes[0].kind === "db" ? [...(await this.indexedDbChildren(nodes[0])), ...session] : [...nodes, ...session];
@@ -641,7 +717,7 @@ class Explorer {
       return;
     }
     log.info("catalog", sql);
-    await this.remember();
+    await this.save({ alias, path: uri.fsPath, type: /\.sqlite3?$/i.test(uri.fsPath) ? "sqlite" : "duckdb", readOnly: mode.readOnly });
     this.refresh();
     vscode.window.setStatusBarMessage(`grebe: attached as ${alias}; query it as ${alias}.<table>`, 5000);
   }
@@ -698,15 +774,24 @@ class Explorer {
       log.report("catalog", `could not attach ${where}: ${r.type} Error: ${r.message}`);
       return;
     }
-    log.info("catalog", attachSql(conn));
-    await this.remember();
+    log.info("catalog", conninfo.redact(attachSql(conn)));
+    await this.save({ alias, path: conninfo.withoutPassword(conn.trim()), type: "postgres", readOnly: mode.readOnly });
     this.refresh();
     vscode.window.setStatusBarMessage(`grebe: attached ${where} as ${alias}; query it as ${alias}.<schema>.<table>`, 5000);
   }
 
-  /** DETACH an attached database from the session. */
+  /** DETACH an attached database. One in the setting is marked detached
+   *  there and stays listed; one attached in SQL is let go of. */
   async detach(n) {
     if (!n || n.kind !== "db") return;
+    const name = this.sessionNameOf(n.source);
+    if (n.item.contextValue === "grebe.attachedDb" && this.deps.detach) {
+      const error = await this.deps.detach(n.db, name);
+      if (error) log.report("catalog", `could not detach ${n.db}: ${error}`);
+      else log.info("catalog", `DETACH ${ident(n.db)}`);
+      this.refresh();
+      return;
+    }
     const sess = await this.sessionFor(n.source);
     const r = await sess.run(`DETACH ${ident(n.db)}`);
     if (r.kind === "error") {
@@ -714,8 +799,7 @@ class Explorer {
       return;
     }
     log.info("catalog", `DETACH ${ident(n.db)}`);
-    // The session it was detached from: not always the one in front.
-    await this.remember(n.source === "session" ? undefined : n.source.slice("session:".length));
+    this.touched(name);
     this.refresh();
   }
 
@@ -733,34 +817,55 @@ class Explorer {
     this.refresh();
   }
 
-  /** Note what the session has attached now, so it comes back with it. */
-  async remember(name) {
-    if (this.deps.remember) await this.deps.remember(name);
+  /** The session `name` attached or detached something itself: the index
+   *  reads it again. */
+  touched(name) {
+    if (this.deps.touched) this.deps.touched(name);
   }
 
-  /** Attach a listed connection that is detached, or was not brought back. */
+  /** Add what the Catalog just attached to the session in front to the
+   *  setting. */
+  async save(e) {
+    const name = this.sessionNameOf("session");
+    if (this.deps.save) {
+      try {
+        await this.deps.save(e, name);
+      } catch (err) {
+        log.report("catalog", `attached ${e.alias}, but could not add it to grebe.duckdb.connections: ${err.message ?? err}`);
+      }
+    }
+    this.touched(name);
+  }
+
+  /** Attach a connection that is not attached: detached, not brought back,
+   *  or a server not connected yet. */
   async reattach(n) {
     if (!n || n.kind !== "lost" || !this.deps.attachAgain) return;
     if (!trust.ok("Attaching a database")) return;
-    await this.sessionFor("session");
-    const error = await this.deps.attachAgain(n.alias);
+    const error = await this.deps.attachAgain(n.alias, n.session);
     if (error) log.report("catalog", `could not attach ${n.alias}: ${error}`);
-    else vscode.window.setStatusBarMessage(`grebe: attached ${n.alias} again`, 5000);
+    else vscode.window.setStatusBarMessage(`grebe: attached ${n.alias}`, 5000);
     this.refresh();
   }
 
-  /** Take a connection that is not attached off the list. */
+  /** Take a connection out of the setting (every scope that has it),
+   *  detaching it if it is attached. */
   async forget(n) {
-    if (!n || n.kind !== "lost" || !this.deps.forget) return;
-    if (n.declared) {
-      const pick = await vscode.window.showInformationMessage(
-        `grebe: ${n.alias} is declared in the grebe.duckdb.connections setting. Remove it there to forget it.`,
-        "Open Settings",
-      );
-      if (pick === "Open Settings") vscode.commands.executeCommand("workbench.action.openSettings", "grebe.duckdb.connections");
-      return;
-    }
-    this.deps.forget(n.alias);
+    if (!n || !this.deps.forget) return;
+    const alias = n.kind === "lost" ? n.alias : n.kind === "db" ? n.db : null;
+    if (!alias) return;
+    await this.deps.forget(alias, n.kind === "lost" ? n.session : this.sessionNameOf(n.source));
+    this.refresh();
+  }
+
+  /** Add a database attached in SQL to the setting, as it is attached. */
+  async keep(n) {
+    if (!n || n.kind !== "db" || !this.deps.save) return;
+    const a = n.attachedAs || {};
+    if (!a.path) return;
+    const name = this.sessionNameOf(n.source);
+    await this.deps.save({ alias: n.db, path: conninfo.plain(a.path), type: a.type || "duckdb", readOnly: Boolean(a.readOnly) }, name);
+    vscode.window.setStatusBarMessage(`grebe: ${n.db} is kept in grebe.duckdb.connections`, 5000);
     this.refresh();
   }
 
@@ -773,7 +878,9 @@ class Explorer {
       table,
       icon: o.kind === "view" ? "eye" : "table",
       description: `${rows}${o.cols} col${o.cols === 1 ? "" : "s"}${o.tmp ? " · temp" : ""}`,
-      tooltip: `${o.kind} ${qname(o)}`,
+      tooltip: [`${qname(o)}`, `${o.tmp ? "temporary " : ""}${o.kind}`, est === null ? null : `~${est.toLocaleString()} row${est === 1 ? "" : "s"} (estimated)`, `${o.cols} column${o.cols === 1 ? "" : "s"}`]
+        .filter(Boolean)
+        .join("\n"),
       contextValue: o.kind === "view" ? "grebe.view" : "grebe.table",
     });
     n.item.command = { command: "grebe.catalog.preview", title: "Preview", arguments: [n] };
@@ -805,7 +912,10 @@ class Explorer {
     results.running(`${title} of ${o.name}`);
     let r;
     try {
-      r = await (await this.sessionFor(n.source)).run(sql);
+      const sess = await this.sessionFor(n.source);
+      // A table of a server that is not connected: connect first.
+      if (isSession(n.source) && this.deps.prepare) await this.deps.prepare(this.sessionNameOf(n.source), sql);
+      r = await sess.run(sql);
     } catch (e) {
       r = e && e.cancelled
         ? { kind: "cancelled", reason: "cancel", ended: true, message: e.message }
@@ -862,6 +972,12 @@ class Explorer {
 let nextId = 2e9;
 
 const FILES_KEY = "grebe.catalog.files";
+
+const SCOPE_NAMES = { global: "user", workspace: "workspace", workspaceFolder: "workspace folder" };
+
+/** Whether two database names are the same one: DuckDB does not tell
+ *  upper case from lower. */
+const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 
 /** A root that is a session: the current one, or another by name. */
 const isSession = (source) => source === "session" || String(source).startsWith("session:");
@@ -980,11 +1096,16 @@ function message(text, command, icon) {
 function activate(context, deps) {
   const explorer = new Explorer(deps);
   const view = vscode.window.createTreeView("grebe.catalog", { treeDataProvider: explorer, showCollapseAll: true });
+  // Opening a server connection that is not attached connects it. Only
+  // the user opening it does: the tree asking for its children again
+  // (a refresh) does not.
+  const expanded = view && view.onDidExpandElement ? view.onDidExpandElement((e) => explorer.expanded(e.element)) : null;
   const on = (name, fn) => log.command(`grebe.catalog.${name}`, fn);
   const withObject = (fn) => (n) => n && n.object && fn(n);
   context.subscriptions.push(
     explorer,
     view,
+    ...(expanded ? [expanded] : []),
     // The button reads everything again, the foreign databases' index
     // included.
     on("refresh", () => explorer.reindex(null)),
@@ -1008,7 +1129,9 @@ function activate(context, deps) {
     on("attachPostgres", () => explorer.attachPostgres()),
     on("detach", (n) => explorer.detach(n)),
     on("reattach", (n) => explorer.reattach(n)),
+    on("connect", (n) => explorer.reattach(n)),
     on("forget", (n) => explorer.forget(n)),
+    on("keep", (n) => explorer.keep(n)),
     on("closeFile", (n) => explorer.closeFile(n)),
     on("useAsDatabase", async (arg) => {
       const uri = fileArg(arg);

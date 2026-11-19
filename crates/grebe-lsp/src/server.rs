@@ -433,7 +433,9 @@ fn parse_select(v: Option<&Json>) -> Option<Vec<String>> {
 /// an LSP server has no request to reject the way `grebe check --select`
 /// can exit 2, and must keep serving.
 fn apply_select<W: Write>(raw: Option<Vec<String>>, state: &mut State, writer: &mut W) {
-    let Some(codes) = raw else {
+    // No list, or an empty one: the rules that are on by default, as
+    // `grebe check` without --select.
+    let Some(codes) = raw.filter(|c| !c.is_empty()) else {
         state.select = None;
         return;
     };
@@ -1608,9 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_unknown_selection_enables_nothing_and_does_not_panic() {
-        let empty = Some(Vec::new());
-        assert!(analyze("SELECT count(*) FROM t", &empty).is_empty());
+    fn an_unknown_selection_enables_nothing_and_does_not_panic() {
         let bogus = Some(vec!["NOPE999".to_string()]);
         assert!(analyze("SELECT * FROM t", &bogus).is_empty());
     }

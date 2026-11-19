@@ -101,6 +101,31 @@ function fakeDocument(fsPath, text) {
 function makeVscode(config) {
   const shown = { posted: [], errors: [], warnings: [], infos: [], log: [], diagnostics: new Map(), commands: new Map(), lensProviders: [], docs: new Map() };
   const disposable = { dispose() {} };
+  // grebe.duckdb.connections, as VS Code keeps a setting: a value per
+  // scope (user, workspace, workspace folder), the most specific one read,
+  // and every listener told after a write -- as for an edit of
+  // settings.json by hand (shown.edit).
+  const scopes = (shown.scopes = { global: {}, workspace: {}, workspaceFolder: {} });
+  if (config.connections !== undefined) scopes.global.connections = config.connections;
+  const listeners = [];
+  const scoped = (k) => k === "connections";
+  const read = (k, d) => {
+    if (!scoped(k)) return k in config ? config[k] : d;
+    for (const sc of ["workspaceFolder", "workspace", "global"]) if (scopes[sc][k] !== undefined) return scopes[sc][k];
+    return d;
+  };
+  const tell = (key) => Promise.all(listeners.map((h) => h({ affectsConfiguration: (k) => k === key || key.startsWith(`${k}.`) })));
+  shown.configChanged = (e) => Promise.all(listeners.map((h) => h(e)));
+  // shown.edit(scope, value), or shown.edit({ scope: value, ... }) for
+  // several scopes in one save.
+  shown.edit = async (scope, value) => {
+    for (const [sc, v] of Object.entries(typeof scope === "string" ? { [scope]: value } : scope)) {
+      if (v === undefined) delete scopes[sc].connections;
+      else scopes[sc].connections = JSON.parse(JSON.stringify(v));
+    }
+    await tell("grebe.duckdb.connections");
+  };
+  shown.writes = [];
   const vscode = {
     Position,
     Range,
@@ -113,7 +138,7 @@ function makeVscode(config) {
     ViewColumn: { One: 1, Beside: -2 },
     StatusBarAlignment: { Right: 2 },
     DiagnosticSeverity: { Error: 0 },
-    ConfigurationTarget: { Global: 1, Workspace: 2 },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     TextEditorRevealType: { InCenter: 2 },
     Uri: {
       parse: (s) => ({ toString: () => s, fsPath: s.replace(/^file:\/\//, "") }),
@@ -122,14 +147,24 @@ function makeVscode(config) {
     },
     env: { clipboard: { writeText: async (t) => (shown.clipboard = t) } },
     workspace: {
-      getConfiguration: () => ({ get: (k, d) => (k in config ? config[k] : d), update: async () => {} }),
+      getConfiguration: () => ({
+        get: read,
+        inspect: (k) => ({ globalValue: scopes.global[k], workspaceValue: scopes.workspace[k], workspaceFolderValue: scopes.workspaceFolder[k] }),
+        update: async (k, value, target) => {
+          // Other settings: as before, written nowhere.
+          if (!scoped(k)) return;
+          const scope = { 1: "global", 2: "workspace", 3: "workspaceFolder" }[target];
+          shown.writes.push([scope, value]);
+          return shown.edit(scope, value);
+        },
+      }),
       getWorkspaceFolder: () => undefined,
       asRelativePath: (u) => path.basename(typeof u === "string" ? u : u.fsPath),
       onDidChangeTextDocument: () => disposable,
       openTextDocument: async (uri) => shown.docs.get(uri.toString()),
       onDidChangeConfiguration: (h) => {
-        shown.configChanged = h;
-        return disposable;
+        listeners.push(h);
+        return { dispose: () => listeners.splice(listeners.indexOf(h), 1) };
       },
     },
     window: {
@@ -305,7 +340,7 @@ live("run file and run statement, end to end", async (t) => {
   t.after(() => {
     Module._load = origLoad;
   });
-  for (const m of ["../run", "../results", "../log"]) delete require.cache[require.resolve(m)];
+  for (const m of ["../run", "../connectionSettings", "../results", "../log"]) delete require.cache[require.resolve(m)];
   const runner = require("../run");
 
   const client = lspClient(GREBE);
@@ -618,7 +653,7 @@ live("Catalog: session contents, temp tables, a browsed file", async (t) => {
   assert.match(root.item.description, /^[\d.]+ \w+ of [\d.]+ \w+ in use$/, "memory in use on the session line");
   const top = await ex.getChildren(root);
   assert.deepEqual(labels(top).slice(0, 3), ["memory (in-memory)", "scratchpad (attached · in-memory)", "temp (TEMP objects)"]);
-  assert.equal(top[1].item.contextValue, "grebe.attachedDb");
+  assert.equal(top[1].item.contextValue, "grebe.memoryDb", "attached in SQL and in memory: it can be detached, and there is nothing to keep");
   assert.equal(top[0].item.contextValue, "grebe.db", "the session's own database cannot be detached");
   assert.deepEqual(labels(top.slice(3)).map((l) => l.replace(/\d+ loaded/, "N loaded")), ["Variables (1)", "Extensions (N loaded)"]);
   assert.deepEqual(labels(await ex.getChildren(top[3])), ["cutoff (2024-01-01 · DATE)"]);
@@ -717,7 +752,8 @@ livePg("Catalog: attach PostgreSQL by connection string, never showing its passw
   });
   for (const m of ["../catalog", "../results", "../log", "../conninfo"]) delete require.cache[require.resolve(m)];
   const { Explorer } = require("../catalog");
-  const { parse } = require("../conninfo");
+  const conninfo = require("../conninfo");
+  const { parse } = conninfo;
   const { Session } = require("../duckdb-session");
   const password = parse(PG).password;
   assert.ok(password, "PG_TEST_CONN carries a password");
@@ -726,11 +762,22 @@ livePg("Catalog: attach PostgreSQL by connection string, never showing its passw
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-pg-"));
   const sess = new Session({ cli: CLI, database: ":memory:", cwd: dir });
   await sess.start();
+  // What the Catalog adds to grebe.duckdb.connections.
+  const saved = [];
   const ex = new Explorer({
     currentSession: async () => sess,
     liveSession: () => sess,
     settings: () => ({ cli: CLI, database: ":memory:" }),
     cli: () => CLI,
+    save: async (e, name) => saved.push([name, e]),
+    connections: () => saved.map(([, e]) => e),
+    // Detach marks the entry detached.
+    detach: async (alias) => {
+      const d = await sess.run(`DETACH "${alias}"`);
+      if (d.kind === "error") return d.message;
+      saved.find(([, e]) => e.alias === alias)[1].detached = true;
+      return null;
+    },
   });
   t.after(async () => {
     await sess.run(`CALL postgres_execute('setup', 'DROP SCHEMA IF EXISTS ${schema} CASCADE')`);
@@ -776,6 +823,13 @@ livePg("Catalog: attach PostgreSQL by connection string, never showing its passw
   assert.ok(local, labels(top).join(" | "));
   assert.equal(local.item.description, `attached · postgres · ${where} · read-only`);
   assert.equal(local.item.contextValue, "grebe.attachedDb", "it can be detached");
+  // Both are in the setting, without the password.
+  const bare = conninfo.withoutPassword(PG.trim());
+  assert.deepEqual(saved, [
+    ["default", { alias: "setup", path: bare, type: "postgres", readOnly: false }],
+    ["default", { alias: "local", path: bare, type: "postgres", readOnly: true }],
+  ]);
+  assert.ok(!JSON.stringify(saved).includes(password));
   assert.match(local.item.tooltip, /password=\*\*\*/);
   const inSchema = (await ex.getChildren(local)).find((n) => n.item.label === schema);
   assert.ok(inSchema, labels(await ex.getChildren(local)).join(" | "));
@@ -799,9 +853,9 @@ livePg("Catalog: attach PostgreSQL by connection string, never showing its passw
   await ex.attachPostgres();
   assert.match(shown.errors.at(-1), /^grebe: could not attach .*: IO Error: .*password=\*\*\*/);
 
-  // Detach.
+  // Detach: it stays listed, detached.
   await ex.detach((await ex.getChildren(root)).find((n) => n.item.label === "local"));
-  assert.ok(!labels(await ex.getChildren(root)).some((l) => l.startsWith("local (")));
+  assert.ok(labels(await ex.getChildren(root)).includes(`local (detached · ${where})`), labels(await ex.getChildren(root)).join(" | "));
 
   // Nowhere the extension writes did the password appear.
   const everything = [...shown.errors, ...shown.log, ...labels(await ex.getChildren(root))].join("\n");
@@ -882,7 +936,7 @@ live("DuckDB problems are shown when they happen, not at the next run", async (t
   t.after(() => {
     Module._load = origLoad;
   });
-  for (const m of ["../run", "../results", "../log"]) delete require.cache[require.resolve(m)];
+  for (const m of ["../run", "../connectionSettings", "../results", "../log"]) delete require.cache[require.resolve(m)];
   const runner = require("../run");
   const subs = [];
   runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") } }, () => Promise.resolve(null));
@@ -931,7 +985,7 @@ live("no DuckDB on PATH and no path set: nobody is nagged until they run", async
     Module._load = origLoad;
     process.env.PATH = prevPath;
   });
-  for (const m of ["../run", "../results", "../log"]) delete require.cache[require.resolve(m)];
+  for (const m of ["../run", "../connectionSettings", "../results", "../log"]) delete require.cache[require.resolve(m)];
   const runner = require("../run");
   const subs = [];
   runner.activate({ subscriptions: subs, extensionUri: { fsPath: path.join(__dirname, "..") } }, () => Promise.resolve(null));
@@ -1135,7 +1189,7 @@ test("errorContext: the line DuckDB points into, and the column, as the editor c
       return request === "vscode" ? vscode : origLoad.call(this, request, ...rest);
     };
     try {
-      for (const m of ["../run", "../results", "../log"]) delete require.cache[require.resolve(m)];
+      for (const m of ["../run", "../connectionSettings", "../results", "../log"]) delete require.cache[require.resolve(m)];
       return require("../run");
     } finally {
       Module._load = origLoad;
@@ -1169,7 +1223,7 @@ live("cancel: a long statement stops, the rest of the run does not run, the sess
   t.after(() => {
     Module._load = origLoad;
   });
-  for (const m of ["../run", "../results", "../log", "../duckdb-session"]) delete require.cache[require.resolve(m)];
+  for (const m of ["../run", "../connectionSettings", "../results", "../log", "../duckdb-session"]) delete require.cache[require.resolve(m)];
   const runner = require("../run");
   const results = require("../results");
   const client = lspClient(GREBE);
@@ -1302,7 +1356,7 @@ live("Restricted Mode: nothing starts DuckDB, and each place says why", async (t
   t.after(() => {
     Module._load = origLoad;
   });
-  for (const m of ["../run", "../results", "../log", "../trust", "../catalog", "../inspect", "../dataEditor", "../duckdb-session"]) {
+  for (const m of ["../run", "../connectionSettings", "../results", "../log", "../trust", "../catalog", "../inspect", "../dataEditor", "../duckdb-session"]) {
     delete require.cache[require.resolve(m)];
   }
   const { Session } = require("../duckdb-session");
@@ -1422,7 +1476,7 @@ async function startRunner(t, config, context = {}) {
   t.after(() => {
     Module._load = origLoad;
   });
-  for (const m of ["../run", "../results", "../log", "../catalog", "../catalogSync"]) {
+  for (const m of ["../run", "../connectionSettings", "../results", "../log", "../catalog", "../catalogSync"]) {
     try {
       delete require.cache[require.resolve(m)];
     } catch {
@@ -1524,7 +1578,7 @@ live("a file can ask for a session of its own", async (t) => {
   assert.deepEqual(runner.liveSessions().map((x) => x.name), ["default"]);
 });
 
-live("the workspace database keeps tables across sessions; attachments come back", async (t) => {
+live("the workspace database keeps tables across sessions; kept connections come back", async (t) => {
   const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
   // Where DuckDB will say it is (on macOS the temporary folder is behind a link).
   const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grebe-e2e-")));
@@ -1532,8 +1586,9 @@ live("the workspace database keeps tables across sessions; attachments come back
   const state = fakeState();
   const context = { storageUri: { fsPath: path.join(storage, "ws") }, workspaceState: state };
   const config = { path: CLI, database: ":workspace:", maxRows: 100 };
+  let connections;
   {
-    const { runner, open, run } = await startRunner(t, config, context);
+    const { shown, runner, open, run } = await startRunner(t, config, context);
     const make = open(
       path.join(dir, "make.sql"),
       `CREATE TABLE kept AS SELECT 99 AS n;\nATTACH '${other}' AS other;\nCREATE TABLE other.o AS SELECT 5 AS five;\nATTACH ':memory:' AS mem2;`,
@@ -1541,8 +1596,13 @@ live("the workspace database keeps tables across sessions; attachments come back
     assert.deepEqual((await run(make)).map((r) => r.kind), ["ok", "ok", "ok", "ok"]);
     assert.ok(fs.existsSync(path.join(storage, "ws", "session.duckdb")), "the database is in the editor's storage, not the project");
     assert.deepEqual(fs.readdirSync(dir).filter((f) => !f.endsWith(".wal")).sort(), ["make.sql", "other.duckdb"]);
-    // What is remembered: the file, not the in-memory attachment.
-    assert.deepEqual(runner.rememberedAttachments(), [{ alias: "other", path: other, type: "duckdb", readOnly: false }]);
+    // An ATTACH in SQL is not saved anywhere: it lasts for the session.
+    assert.deepEqual(runner.connectionsOf(), []);
+    assert.deepEqual(shown.scopes.global, {});
+    // Kept (the Catalog's Keep): in the user settings.
+    assert.equal(await runner.saveConnection({ alias: "other", path: other, type: "duckdb", readOnly: false }), "global");
+    assert.deepEqual(shown.scopes.global.connections, [{ alias: "other", path: other }]);
+    connections = shown.scopes.global.connections;
     // The window closes.
     runner.liveSession().dispose();
     await until(() => runner.liveSession() === null, "the session to end");
@@ -1550,25 +1610,27 @@ live("the workspace database keeps tables across sessions; attachments come back
   }
   {
     // A new window on the same workspace.
-    const { vscode, shown, runner, open, run } = await startRunner(t, config, context);
+    const { vscode, shown, runner, open, run } = await startRunner(t, { ...config, connections }, context);
     const read = open(path.join(dir, "read.sql"), "SELECT n FROM kept;\nSELECT five FROM other.o;");
     const got = await run(read);
     assert.deepEqual(got.map((r) => r.kind), ["rows", "rows"], JSON.stringify(got));
     assert.deepEqual(got[0].data, [["99"]]);
     assert.deepEqual(got[1].data, [["5"]], "other.duckdb was attached again");
-    assert.match(shown.log.join(""), /re-attached other/);
+    assert.match(shown.log.join(""), /attached other \(other\.duckdb\)/);
 
-    // An attachment whose file is gone is reported, kept, and can be forgotten.
+    // A connection whose file is gone says why, in the Catalog and the
+    // log, and the run fails with DuckDB's own error; Forget takes it out.
     runner.liveSession().dispose();
     await until(() => runner.liveSession() === null, "the session to end");
     await new Promise((r) => setTimeout(r, 300));
     fs.rmSync(other);
     fs.mkdirSync(other); // a directory: cannot be attached
     assert.deepEqual((await run(read)).map((r) => r.kind), ["rows", "error"]);
-    assert.equal(shown.warnings.filter((w) => /could not re-attach other/.test(w)).length, 1, shown.warnings.join("\n"));
-    assert.match(runner.rememberedAttachments()[0].error, /Error/);
-    runner.forgetAttachment("other");
-    assert.deepEqual(runner.rememberedAttachments(), []);
+    assert.match(runner.connectionsOf()[0].error, /Error/);
+    assert.equal(shown.warnings.length, 0, "no notification for it");
+    await runner.forgetConnection("other");
+    assert.deepEqual(runner.connectionsOf(), []);
+    assert.equal(shown.scopes.global.connections, undefined, "the setting is gone, not left empty");
 
     // Deleting the workspace database asks first, then starts clean.
     vscode.window.showWarningMessage = async (m, ...rest) => (rest.includes("Delete") ? "Delete" : undefined);
@@ -1848,4 +1910,397 @@ live("the editor marks what the session does not have, and completes what it has
   await until(() => cat().every((d) => d.code === "CAT002"), "CAT001 to clear");
   // ordrs is known now, so its misspelt column is what is marked there.
   assert.deepEqual(cat().map((d) => d.range.start.line), [0, 2]);
+});
+
+// ------------------------------------------- connections in the setting --
+
+// run.js, the Catalog and the catalog index wired together as extension.js
+// wires them, over the fake editor: what the user sees of the
+// grebe.duckdb.connections setting. No language server is told anything
+// (the index is kept for the Catalog all the same).
+async function startExtension(t, config, context = {}) {
+  const h = await startRunner(t, config, context);
+  const { vscode, shown, runner } = h;
+  class TreeItem {
+    constructor(label, state) {
+      this.label = label;
+      this.collapsibleState = state;
+    }
+  }
+  Object.assign(vscode, {
+    TreeItem,
+    ThemeIcon: class {
+      constructor(id) {
+        this.id = id;
+      }
+    },
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+    // One that tells its listeners: the tree being drawn is counted.
+    EventEmitter: class {
+      constructor() {
+        this.listeners = [];
+        this.event = (fn) => (this.listeners.push(fn), { dispose() {} });
+      }
+      fire(e) {
+        for (const fn of this.listeners) fn(e);
+      }
+      dispose() {}
+    },
+  });
+  const nothing = () => ({ dispose() {} });
+  vscode.workspace.onDidOpenTextDocument = nothing;
+  vscode.workspace.onDidSaveTextDocument = nothing;
+  vscode.workspace.textDocuments = [];
+  vscode.window.createTreeView = () => ({
+    onDidExpandElement: (fn) => {
+      shown.expand = fn;
+      return { dispose() {} };
+    },
+    dispose() {},
+  });
+  // What the user types: a password when asked (counted), else nothing.
+  shown.prompts = [];
+  vscode.window.showInputBox = async (o) => {
+    shown.prompts.push(o.title);
+    return o.password ? shown.password : undefined;
+  };
+  vscode.window.showQuickPick = async (items) => items.find((i) => i.label === shown.pick);
+  const catalog = require("../catalog");
+  const catalogSync = require("../catalogSync");
+  const subs = [];
+  t.after(() => subs.forEach((s) => s.dispose && s.dispose()));
+  let feed = null;
+  const explorer = catalog.activate({ subscriptions: subs }, {
+    currentSession: runner.currentSession,
+    liveSession: runner.liveSession,
+    liveSessions: runner.liveSessions,
+    sessionName: runner.currentSessionName,
+    touched: (name) => feed && feed.touched(name || runner.currentSessionName()),
+    indexStatus: (name, db) => (feed ? feed.status(name, db) : null),
+    indexView: (name, sess) => (feed ? feed.view(name, sess) : null),
+    isRunning: runner.isRunning,
+    reindex: (name, db) => feed && feed.reindex(name, db),
+    connections: runner.connectionsOf,
+    offline: (name, alias) => (feed ? feed.offline(name, alias) : null),
+    attachAgain: runner.attachAgain,
+    detach: runner.detachConnection,
+    forget: runner.forgetConnection,
+    save: runner.saveConnection,
+    prepare: runner.prepareFor,
+    onDidRun: runner.onDidRun,
+    settings: runner.settings,
+    cli: () => runner.settings().cli,
+  });
+  let drawn = 0;
+  explorer.onDidChangeTreeData(() => drawn++);
+  feed = catalogSync.activate({ subscriptions: subs, storageUri: context.storageUri }, {
+    clientReady: async () => null,
+    liveSessions: runner.liveSessions,
+    sessionNameOf: runner.sessionNameOf,
+    onDidRun: runner.onDidRun,
+    isRunning: runner.isRunning,
+    connections: runner.allConnections,
+    offline: runner.offlineConnections,
+    offlineSessions: runner.offlineSessions,
+    onDidIndex: () => explorer.redraw(),
+  });
+  const line = (n) => `${n.item.label}${n.item.description ? ` (${n.item.description})` : ""} <${n.item.contextValue || ""}>`;
+  return {
+    ...h,
+    explorer,
+    feed,
+    drawn: () => drawn,
+    /** What is under the current session's line, once the index has
+     *  read what there is to read. */
+    async top() {
+      await feed.sync();
+      const [root] = await explorer.getChildren();
+      return explorer.getChildren(root);
+    },
+    async node(label) {
+      return (await this.top()).find((n) => n.item.label === label);
+    },
+    async lines() {
+      return (await this.top()).map(line);
+    },
+    /** The databases the current session has attached, its own left out. */
+    async attached() {
+      const sess = runner.liveSession();
+      if (!sess) return [];
+      const r = await sess.run("SELECT database_name FROM duckdb_databases() WHERE NOT internal AND database_name <> 'memory' ORDER BY 1");
+      return r.rows.map((row) => row[0]);
+    },
+  };
+}
+
+/** A DuckDB file with a table `t` in it. */
+async function duckdbFile(file) {
+  const { Session } = require("../duckdb-session");
+  const w = new Session({ cli: CLI, database: file, cwd: path.dirname(file) });
+  await w.start();
+  await w.run("CREATE TABLE t AS SELECT 1 AS i");
+  w.dispose();
+  await new Promise((r) => setTimeout(r, 200));
+}
+
+live("the Catalog writes grebe.duckdb.connections: attach, detach, attach again, the X and Keep", async (t) => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grebe-conn-")));
+  for (const f of ["a", "b", "c"]) await duckdbFile(path.join(dir, `${f}.duckdb`));
+  const h = await startExtension(t, { path: CLI, database: ":memory:", maxRows: 100 });
+  const { shown, explorer } = h;
+  await h.run(h.open(path.join(dir, "start.sql"), "SELECT 1;"));
+
+  // No scope has the setting: the user's settings get it.
+  shown.pick = "Read-only";
+  await explorer.attach({ fsPath: path.join(dir, "a.duckdb") });
+  assert.deepEqual(shown.scopes.global.connections, [{ alias: "a", path: path.join(dir, "a.duckdb"), readOnly: true }]);
+  assert.deepEqual(await h.attached(), ["a"]);
+  assert.match((await h.lines()).join("\n"), /^a \(attached · a\.duckdb · read-only\) <grebe\.attachedDb>$/m);
+
+  // Only the workspace has it: the workspace gets the next one. (Moved by
+  // hand: the same entry, so nothing is detached or attached.)
+  await shown.edit({ global: undefined, workspace: [{ alias: "a", path: path.join(dir, "a.duckdb"), readOnly: true }] });
+  shown.pick = "Read and write";
+  await explorer.attach({ fsPath: path.join(dir, "b.duckdb") });
+  assert.equal(shown.scopes.global.connections, undefined);
+  assert.deepEqual(shown.scopes.workspace.connections.map((e) => e.alias), ["a", "b"]);
+  assert.deepEqual(await h.attached(), ["a", "b"]);
+
+  // Detach marks it detached where it is; Attach Again clears that.
+  await explorer.detach(await h.node("a"));
+  assert.deepEqual(shown.scopes.workspace.connections[0], { alias: "a", path: path.join(dir, "a.duckdb"), readOnly: true, detached: true });
+  assert.deepEqual(await h.attached(), ["b"]);
+  assert.equal((await h.node("a")).item.contextValue, "grebe.detachedDb");
+  await explorer.reattach(await h.node("a"));
+  assert.deepEqual(shown.scopes.workspace.connections[0], { alias: "a", path: path.join(dir, "a.duckdb"), readOnly: true });
+  assert.deepEqual(await h.attached(), ["a", "b"]);
+
+  // The X: out of every scope that has it, and detached.
+  await shown.edit("global", [{ alias: "b", path: path.join(dir, "b.duckdb") }]);
+  await explorer.forget(await h.node("b"));
+  assert.equal(shown.scopes.global.connections, undefined);
+  assert.deepEqual(shown.scopes.workspace.connections.map((e) => e.alias), ["a"]);
+  assert.deepEqual(await h.attached(), ["a"]);
+  assert.equal(await h.node("b"), undefined);
+
+  // An ATTACH in SQL is not saved; Keep saves it, as it is attached.
+  const sql = h.open(path.join(dir, "c.sql"), `ATTACH '${path.join(dir, "c.duckdb")}' AS c (READ_ONLY);`);
+  assert.deepEqual((await h.run(sql)).map((r) => r.kind), ["ok"]);
+  assert.deepEqual(shown.scopes.workspace.connections.map((e) => e.alias), ["a"]);
+  assert.equal((await h.node("c")).item.contextValue, "grebe.unsavedDb");
+  await shown.commands.get("grebe.catalog.keep")(await h.node("c"));
+  assert.deepEqual(shown.scopes.workspace.connections[1], { alias: "c", path: path.join(dir, "c.duckdb"), readOnly: true });
+  assert.equal((await h.node("c")).item.contextValue, "grebe.attachedDb");
+  assert.deepEqual(await h.attached(), ["a", "c"]);
+  // No password and no path of this machine outside the paths given.
+  assert.ok(shown.writes.every(([scope]) => scope === "global" || scope === "workspace"));
+});
+
+live("an edit of grebe.duckdb.connections by hand applies to the running session at once", async (t) => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grebe-conn-")));
+  for (const f of ["a", "b", "b2"]) await duckdbFile(path.join(dir, `${f}.duckdb`));
+  const a = { alias: "a", path: path.join(dir, "a.duckdb") };
+  const h = await startExtension(t, { path: CLI, database: ":memory:", maxRows: 100, connections: [a] });
+  const { shown } = h;
+  await h.run(h.open(path.join(dir, "start.sql"), "SELECT 1;"));
+  const settle = async (want) => {
+    for (let i = 0; i < 200; i++) {
+      if (JSON.stringify(await h.attached()) === JSON.stringify(want)) return;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.deepEqual(await h.attached(), want);
+  };
+  await settle(["a"]);
+  const before = h.drawn();
+  await shown.edit("global", [a, { alias: "b", path: path.join(dir, "b.duckdb") }]);
+  await settle(["a", "b"]);
+  await until(() => h.drawn() > before, "the tree to be drawn again");
+  await shown.edit("global", [{ ...a, detached: true }, { alias: "b", path: path.join(dir, "b.duckdb") }]);
+  await settle(["b"]);
+  assert.match((await h.lines()).join("\n"), /^a \(detached · a\.duckdb\) <grebe\.detachedDb>$/m);
+  await shown.edit("global", [{ ...a, detached: true }, { alias: "b", path: path.join(dir, "b2.duckdb"), readOnly: true }]);
+  for (let i = 0; i < 200 && !/b2\.duckdb · read-only/.test((await h.lines()).join("\n")); i++) await new Promise((r) => setTimeout(r, 25));
+  assert.match((await h.lines()).join("\n"), /^b \(attached · b2\.duckdb · read-only\) <grebe\.attachedDb>$/m, "attached again, as it is now");
+  await shown.edit("global", [a]);
+  await settle(["a"]);
+  assert.equal(await h.node("b"), undefined);
+  // Nothing this extension did wrote the setting.
+  assert.deepEqual(shown.writes, []);
+});
+
+live("saved attachments of an earlier version move to the setting once", async (t) => {
+  const state = fakeState(
+    new Map([
+      [
+        "grebe.duckdb.attachments",
+        {
+          default: [
+            { alias: "a", path: "/data/a.duckdb", type: "duckdb", readOnly: true },
+            { alias: "off", path: "/data/off.duckdb", type: "duckdb", readOnly: false, detached: true },
+            { alias: "mem", path: ":memory:", type: "duckdb", readOnly: false },
+            { alias: "lost", error: "IO Error: gone" },
+          ],
+          etl: [{ alias: "pg", path: "dbname=x host=h", type: "postgres", readOnly: true }],
+        },
+      ],
+    ]),
+  );
+  const h = await startExtension(t, { path: CLI, database: ":memory:", maxRows: 100 }, { workspaceState: state });
+  await until(() => h.shown.scopes.global.connections !== undefined, "the setting to be written");
+  assert.deepEqual(h.shown.scopes.global.connections, [
+    { alias: "a", path: "/data/a.duckdb", readOnly: true },
+    { alias: "off", path: "/data/off.duckdb", detached: true },
+    { alias: "pg", path: "dbname=x host=h", type: "postgres", readOnly: true, session: "etl" },
+  ]);
+  await until(() => state.values.get("grebe.duckdb.attachments") === undefined, "the old store to be cleared");
+  assert.match(h.shown.log.join(""), /moved 3 saved connections to grebe\.duckdb\.connections \(user settings\)/);
+  // Once: a new window finds nothing to move.
+  const again = await startExtension(t, { path: CLI, database: ":memory:", maxRows: 100 }, { workspaceState: state });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.doesNotMatch(again.shown.log.join(""), /moved/);
+});
+
+livePgServer("a server is connected when first needed, and known from its kept index until then", async (t) => {
+  const { Session } = require("../duckdb-session");
+  const conninfo = require("../conninfo");
+  const password = conninfo.parse(PG).password;
+  const bare = conninfo.withoutPassword(PG);
+  const schema = `grebe_conn_${process.pid}`;
+  // A table on the server to find.
+  const setup = new Session({ cli: CLI, database: ":memory:", cwd: os.tmpdir() });
+  await setup.start();
+  assert.equal((await setup.run(`ATTACH '${PG}' AS s (TYPE postgres)`)).kind, "ok");
+  for (const q of [`CREATE SCHEMA IF NOT EXISTS ${schema}`, `CREATE TABLE IF NOT EXISTS ${schema}.orders AS SELECT 1 AS id`]) {
+    const made = await setup.run(`CALL postgres_execute('s', '${q}')`);
+    assert.notEqual(made.kind, "error", `${q}: ${made.message}`);
+  }
+  t.after(async () => {
+    await setup.run(`CALL postgres_execute('s', 'DROP SCHEMA IF EXISTS ${schema} CASCADE')`);
+    setup.dispose();
+  });
+
+  // A server that takes the connection and never answers.
+  const sockets = [];
+  const silent = require("net").createServer((s) => sockets.push(s));
+  await new Promise((resolve) => silent.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    for (const s of sockets) s.destroy();
+    silent.close();
+  });
+
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grebe-conn-")));
+  await duckdbFile(path.join(dir, "a.duckdb"));
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), "grebe-storage-"));
+  const context = { storageUri: { fsPath: storage } };
+  const connections = [
+    { alias: "a", path: path.join(dir, "a.duckdb") },
+    { alias: "gone", path: path.join(dir, "no", "such.duckdb") },
+    { alias: "slow", path: `host=127.0.0.1 port=${silent.address().port} dbname=x user=u connect_timeout=2`, type: "postgres" },
+    { alias: "pg", path: bare, readOnly: true, type: "postgres" },
+    { alias: "pg2", path: bare, readOnly: true, type: "postgres" },
+  ];
+  const savedPgPassword = process.env.PGPASSWORD;
+  delete process.env.PGPASSWORD; // so the server has to ask
+  t.after(() => {
+    if (savedPgPassword !== undefined) process.env.PGPASSWORD = savedPgPassword;
+  });
+  {
+    const h = await startExtension(t, { path: CLI, database: ":memory:", maxRows: 100, connections }, context);
+    const { shown, runner, explorer, feed } = h;
+    shown.password = password;
+    // Before the session starts: listed, a server not connected.
+    assert.deepEqual(
+      (await h.lines()).slice(1),
+      [
+        "a (attached when the session starts · a.duckdb) <grebe.pendingDb>",
+        "gone (attached when the session starts · such.duckdb) <grebe.pendingDb>",
+        `slow (not connected · x@127.0.0.1:${silent.address().port}) <grebe.offlineDb>`,
+        `pg (not connected · ${conninfo.where(bare)}) <grebe.offlineDb>`,
+        `pg2 (not connected · ${conninfo.where(bare)}) <grebe.offlineDb>`,
+      ],
+    );
+    // A run starts the session and does not wait for any connection, nor
+    // ask for anything.
+    const t0 = Date.now();
+    const got = await h.run(h.open(path.join(dir, "one.sql"), "SELECT 42 AS n;"));
+    assert.deepEqual(got.map((r) => r.kind), ["rows"]);
+    assert.ok(Date.now() - t0 < 3000, `the run took ${Date.now() - t0} ms`);
+    assert.deepEqual(shown.prompts, []);
+    await until(() => runner.connectionsOf().every((c) => !c.attaching), "the files to be attached");
+    assert.deepEqual(await h.attached(), ["a"]);
+    const lines = (await h.lines()).join("\n");
+    assert.match(lines, /^gone \(not attached · such\.duckdb\) <grebe\.lostDb>$/m, "the reason is on the node");
+    assert.match(lines, /^pg \(not connected · .*\) <grebe\.offlineDb>$/m);
+
+    // The first statement that refers to it connects it: the password is
+    // asked for then, once.
+    const q = h.open(path.join(dir, "pg.sql"), `SELECT count(*) AS n FROM pg.${schema}.orders;`);
+    const r = await h.run(q);
+    assert.deepEqual(r.map((x) => x.kind), ["rows"], JSON.stringify(r));
+    assert.deepEqual(r[0].data, [["1"]]);
+    assert.equal(shown.prompts.length, 1);
+    assert.match(shown.prompts[0], /^Password for /);
+    assert.deepEqual(await h.attached(), ["a", "pg"]);
+    await h.run(q);
+    assert.equal(shown.prompts.length, 1, "attached is attached");
+
+    // Opening its node in the Catalog connects the other.
+    const pg2 = await h.node("pg2");
+    assert.equal(pg2.item.collapsibleState, 1);
+    await shown.expand({ element: pg2 });
+    assert.equal(shown.prompts.length, 2);
+    assert.deepEqual(await h.attached(), ["a", "pg", "pg2"]);
+    // The tree asking for a node's children again connects nothing.
+    await explorer.getChildren(await h.node("slow"));
+    assert.equal(shown.prompts.length, 2);
+
+    // A server that does not answer: the run that needs it is held up no
+    // longer than the attach's limit, and fails with DuckDB's own error.
+    const t1 = Date.now();
+    const s = await h.run(h.open(path.join(dir, "slow.sql"), "SELECT * FROM slow.public.t;"));
+    assert.deepEqual(s.map((x) => x.kind), ["error"]);
+    assert.ok(Date.now() - t1 < 8000, `the run took ${Date.now() - t1} ms`);
+    assert.match(shown.log.join(""), /slow is not attached: .*timeout expired/);
+    assert.equal(runner.liveSession().alive, true);
+
+    // The index reads the attached server and keeps it for the next window.
+    await feed.sync();
+    await feed.index.indexPending("default", runner.liveSession());
+    assert.ok(feed.index.parts("default").some((p) => p.database === "pg" && p.tables.some((x) => x.schema === schema && x.table === "orders")));
+    runner.liveSession().dispose();
+    await until(() => runner.liveSession() === null, "the session to end");
+  }
+  {
+    // The next window: nothing is running, nothing is asked, and the
+    // server's names are known from what was kept.
+    const h = await startExtension(t, { path: CLI, database: ":memory:", maxRows: 100, connections }, context);
+    const { shown, runner, feed } = h;
+    await feed.sync();
+    assert.equal(runner.liveSession(), null);
+    const part = feed.index.parts("default").find((p) => p.database === "pg");
+    assert.ok(part && part.tables.some((x) => x.schema === schema && x.table === "orders"), "the editor knows its tables");
+    const pg = await h.node("pg");
+    assert.match(pg.item.description, /^not connected · .* · indexed (just now|\d+ min ago)$/);
+    const inside = await h.explorer.getChildren(pg);
+    const flat = [];
+    for (const n of inside) flat.push(n.item.label, ...(n.kind === "schema" ? (await h.explorer.getChildren(n)).map((x) => x.item.label) : []));
+    assert.ok(flat.includes("orders"), flat.join(" | "));
+    assert.deepEqual(shown.prompts, []);
+    // A session that starts leaves it alone: not attached, not read again,
+    // its kept index still in use and still on disk.
+    await h.run(h.open(path.join(dir, "two.sql"), "SELECT 1;"));
+    await feed.sync();
+    await feed.index.indexPending("default", runner.liveSession());
+    assert.deepEqual(shown.prompts, []);
+    assert.ok(!(await h.attached()).includes("pg"));
+    assert.ok(feed.index.parts("default").some((p) => p.database === "pg"));
+    assert.doesNotMatch(shown.log.join(""), /indexed pg /);
+    const kept = path.join(storage, "catalog-index", `${require("../catalogIndex").cacheKey("postgres", bare)}.json`);
+    assert.ok(fs.existsSync(kept), "kept while the setting names it");
+    // Forgotten: its kept index goes at the next reading.
+    await h.explorer.forget(await h.node("pg"));
+    await h.explorer.forget(await h.node("pg2"));
+    await feed.sync();
+    assert.equal(fs.existsSync(kept), false);
+  }
 });

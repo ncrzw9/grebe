@@ -95,4 +95,27 @@ function withoutPassword(s) {
     .trim();
 }
 
-module.exports = { redact, isConnection, parse, where, aliasFor, withPassword, withoutPassword };
+/** `s` with libpq's connect_timeout set to `seconds`, unless it sets one:
+ *  a server that does not answer is then given up on by the client, and
+ *  the DuckDB session stays usable. */
+function withConnectTimeout(s, seconds) {
+  const t = String(s).trim();
+  if (/\bconnect_timeout\s*=/i.test(t)) return t;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return `${t}${t.includes("?") ? "&" : "?"}connect_timeout=${seconds}`;
+  return `${t} connect_timeout=${seconds}`;
+}
+
+/** `s` as it is kept and compared: no password, and no connect_timeout,
+ *  which says nothing about where it is. A file path is returned as it is. */
+function plain(s) {
+  const t = withoutPassword(s);
+  if (t === null || t === undefined || !isConnection(String(t))) return t;
+  return String(t)
+    .replace(/([?&])connect_timeout=[^&\s'"]*&?/gi, "$1")
+    .replace(/[?&]$/, "")
+    .replace(/(^|\s)connect_timeout\s*=\s*\S*/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+module.exports = { redact, isConnection, parse, where, aliasFor, withPassword, withoutPassword, withConnectTimeout, plain };

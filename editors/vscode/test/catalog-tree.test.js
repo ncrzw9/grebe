@@ -134,7 +134,7 @@ async function open(t, { dir = tmp("work"), storage = null, isForeign, maxColumn
     indexView: (name, s) => sync.view(name, s),
     isRunning: () => running,
     reindex: (name, db) => sync.reindex(name, db),
-    remember: async (name) => sync.touched(name || "default"),
+    touched: (name) => sync.touched(name || "default"),
     onDidRun: (fn) => {
       ended.push(fn);
       return { dispose() {} };
@@ -296,11 +296,11 @@ live("local databases look the same from the index as asked of the session, and 
     "    orders (~100 rows · 2 cols) <grebe.table> +",
     "      recent(n) (table macro) <grebe.macro>",
     "  only_macros (1) +",
-    "empty (attached · in-memory) <grebe.attachedDb>",
+    "empty (attached · in-memory) <grebe.memoryDb>",
     "  No tables yet",
-    "scratchpad (attached · in-memory) <grebe.attachedDb>",
+    "scratchpad (attached · in-memory) <grebe.memoryDb>",
     "  notes (~0 rows · 1 col) <grebe.table> +",
-    "side (attached · side.duckdb) <grebe.attachedDb>",
+    "side (attached · side.duckdb) <grebe.unsavedDb>",
     "  facts (~1,200 rows · 1 col) <grebe.table> +",
     "temp (TEMP objects) <grebe.db>",
     "  scratch (~1 row · 1 col · temp) <grebe.table> +",
@@ -343,7 +343,7 @@ live("a database too large for the index is asked of the session when it is open
     assert.deepEqual(await h.draw(["t", "Sequences"]), [
       "memory (in-memory) <grebe.db>",
       "  small (~0 rows · 1 col) <grebe.table> +",
-      "wide (attached · in-memory · not in the editor: too large) <grebe.attachedDb>",
+      "wide (attached · in-memory · not in the editor: too large) <grebe.memoryDb>",
       "  t (~0 rows · 5 cols) <grebe.table> +",
       "    a (INTEGER) <grebe.column>",
       "    b (INTEGER) <grebe.column>",
@@ -381,7 +381,7 @@ live("a foreign database is drawn from the index: lazily, with no question about
     assert.deepEqual(await h.draw(["wh"]), [
       "memory (in-memory) <grebe.db>",
       "  here (~0 rows · 1 col) <grebe.table> +",
-      "wh (attached · wh.duckdb · not indexed yet) <grebe.attachedDb> +",
+      "wh (attached · wh.duckdb · not indexed yet) <grebe.unsavedDb> +",
       "  indexing…",
       (await h.draw()).at(-1),
     ]);
@@ -396,13 +396,13 @@ live("a foreign database is drawn from the index: lazily, with no question about
     assert.deepEqual((await h.draw()).slice(0, 3), [
       "memory (in-memory) <grebe.db>",
       "  here (~0 rows · 1 col) <grebe.table> +",
-      "wh (attached · wh.duckdb · indexed just now) <grebe.attachedDb> +",
+      "wh (attached · wh.duckdb · indexed just now) <grebe.unsavedDb> +",
     ]);
   });
   assert.deepEqual(catalogOnly(asked), [], "closed: nothing asked");
   asked = await h.during(async () => {
     assert.deepEqual((await h.draw(["wh", "facts", "recent"])).slice(2, -1), [
-      "wh (attached · wh.duckdb · indexed just now) <grebe.attachedDb> +",
+      "wh (attached · wh.duckdb · indexed just now) <grebe.unsavedDb> +",
       "  dim (1 col) <grebe.table> +",
       "  facts (3 cols) <grebe.table> +",
       "    id (INTEGER NOT NULL) <grebe.column>",
@@ -499,7 +499,7 @@ live("a foreign database is drawn from the index: lazily, with no question about
   await next.index.refresh("default", next.sess);
   asked = await next.during(async () => {
     assert.deepEqual((await next.draw(["wh"])).slice(2, -1), [
-      "wh (attached · wh.duckdb · read-only · indexed just now) <grebe.attachedDb> +",
+      "wh (attached · wh.duckdb · read-only · indexed just now) <grebe.unsavedDb> +",
       "  dim (1 col) <grebe.table> +",
       "  facts (3 cols) <grebe.table> +",
       "  recent (3 cols) <grebe.view> +",
@@ -523,7 +523,7 @@ live("with grebe.duckdb.catalogIndex off, a foreign database is read by the tree
       assert.deepEqual((await h.draw(["facts"])).slice(0, -1), [
         "memory (in-memory) <grebe.db>",
         "  here (~0 rows · 1 col) <grebe.table> +",
-        "wh (attached · wh.duckdb) <grebe.attachedDb>",
+        "wh (attached · wh.duckdb) <grebe.unsavedDb>",
         "  facts (~0 rows · 2 cols) <grebe.table> +",
         "    id (INTEGER NOT NULL) <grebe.column>",
         "    code (VARCHAR NOT NULL) <grebe.column>",
@@ -561,7 +561,7 @@ live("SQLite: tables and views from the index, a view as a view", async (t) => {
     assert.deepEqual((await h.draw(["app", "notes"])).slice(0, -1), [
       "memory (in-memory) <grebe.db>",
       "  No tables yet",
-      "app (attached · sqlite · app.sqlite · indexed just now) <grebe.attachedDb> +",
+      "app (attached · sqlite · app.sqlite · indexed just now) <grebe.unsavedDb> +",
       "  notes (2 cols) <grebe.table> +",
       "    id (BIGINT) <grebe.column>",
       "    body (VARCHAR NOT NULL) <grebe.column>",
@@ -618,7 +618,7 @@ livePg("PostgreSQL: the tree is drawn from the index, in folders when a schema i
     assert.deepEqual((await h.draw()).slice(0, 3), [
       "memory (in-memory) <grebe.db>",
       "  here (~0 rows · 1 col) <grebe.table> +",
-      `pg (attached · postgres · ${where} · read-only · indexed just now) <grebe.attachedDb> +`,
+      `pg (attached · postgres · ${where} · read-only · indexed just now) <grebe.unsavedDb> +`,
     ]);
   });
   assert.deepEqual(catalogOnly(asked), []);
