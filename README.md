@@ -6,6 +6,8 @@ dependencies: no database engine, no catalog, no network. Give it a
 checks queries against what the catalog says of each table, and completes
 names in your editor.
 
+Documentation, with an exact example for every option and rule: [docs/](docs/README.md).
+
 The parser is generated from DuckDB's own PEG grammar, vendored verbatim, so
 grebe parses the dialect DuckDB parses instead of approximating it. The
 grammar is DuckDB 2.0.0's. Measured on 62,253 distinct statements (every
